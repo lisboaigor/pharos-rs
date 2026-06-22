@@ -91,6 +91,22 @@ impl<C, H> CommandHandlerState<C, H> {
     }
 }
 
+impl<C, H> CommandHandlerState<C, H>
+where
+    C: Command,
+    H: CommandHandler<C>,
+{
+    /// Dispatches a command through the framework's instrumentation seam.
+    ///
+    /// Equivalent to [`pharos_app::dispatch`] over the extracted handler, but
+    /// keeps the route handler free of `.handler().as_ref()` plumbing. The
+    /// handler's own error type is returned, so callers map it to whatever
+    /// HTTP response they want.
+    pub async fn dispatch(&self, command: C) -> Result<H::Output, H::Error> {
+        pharos_app::dispatch(&*self.handler, command).await
+    }
+}
+
 impl<S, C, H> FromRequestParts<S> for CommandHandlerState<C, H>
 where
     S: Send + Sync,
@@ -132,6 +148,19 @@ impl<Q, H> QueryHandlerState<Q, H> {
     /// Returns the shared handler.
     pub fn handler(&self) -> &Arc<H> {
         &self.handler
+    }
+}
+
+impl<Q, H> QueryHandlerState<Q, H>
+where
+    Q: Query,
+    H: QueryHandler<Q>,
+{
+    /// Dispatches a query through the framework's instrumentation seam.
+    ///
+    /// Read-side counterpart to [`CommandHandlerState::dispatch`].
+    pub async fn dispatch(&self, query: Q) -> Result<Q::Result, H::Error> {
+        pharos_app::query_dispatch(&*self.handler, query).await
     }
 }
 
@@ -258,7 +287,9 @@ mod tests {
         name: String,
     }
 
-    impl Command for Greet {}
+    impl Command for Greet {
+        const NAME: &'static str = "Greet";
+    }
 
     struct GreetHandler;
 
@@ -285,6 +316,7 @@ mod tests {
 
     impl Query for Double {
         type Result = Doubled;
+        const NAME: &'static str = "Double";
     }
 
     struct LookupHandler;

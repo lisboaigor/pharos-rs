@@ -9,6 +9,8 @@
 //!
 //! - DDD aggregate modeling with typed UUID v7 identifiers.
 //! - CQRS-style command and query handlers.
+//! - Exposing those handlers over HTTP with axum + tower (see [`web`] and the
+//!   `web` binary, `cargo run -p order --bin web`).
 //! - In-process domain event publication.
 //! - Explicit relational PostgreSQL persistence for a normalized order schema.
 //! - Mapping domain events to integration events.
@@ -42,3 +44,4 @@
 pub mod application;
 pub mod domain;
 pub mod infrastructure;
+pub mod web;

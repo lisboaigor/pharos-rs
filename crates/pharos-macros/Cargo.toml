@@ -12,3 +12,9 @@ proc-macro = true
 syn         = { workspace = true }
 quote       = { workspace = true }
 proc-macro2 = { workspace = true }
+
+[dev-dependencies]
+# Integration tests derive the real `pharos-app` traits and run them.
+pharos-app = { path = "../pharos-app" }
+tokio      = { workspace = true }
+tracing    = { workspace = true }

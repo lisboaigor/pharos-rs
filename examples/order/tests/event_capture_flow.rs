@@ -7,13 +7,13 @@ use order::application::commands::{AddItem, ConfirmOrder, CreateOrder};
 use order::domain::events::OrderEvent;
 use order::domain::order::Order;
 use order::domain::value_objects::OrderId;
-use pharos_app::{CommandHandler, EventBus, save_and_publish};
+use pharos_app::{EventBus, dispatch, save_and_publish};
 use pharos_core::{AggregateRoot, Entity, Repository, RepositoryError};
 use pharos_infra::InMemoryRepository;
 use pharos_testing::{EventCapture, assert_event_published};
 use uuid::Uuid;
 
-use order::application::handlers::{AddItemHandler, ConfirmOrderHandler, CreateOrderHandler};
+use order::application::handlers::OrderHandlers;
 
 #[tokio::test]
 async fn full_command_flow_publishes_expected_domain_events() {
@@ -24,29 +24,30 @@ async fn full_command_flow_publishes_expected_domain_events() {
     let capture = EventCapture::<OrderEvent>::new();
     capture.register_on(&bus);
 
-    let create = CreateOrderHandler::new(repo.clone(), bus.clone());
-    let add_item = AddItemHandler::new(repo.clone(), bus.clone());
-    let confirm = ConfirmOrderHandler::new(repo.clone(), bus.clone());
+    let handlers = OrderHandlers::new(repo.clone(), bus.clone());
 
-    let order_id = create
-        .handle(CreateOrder {
+    let order_id = dispatch(
+        &handlers,
+        CreateOrder {
             customer_id: Uuid::now_v7(),
-        })
-        .await
-        .expect("create order");
+        },
+    )
+    .await
+    .expect("create order");
 
-    add_item
-        .handle(AddItem {
+    dispatch(
+        &handlers,
+        AddItem {
             order_id,
             description: "Keyboard".into(),
             quantity: 1,
             unit_price_reais: 100.0,
-        })
-        .await
-        .expect("add item");
+        },
+    )
+    .await
+    .expect("add item");
 
-    confirm
-        .handle(ConfirmOrder { order_id })
+    dispatch(&handlers, ConfirmOrder { order_id })
         .await
         .expect("confirm order");
 

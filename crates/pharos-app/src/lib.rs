@@ -7,9 +7,13 @@
 //!
 //! # Main areas
 //!
-//! - Commands and queries: [`CommandHandler`] and [`QueryHandler`].
+//! - Commands and queries: [`CommandHandler`] and [`QueryHandler`], driven
+//!   through [`dispatch`] and [`query_dispatch`] — the instrumentation seam
+//!   that wraps each call in the command's/query's tracing span, so handlers
+//!   stay pure business logic.
 //! - In-process domain events: [`EventBus`], [`EventHandler`], and
-//!   [`save_and_publish`].
+//!   [`save_and_publish`]. The bus is itself the instrumentation seam for event
+//!   handlers, wrapping each in an `event_handler` span.
 //! - Distributed event-driven seam: [`save_and_enqueue`], [`OutboxRepository`],
 //!   and [`OutboxDispatcher`].
 //! - Consumers and idempotency: [`InboxStore`] and [`IdempotencyStore`].
@@ -97,7 +101,7 @@ pub mod tower_service;
 pub mod transport;
 pub mod unit_of_work;
 
-pub use command::{Command, CommandHandler};
+pub use command::{Command, CommandHandler, dispatch};
 pub use consumer_group::{ConsumerGroupCoordinator, ConsumerGroupError, PartitionAssignment};
 pub use dead_letter::{DeadLetterError, DeadLetterMessage, DeadLetterQueue};
 pub use error::ApplicationError;
@@ -116,7 +120,7 @@ pub use outbox::{OutboxError, OutboxMessage, OutboxRepository, OutboxStatus};
 pub use outbox_dispatcher::{
     DispatchConfig, DispatchResult, OutboxDispatchError, OutboxDispatcher,
 };
-pub use query::{Query, QueryHandler};
+pub use query::{Query, QueryHandler, dispatch as query_dispatch};
 pub use schema_registry::{EventSchema, SchemaRegistry, SchemaRegistryError};
 pub use serialization::{
     EventSerializationError, EventSerializer, JsonEventSerializer, SerializedEvent,

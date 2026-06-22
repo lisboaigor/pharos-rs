@@ -75,7 +75,7 @@ where
 
     fn call(&mut self, command: C) -> Self::Future {
         let handler = Arc::clone(&self.handler);
-        Box::pin(async move { handler.handle(command).await })
+        Box::pin(async move { crate::command::dispatch(&*handler, command).await })
     }
 }
 
@@ -134,7 +134,7 @@ where
 
     fn call(&mut self, query: Q) -> Self::Future {
         let handler = Arc::clone(&self.handler);
-        Box::pin(async move { handler.handle(query).await })
+        Box::pin(async move { crate::query::dispatch(&*handler, query).await })
     }
 }
 
@@ -144,7 +144,9 @@ mod tests {
     use tower::ServiceExt;
 
     struct Greet(String);
-    impl Command for Greet {}
+    impl Command for Greet {
+        const NAME: &'static str = "Greet";
+    }
 
     struct GreetHandler;
 
@@ -160,6 +162,7 @@ mod tests {
     struct Lookup(u32);
     impl Query for Lookup {
         type Result = u32;
+        const NAME: &'static str = "Lookup";
     }
 
     struct LookupHandler;

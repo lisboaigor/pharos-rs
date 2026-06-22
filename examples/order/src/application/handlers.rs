@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use pharos_app::{Command, CommandHandler, EventBus, save_and_publish};
 use pharos_core::{DomainError, Entity, Repository};
-use tracing::{Instrument, info_span};
-
-use crate::application::error::AppError;
+use uuid::Uuid;
 
 use crate::application::commands::{AddItem, ConfirmOrder, CreateOrder};
+use crate::application::error::AppError;
 use crate::domain::order::Order;
 use crate::domain::value_objects::{CustomerId, Money, OrderId, Quantity};
 
@@ -18,114 +17,74 @@ async fn load<R: Repository<Order>>(repo: &R, id: OrderId) -> Result<Order, AppE
         .ok_or_else(|| AppError::Domain(DomainError::NotFound(format!("order {id}"))))
 }
 
-// ── CreateOrder ─────────────────────────────────────────────────────────────
-
-pub struct CreateOrderHandler<R: Repository<Order>> {
+/// Command handlers for the `Order` aggregate.
+///
+/// A single struct serves every `Order` command: the dependencies (`repo`,
+/// `bus`) are identical across them. Tracing is applied by
+/// [`pharos_app::dispatch`], so each `handle` is pure business logic — no
+/// `async move`, no `info_span!`, no `.instrument(..)`.
+pub struct OrderHandlers<R: Repository<Order>> {
     repo: Arc<R>,
     bus: EventBus,
 }
 
-impl<R: Repository<Order>> CreateOrderHandler<R> {
+impl<R: Repository<Order>> OrderHandlers<R> {
     pub fn new(repo: Arc<R>, bus: EventBus) -> Self {
         Self { repo, bus }
     }
 }
 
-impl<R: Repository<Order>> CommandHandler<CreateOrder> for CreateOrderHandler<R> {
-    type Output = uuid::Uuid;
+impl<R: Repository<Order>> CommandHandler<CreateOrder> for OrderHandlers<R> {
+    type Output = Uuid;
     type Error = AppError;
 
     async fn handle(&self, cmd: CreateOrder) -> Result<Self::Output, Self::Error> {
-        async move {
-            let mut order = Order::create(CustomerId::from_uuid(cmd.customer_id))?;
-            let id = order.id().as_uuid();
-            save_and_publish(&*self.repo, &self.bus, &mut order)
-                .await
-                .map_err(AppError::infra)?;
-            Ok(id)
-        }
-        .instrument(info_span!(
-            "command.handle",
-            command = "CreateOrder",
-            customer_id = %cmd.customer_id,
-        ))
-        .await
+        let mut order = Order::create(CustomerId::from_uuid(cmd.customer_id))?;
+        let id = order.id().as_uuid();
+
+        save_and_publish(&*self.repo, &self.bus, &mut order)
+            .await
+            .map_err(AppError::infra)?;
+
+        Ok(id)
     }
 }
 
-// ── AddItem ─────────────────────────────────────────────────────────────────
-
-pub struct AddItemHandler<R: Repository<Order>> {
-    repo: Arc<R>,
-    bus: EventBus,
-}
-
-impl<R: Repository<Order>> AddItemHandler<R> {
-    pub fn new(repo: Arc<R>, bus: EventBus) -> Self {
-        Self { repo, bus }
-    }
-}
-
-impl<R: Repository<Order>> CommandHandler<AddItem> for AddItemHandler<R> {
+impl<R: Repository<Order>> CommandHandler<AddItem> for OrderHandlers<R> {
     type Output = ();
     type Error = AppError;
 
     async fn handle(&self, cmd: AddItem) -> Result<Self::Output, Self::Error> {
-        async move {
-            let mut order = load(&*self.repo, OrderId::from_uuid(cmd.order_id)).await?;
-            order.add_item(
-                cmd.description,
-                Quantity::new(cmd.quantity)?,
-                Money::brl(cmd.unit_price_reais)?,
-            )?;
-            save_and_publish(&*self.repo, &self.bus, &mut order)
-                .await
-                .map_err(AppError::infra)?;
-            Ok(())
-        }
-        .instrument(info_span!(
-            "command.handle",
-            command = "AddItem",
-            order_id = %cmd.order_id,
-            quantity = cmd.quantity,
-            unit_price_reais = cmd.unit_price_reais,
-        ))
-        .await
+        let mut order = load(&*self.repo, OrderId::from_uuid(cmd.order_id)).await?;
+
+        order.add_item(
+            cmd.description,
+            Quantity::new(cmd.quantity)?,
+            Money::brl(cmd.unit_price_reais)?,
+        )?;
+
+        save_and_publish(&*self.repo, &self.bus, &mut order)
+            .await
+            .map_err(AppError::infra)?;
+
+        Ok(())
     }
 }
 
-// ── ConfirmOrder ────────────────────────────────────────────────────────────
-
-pub struct ConfirmOrderHandler<R: Repository<Order>> {
-    repo: Arc<R>,
-    bus: EventBus,
-}
-
-impl<R: Repository<Order>> ConfirmOrderHandler<R> {
-    pub fn new(repo: Arc<R>, bus: EventBus) -> Self {
-        Self { repo, bus }
-    }
-}
-
-impl<R: Repository<Order>> CommandHandler<ConfirmOrder> for ConfirmOrderHandler<R> {
+impl<R: Repository<Order>> CommandHandler<ConfirmOrder> for OrderHandlers<R> {
     type Output = ();
     type Error = AppError;
 
     async fn handle(&self, cmd: ConfirmOrder) -> Result<Self::Output, Self::Error> {
-        async move {
-            let mut order = load(&*self.repo, OrderId::from_uuid(cmd.order_id)).await?;
-            order.confirm()?;
-            save_and_publish(&*self.repo, &self.bus, &mut order)
-                .await
-                .map_err(AppError::infra)?;
-            Ok(())
-        }
-        .instrument(info_span!(
-            "command.handle",
-            command = "ConfirmOrder",
-            order_id = %cmd.order_id,
-        ))
-        .await
+        let mut order = load(&*self.repo, OrderId::from_uuid(cmd.order_id)).await?;
+
+        order.confirm()?;
+
+        save_and_publish(&*self.repo, &self.bus, &mut order)
+            .await
+            .map_err(AppError::infra)?;
+
+        Ok(())
     }
 }
 

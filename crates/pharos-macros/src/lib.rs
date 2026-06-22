@@ -11,6 +11,11 @@
 //! - `#[derive(DomainEvent)]` for enums with `#[occurred_at]` and
 //!   `#[aggregate_id]` fields on each variant (the `#[aggregate_id]` field must
 //!   be string-like so `aggregate_id()` can borrow it).
+//! - `#[derive(Command)]` / `#[derive(Query)]` for application DTOs: derive the
+//!   `NAME` label (default = type name, override with `#[command(name = "...")]`
+//!   / `#[query(name = "...")]`) and generate the tracing `trace_span` from
+//!   `#[trace]`-annotated fields. `#[derive(Query)]` also needs the read model
+//!   type via `#[query(result = Type)]`.
 //! - `id_type!(...)` for strongly typed UUID wrappers using UUID v7 by default.
 //!
 //! # Typical aggregate shape
@@ -33,8 +38,8 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments, Token, Type, parse::Parser,
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned,
+    Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, Meta, PathArguments, Token, Type,
+    parse::Parser, parse_macro_input, punctuated::Punctuated, spanned::Spanned,
 };
 
 #[proc_macro_derive(Entity, attributes(id))]
@@ -207,6 +212,227 @@ pub fn derive_domain_event(input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Derives [`pharos_app::Command`] for a struct.
+///
+/// The command's `NAME` defaults to the type name; override it with
+/// `#[command(name = "...")]`. Annotate fields with `#[trace]` to have the
+/// generated `trace_span` record them — so the DTO declares its observability
+/// and the handler stays pure business logic.
+///
+/// ```ignore
+/// #[derive(Command)]
+/// pub struct AddItem {
+///     #[trace(display)] pub order_id: Uuid, // recorded as `%order_id`
+///     pub description: String,              // not recorded
+///     #[trace] pub quantity: u32,           // recorded by Value
+/// }
+/// ```
+#[proc_macro_derive(Command, attributes(command, trace))]
+pub fn derive_command(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    expand_dispatchable(&ast, Dispatchable::Command)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives [`pharos_app::Query`] for a struct.
+///
+/// Like [`macro@Command`], but the read model type is required:
+/// `#[query(result = Option<u64>)]`. `NAME` defaults to the type name
+/// (override with `#[query(name = "...")]`), and `#[trace]` fields feed the
+/// generated `query.handle` span.
+///
+/// ```ignore
+/// #[derive(Query)]
+/// #[query(result = Option<u64>)]
+/// pub struct GetOrderTotal {
+///     #[trace(display)] pub order_id: Uuid,
+/// }
+/// ```
+#[proc_macro_derive(Query, attributes(query, trace))]
+pub fn derive_query(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    expand_dispatchable(&ast, Dispatchable::Query)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Which dispatchable trait a derive targets; captures the small differences
+/// (trait path, attribute name, span name, span key) between `Command` and
+/// `Query` so the two derives share one expansion.
+#[derive(Clone, Copy)]
+enum Dispatchable {
+    Command,
+    Query,
+}
+
+impl Dispatchable {
+    /// The struct-level helper attribute (`#[command(..)]` / `#[query(..)]`).
+    fn attr(self) -> &'static str {
+        match self {
+            Dispatchable::Command => "command",
+            Dispatchable::Query => "query",
+        }
+    }
+
+    /// The span name and the span key under which `NAME` is recorded.
+    fn span(self) -> (&'static str, proc_macro2::TokenStream) {
+        match self {
+            Dispatchable::Command => ("command.handle", quote!(command)),
+            Dispatchable::Query => ("query.handle", quote!(query)),
+        }
+    }
+
+    fn trait_path(self) -> proc_macro2::TokenStream {
+        match self {
+            Dispatchable::Command => quote!(::pharos_app::Command),
+            Dispatchable::Query => quote!(::pharos_app::Query),
+        }
+    }
+}
+
+fn expand_dispatchable(
+    ast: &DeriveInput,
+    kind: Dispatchable,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &ast.ident;
+    let (ig, tg, wc) = ast.generics.split_for_impl();
+
+    // Struct-level options: `name` (both) and `result` (Query only).
+    let mut name_override: Option<LitStr> = None;
+    let mut result_ty: Option<Type> = None;
+    for attr in &ast.attrs {
+        if !attr.path().is_ident(kind.attr()) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                name_override = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if matches!(kind, Dispatchable::Query) && meta.path.is_ident("result") {
+                result_ty = Some(meta.value()?.parse()?);
+                Ok(())
+            } else {
+                Err(meta.error("unsupported option; expected `name` (or `result` for queries)"))
+            }
+        })?;
+    }
+
+    let name_lit = match name_override {
+        Some(lit) => quote!(#lit),
+        None => {
+            let s = name.to_string();
+            quote!(#s)
+        }
+    };
+
+    // `#[trace]` fields → generated `trace_span`. With none, inherit the trait
+    // default (a span carrying only the name).
+    let (span_name, span_key) = kind.span();
+    let trace_fields = collect_trace_fields(ast)?;
+    let trace_span_fn = if trace_fields.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            fn trace_span(&self) -> ::tracing::Span {
+                ::tracing::info_span!(#span_name, #span_key = Self::NAME, #(#trace_fields),*)
+            }
+        }
+    };
+
+    let trait_path = kind.trait_path();
+    let body = match kind {
+        Dispatchable::Command => quote! {
+            const NAME: &'static str = #name_lit;
+            #trace_span_fn
+        },
+        Dispatchable::Query => {
+            let result_ty = result_ty.ok_or_else(|| {
+                syn::Error::new(
+                    ast.span(),
+                    "#[derive(Query)] requires the read model type: `#[query(result = Type)]`",
+                )
+            })?;
+            quote! {
+                type Result = #result_ty;
+                const NAME: &'static str = #name_lit;
+                #trace_span_fn
+            }
+        }
+    };
+
+    Ok(quote! {
+        impl #ig #trait_path for #name #tg #wc {
+            #body
+        }
+    })
+}
+
+/// How a `#[trace]` field is recorded on the span.
+enum TraceMode {
+    /// `field = self.field` (the type implements `tracing::Value`).
+    Value,
+    /// `field = %self.field` (recorded via `Display`).
+    Display,
+    /// `field = ?self.field` (recorded via `Debug`).
+    Debug,
+}
+
+/// Builds the span-field tokens for every `#[trace]`-annotated named field.
+fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let fields = match &ast.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(f) => &f.named,
+            // Tuple/unit structs cannot carry `#[trace]` fields; nothing to record.
+            _ => return Ok(Vec::new()),
+        },
+        _ => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for field in fields {
+        let Some(attr) = field.attrs.iter().find(|a| a.path().is_ident("trace")) else {
+            continue;
+        };
+        let ident = field
+            .ident
+            .as_ref()
+            .ok_or_else(|| syn::Error::new(field.span(), "`#[trace]` requires a named field"))?;
+
+        let mut mode = TraceMode::Value;
+        let mut rename: Option<LitStr> = None;
+        // `#[trace]` is a bare path; `#[trace(display)]`, `#[trace(debug)]`,
+        // `#[trace(name = "...")]` (and combinations) carry options.
+        if !matches!(attr.meta, Meta::Path(_)) {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("display") {
+                    mode = TraceMode::Display;
+                    Ok(())
+                } else if meta.path.is_ident("debug") {
+                    mode = TraceMode::Debug;
+                    Ok(())
+                } else if meta.path.is_ident("name") {
+                    rename = Some(meta.value()?.parse()?);
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `display`, `debug`, or `name = \"...\"`"))
+                }
+            })?;
+        }
+
+        let key = match rename {
+            Some(lit) => quote!(#lit),
+            None => quote!(#ident),
+        };
+        out.push(match mode {
+            TraceMode::Value => quote!(#key = self.#ident),
+            TraceMode::Display => quote!(#key = %self.#ident),
+            TraceMode::Debug => quote!(#key = ?self.#ident),
+        });
+    }
+    Ok(out)
 }
 
 #[proc_macro]

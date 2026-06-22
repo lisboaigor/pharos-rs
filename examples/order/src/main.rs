@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
-use pharos_app::{CommandHandler, EventBus, QueryHandler};
+use pharos_app::{EventBus, dispatch, query_dispatch};
 use pharos_infra::InMemoryRepository;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use order::application::commands::{AddItem, ConfirmOrder, CreateOrder};
 use order::application::event_handlers::{NotifyCustomer, UpdateInventory};
-use order::application::handlers::{AddItemHandler, ConfirmOrderHandler, CreateOrderHandler};
+use order::application::handlers::OrderHandlers;
 use order::application::queries::{GetOrderTotal, GetOrderTotalHandler};
 use order::domain::events::OrderEvent;
 use order::domain::order::Order;
@@ -36,37 +36,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let repo = Arc::new(InMemoryRepository::<Order>::new());
 
     // ── Handlers (explicit DI) ──────────────────────────────────────────────
-    let create = CreateOrderHandler::new(repo.clone(), bus.clone());
-    let add_item = AddItemHandler::new(repo.clone(), bus.clone());
-    let confirm = ConfirmOrderHandler::new(repo.clone(), bus.clone());
+    // One struct serves every `Order` command; `dispatch` wraps each call in
+    // the command's tracing span, so the handlers carry no tracing code.
+    let handlers = OrderHandlers::new(repo.clone(), bus.clone());
 
     // ── Flow ────────────────────────────────────────────────────────────────
     let customer_id = uuid::Uuid::now_v7();
-    let order_id = create.handle(CreateOrder { customer_id }).await?;
+    let order_id = dispatch(&handlers, CreateOrder { customer_id }).await?;
     info!(order_id = %order_id, "order created");
 
-    add_item
-        .handle(AddItem {
+    dispatch(
+        &handlers,
+        AddItem {
             order_id,
             description: "Mechanical keyboard".into(),
             quantity: 2,
             unit_price_reais: 350.00,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
-    add_item
-        .handle(AddItem {
+    dispatch(
+        &handlers,
+        AddItem {
             order_id,
             description: "Mousepad".into(),
             quantity: 1,
             unit_price_reais: 80.00,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
-    confirm.handle(ConfirmOrder { order_id }).await?;
+    dispatch(&handlers, ConfirmOrder { order_id }).await?;
 
     let query = GetOrderTotalHandler::new(repo.clone());
-    let total = query.handle(GetOrderTotal { order_id }).await?;
+    let total = query_dispatch(&query, GetOrderTotal { order_id }).await?;
 
     match total {
         Some(total_centavos) => info!(
