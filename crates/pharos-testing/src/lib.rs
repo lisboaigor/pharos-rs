@@ -154,8 +154,10 @@ macro_rules! assert_event_published {
 /// use pharos_testing::TestSubscriber;
 ///
 /// let sub = TestSubscriber::new();
-/// let _guard = sub.install();
+/// let guard = sub.install();
 /// // … run code under test …
+/// tracing::info!("postgres.outbox.insert");
+/// drop(guard); // flush by uninstalling before reading
 /// let lines = sub.lines();
 /// assert!(lines.iter().any(|l| l.contains("postgres.outbox.insert")));
 /// ```
