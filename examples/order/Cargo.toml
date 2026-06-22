@@ -1,0 +1,27 @@
+[package]
+name = "order"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pharos-rs/pharos-rs"
+
+[dependencies]
+pharos-core   = { path = "../../crates/pharos-core" }
+pharos-macros = { path = "../../crates/pharos-macros" }
+pharos-app    = { path = "../../crates/pharos-app" }
+pharos-infra  = { path = "../../crates/pharos-infra" }
+pharos-postgres = { path = "../../crates/pharos-postgres" }
+
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true }
+sqlx        = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+pharos-redis   = { path = "../../crates/pharos-redis" }
+pharos-testing = { path = "../../crates/pharos-testing" }
+testcontainers = { workspace = true }

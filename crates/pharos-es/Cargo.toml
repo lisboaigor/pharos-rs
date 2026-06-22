@@ -1,0 +1,15 @@
+[package]
+name = "pharos-es"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pharos-rs/pharos-rs"
+description = "Event sourcing building blocks for Pharos."
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

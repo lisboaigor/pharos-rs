@@ -1,0 +1,14 @@
+[package]
+name = "pharos-saga"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pharos-rs/pharos-rs"
+description = "Saga and process-manager building blocks for Pharos."
+
+[dependencies]
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

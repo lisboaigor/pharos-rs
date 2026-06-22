@@ -1,0 +1,98 @@
+//! Demonstrates asserting on published domain events with `pharos-testing`,
+//! and verifies optimistic-concurrency behavior of the in-memory repository.
+
+use std::sync::Arc;
+
+use order::application::commands::{AddItem, ConfirmOrder, CreateOrder};
+use order::domain::events::OrderEvent;
+use order::domain::order::Order;
+use order::domain::value_objects::OrderId;
+use pharos_app::{CommandHandler, EventBus, save_and_publish};
+use pharos_core::{AggregateRoot, Entity, Repository, RepositoryError};
+use pharos_infra::InMemoryRepository;
+use pharos_testing::{EventCapture, assert_event_published};
+use uuid::Uuid;
+
+use order::application::handlers::{AddItemHandler, ConfirmOrderHandler, CreateOrderHandler};
+
+#[tokio::test]
+async fn full_command_flow_publishes_expected_domain_events() {
+    let repo = Arc::new(InMemoryRepository::<Order>::new());
+    let bus = EventBus::new();
+
+    // Capture every OrderEvent the flow publishes.
+    let capture = EventCapture::<OrderEvent>::new();
+    capture.register_on(&bus);
+
+    let create = CreateOrderHandler::new(repo.clone(), bus.clone());
+    let add_item = AddItemHandler::new(repo.clone(), bus.clone());
+    let confirm = ConfirmOrderHandler::new(repo.clone(), bus.clone());
+
+    let order_id = create
+        .handle(CreateOrder {
+            customer_id: Uuid::now_v7(),
+        })
+        .await
+        .expect("create order");
+
+    add_item
+        .handle(AddItem {
+            order_id,
+            description: "Keyboard".into(),
+            quantity: 1,
+            unit_price_reais: 100.0,
+        })
+        .await
+        .expect("add item");
+
+    confirm
+        .handle(ConfirmOrder { order_id })
+        .await
+        .expect("confirm order");
+
+    // OrderCreated, ItemAdded, OrderConfirmed.
+    assert_event_published!(capture, 3);
+
+    let events = capture.events();
+    assert!(matches!(events[0], OrderEvent::OrderCreated { .. }));
+    assert!(matches!(events[1], OrderEvent::ItemAdded { .. }));
+    assert!(matches!(events[2], OrderEvent::OrderConfirmed { .. }));
+
+    // The persisted aggregate advanced its version once per save.
+    let stored = repo
+        .find_by_id(&OrderId::from_uuid(order_id))
+        .await
+        .unwrap()
+        .expect("order persisted");
+    assert_eq!(stored.version(), 3);
+}
+
+#[tokio::test]
+async fn stale_write_is_rejected_with_concurrency_conflict() {
+    let repo = InMemoryRepository::<Order>::new();
+    let bus = EventBus::new();
+
+    // Persist an order once (version 0 -> 1).
+    let mut writer_a = Order::create(crate_customer()).unwrap();
+    save_and_publish(&repo, &bus, &mut writer_a).await.unwrap();
+    assert_eq!(writer_a.version(), 1);
+
+    // A second in-memory copy still believes it is at version 1 after another
+    // writer has already advanced storage to version 2.
+    let mut writer_b = repo.find_by_id(writer_a.id()).await.unwrap().unwrap();
+    save_and_publish(&repo, &bus, &mut writer_a).await.unwrap(); // storage -> 2
+
+    // writer_b is now stale; its save must be rejected.
+    let conflict = repo.save(&mut writer_b).await.unwrap_err();
+    assert!(matches!(
+        conflict,
+        RepositoryError::ConcurrencyConflict {
+            expected: 1,
+            actual: Some(2)
+        }
+    ));
+}
+
+fn crate_customer() -> order::domain::value_objects::CustomerId {
+    order::domain::value_objects::CustomerId::new()
+}

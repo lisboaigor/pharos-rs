@@ -1,0 +1,56 @@
+[package]
+name = "pharos"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pharos-rs/pharos-rs"
+description = "DDD, CQRS and event-driven building blocks for Rust applications."
+
+[dependencies]
+pharos-core   = { path = "../pharos-core" }
+pharos-app    = { path = "../pharos-app" }
+pharos-macros = { path = "../pharos-macros", optional = true }
+pharos-infra  = { path = "../pharos-infra", optional = true }
+pharos-postgres = { path = "../pharos-postgres", optional = true }
+pharos-redis  = { path = "../pharos-redis", optional = true }
+pharos-testing = { path = "../pharos-testing", optional = true }
+pharos-axum = { path = "../pharos-axum", optional = true }
+pharos-saga = { path = "../pharos-saga", optional = true }
+pharos-es = { path = "../pharos-es", optional = true }
+pharos-kafka = { path = "../pharos-kafka", optional = true }
+pharos-nats = { path = "../pharos-nats", optional = true }
+
+[features]
+default = ["macros", "infra"]
+
+# ── Individual building blocks ───────────────────────────────────────────────
+macros = ["dep:pharos-macros"]
+infra = ["dep:pharos-infra"]
+postgres = ["dep:pharos-postgres"]
+redis = ["dep:pharos-redis"]
+testing = ["dep:pharos-testing"]
+tower = ["pharos-app/tower"]
+axum = ["dep:pharos-axum"]
+saga = ["dep:pharos-saga"]
+es = ["dep:pharos-es"]
+kafka = ["dep:pharos-kafka"]
+nats = ["dep:pharos-nats"]
+
+# ── Opinionated bundles (skip the feature-by-feature decision) ────────────────
+# The recommended default path: PostgreSQL outbox + HTTP transport. Pick this
+# when you want the common production setup without choosing each flag yourself.
+starter = ["macros", "infra", "postgres", "axum", "tower"]
+# Everything Pharos ships, for exploration or workspaces that touch many seams.
+full = [
+    "macros",
+    "infra",
+    "postgres",
+    "redis",
+    "testing",
+    "tower",
+    "axum",
+    "saga",
+    "es",
+    "kafka",
+    "nats",
+]

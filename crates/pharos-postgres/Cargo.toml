@@ -1,0 +1,24 @@
+[package]
+name = "pharos-postgres"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pharos-rs/pharos-rs"
+description = "Pooled PostgreSQL adapters (outbox, inbox, JSON aggregate repository) for Pharos RS."
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+pharos-app  = { path = "../pharos-app" }
+
+chrono     = { workspace = true }
+metrics    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sqlx       = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+
+[dev-dependencies]
+tokio          = { workspace = true }
+testcontainers = { workspace = true }
