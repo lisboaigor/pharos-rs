@@ -3,6 +3,11 @@
 # just a defense-in-depth default so a future crate that forgets the field
 # doesn't accidentally get pushed to crates.io.
 publish = false
+# None of these crates exist on crates.io (never published, not yanked), so
+# release-plz can't use the registry to figure out "what's already released".
+# git_only makes it derive that from git tags instead, which is what lets it
+# produce a first release when there is no prior tag.
+git_only = true
 changelog_update = true
 # Only the `pharos-rs` facade crate gets a git tag / GitHub release (see
 # override below). The workspace has historically shipped as a single
