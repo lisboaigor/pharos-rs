@@ -1,0 +1,26 @@
+[package]
+name = "pharos-redis"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Redis messaging adapter for Pharos RS."
+
+[dependencies]
+pharos-app = { path = "../pharos-app" }
+
+dashmap     = { workspace = true }
+metrics     = { workspace = true }
+redis       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+
+[dev-dependencies]
+tokio          = { workspace = true }
+testcontainers = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name    = "pharos-init"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive project scaffolder for Pharos RS, guided by the decision matrix."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "pharos-init"
+path = "src/main.rs"
+
+[dependencies]
+dialoguer = "0.11"
+console   = "0.15"
+indoc     = "2"
+
+[lints]
+workspace = true

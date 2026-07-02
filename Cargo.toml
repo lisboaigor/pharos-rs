@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pharos-core",
+    "crates/pharos-macros",
+    "crates/pharos-app",
+    "crates/pharos-infra",
+    "crates/pharos-postgres",
+    "crates/pharos-redis",
+    "crates/pharos-testing",
+    "crates/pharos-axum",
+    "crates/pharos-saga",
+    "crates/pharos-es",
+    "crates/pharos-kafka",
+    "crates/pharos-nats",
+    "crates/pharos-proto",
+    "crates/pharos",
+    "examples/order",
+    "examples/multi-tenant",
+    "examples/modular-monolith",
+    "benches/pharos-benches",
+    "tools/pharos-init",
+]
+
+[workspace.dependencies]
+thiserror = "2.0.18"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.23.4", features = ["v4", "v7", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync"] }
+dashmap = "6.2.1"
+futures = "0.3.32"
+metrics = "0.24.2"
+syn = { version = "2.0.118", features = ["full"] }
+quote = "1.0.46"
+proc-macro2 = "1.0.106"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+testcontainers = "0.27.3"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "chrono", "uuid", "json", "macros"] }
+redis = { version = "1.3.0", features = ["tokio-comp"] }
+tower = { version = "0.5.2", features = ["util"] }
+axum = "0.8.7"
+http = "1.3.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+async-nats = "0.49.1"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+rdkafka = { version = "0.39.0", features = ["tokio"] }
+prost = "0.14.4"
+garde = { version = "0.23.0", features = ["derive"] }
+
+[workspace.lints.clippy]
+# unwrap() and expect() are banned across the workspace. Use `?` or an explicit
+# error type. In tests, prefer `?` on async functions. For infallible panics
+# (e.g. mutex poisoning, test fixtures), use `let Ok(...) else { panic!() }`.
+unwrap_used = "warn"
+expect_used = "warn"

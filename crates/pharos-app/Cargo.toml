@@ -1,0 +1,32 @@
+[package]
+name = "pharos-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Application contracts for Pharos RS: command/query handlers, event bus, outbox, inbox, and messaging."
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+chrono      = { workspace = true }
+garde       = { workspace = true }
+serde       = { workspace = true }
+metrics     = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tower       = { workspace = true, optional = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+
+[features]
+# Adapters exposing command/query handlers as `tower::Service`s.
+tower = ["dep:tower"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

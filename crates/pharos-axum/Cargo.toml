@@ -1,0 +1,23 @@
+[package]
+name = "pharos-axum"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Axum integration for Pharos command and query handlers."
+
+[dependencies]
+pharos-app = { path = "../pharos-app" }
+axum = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

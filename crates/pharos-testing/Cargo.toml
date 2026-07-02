@@ -1,0 +1,20 @@
+[package]
+name = "pharos-testing"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+pharos-app  = { path = "../pharos-app" }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+tokio  = { workspace = true }
+
+[lints]
+workspace = true

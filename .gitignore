@@ -1,0 +1,17 @@
+# Rust
+/target
+Cargo.lock
+
+# Claude Code
+.claude
+
+# Ambiente
+.env
+.env.*
+
+# IDEs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

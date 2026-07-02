@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/domain",
+    "crates/application",
+    "crates/api",
+]
+
+[workspace.dependencies]
+pharos = { path = "../../crates/pharos", features = ["macros", "infra", "axum"] }
+pharos-core = { path = "../../crates/pharos-core" }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = "0.8"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }

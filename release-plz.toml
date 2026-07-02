@@ -1,0 +1,41 @@
+[workspace]
+# Every crate is `publish = false` in its own Cargo.toml already; this is
+# just a defense-in-depth default so a future crate that forgets the field
+# doesn't accidentally get pushed to crates.io.
+publish = false
+changelog_update = true
+# Only the `pharos-rs` facade crate gets a git tag / GitHub release (see
+# override below). The workspace has historically shipped as a single
+# version, so we don't want every internal crate creating its own tag.
+git_tag_enable = false
+git_release_enable = false
+
+# The public surface of the project: gets its own git tag and GitHub release
+# on every version bump.
+[[package]]
+name = "pharos-rs"
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+# Non-library workspace members: not part of the versioned/released surface.
+[[package]]
+name = "pharos-init"
+release = false
+
+[[package]]
+name = "pharos-benches"
+release = false
+
+[[package]]
+name = "order"
+release = false
+
+[[package]]
+name = "multi-tenant"
+release = false
+
+[[package]]
+name = "modular-monolith"
+release = false

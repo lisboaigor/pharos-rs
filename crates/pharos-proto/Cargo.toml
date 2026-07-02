@@ -1,0 +1,22 @@
+[package]
+name        = "pharos-proto"
+version     = "0.1.0"
+edition     = "2024"
+publish     = false
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/lisboaigor/pharos-rs"
+description = "Protobuf serialization support for Pharos RS integration events."
+
+[dependencies]
+pharos-app  = { path = "../pharos-app" }
+prost       = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+
+[dev-dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[lints]
+workspace = true

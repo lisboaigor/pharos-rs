@@ -1,0 +1,38 @@
+[package]
+name = "order"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+
+[dependencies]
+pharos-core   = { path = "../../crates/pharos-core" }
+pharos-macros = { path = "../../crates/pharos-macros" }
+pharos-app    = { path = "../../crates/pharos-app", features = ["tower"] }
+pharos-infra  = { path = "../../crates/pharos-infra" }
+pharos-postgres = { path = "../../crates/pharos-postgres" }
+pharos-axum   = { path = "../../crates/pharos-axum" }
+
+garde       = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net"] }
+sqlx        = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum        = { workspace = true }
+tower       = { workspace = true, features = ["util", "limit", "timeout"] }
+
+[dev-dependencies]
+pharos-redis   = { path = "../../crates/pharos-redis" }
+pharos-testing = { path = "../../crates/pharos-testing" }
+pharos-proto   = { path = "../../crates/pharos-proto" }
+prost          = { workspace = true }
+testcontainers = { workspace = true }
+serde_json     = { workspace = true }
+http           = { workspace = true }
+
+[lints]
+workspace = true
