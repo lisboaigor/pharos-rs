@@ -1,0 +1,27 @@
+[package]
+name = "pharos-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Proc-macros for Pharos RS, including derives and the id_type! helper."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn              = { workspace = true }
+quote            = { workspace = true }
+proc-macro2      = { workspace = true }
+proc-macro-crate = { workspace = true }
+
+[dev-dependencies]
+# Integration tests derive the real `pharos-app` traits and run them.
+pharos-app = { path = "../pharos-app", version = "0.1.0" }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

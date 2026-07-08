@@ -1,0 +1,23 @@
+[package]
+name = "pharos-kafka"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Kafka adapters for Pharos messaging and schema registry contracts."
+
+[dependencies]
+pharos-app = { path = "../pharos-app", version = "0.1.0" }
+metrics = { workspace = true }
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

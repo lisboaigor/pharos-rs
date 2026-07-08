@@ -1,0 +1,10 @@
+[package]
+name = "application"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pharos = { workspace = true }
+domain = { path = "../domain" }
+serde = { workspace = true }
+thiserror = { workspace = true }

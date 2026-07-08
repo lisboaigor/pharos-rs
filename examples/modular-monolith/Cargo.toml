@@ -1,0 +1,25 @@
+[package]
+name = "modular-monolith"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+
+[dependencies]
+pharos-core   = { path = "../../crates/pharos-core" }
+pharos-app    = { path = "../../crates/pharos-app" }
+pharos-memory  = { path = "../../crates/pharos-memory" }
+
+chrono      = { workspace = true }
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+pharos-proto = { path = "../../crates/pharos-proto" }
+prost        = { workspace = true }
+
+[lints]
+workspace = true

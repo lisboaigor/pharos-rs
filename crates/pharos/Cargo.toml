@@ -1,0 +1,32 @@
+[package]
+name = "pharos-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "DDD, CQRS and event-driven building blocks for Rust applications."
+
+[lib]
+name = "pharos"
+
+[dependencies]
+pharos-core      = { path = "../pharos-core", version = "0.1.0" }
+pharos-app       = { path = "../pharos-app", version = "0.1.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.1.0" }
+pharos-macros    = { path = "../pharos-macros", version = "0.1.0", optional = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+serde  = { workspace = true }
+tokio  = { workspace = true }
+uuid   = { workspace = true }
+
+[features]
+default = ["macros"]
+
+macros = ["dep:pharos-macros"]
+
+[lints]
+workspace = true

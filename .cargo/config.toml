@@ -1,0 +1,21 @@
+[alias]
+# Run the whole test suite, including the container-backed integration tests,
+# with a single test thread so the number of concurrently running Docker
+# containers stays bounded. The container tests are a first-class part of the
+# suite (they are never `#[ignore]`d), so a running Docker daemon is required.
+test-docker = "test --workspace --all-features -- --test-threads=1"
+
+# Build the workspace docs with the Mermaid header injected. Use this instead of
+# a plain `cargo doc`: the `--html-in-header` path below is relative to the
+# workspace root, which only resolves for workspace crates. `--no-deps` skips
+# dependency crates (built with a cwd inside the registry, where the relative
+# path would not exist) — and you don't want the header in `libc`'s docs anyway.
+docs = "doc --workspace --no-deps"
+
+[build]
+# Path is relative to the workspace root (where cargo is invoked), so this works
+# for any contributor and in CI — not just on one machine. Pair it with the
+# `cargo docs` alias above (or always pass `--no-deps`); a plain `cargo doc`
+# also documents dependencies, whose rustdoc runs from a different directory and
+# cannot find this relative path.
+rustdocflags = ["--html-in-header", "docs/rustdoc/mermaid-header.html"]

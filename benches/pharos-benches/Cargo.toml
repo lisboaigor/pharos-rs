@@ -1,0 +1,27 @@
+[package]
+name = "pharos-benches"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[[bench]]
+name = "event_bus"
+harness = false
+
+[[bench]]
+name = "outbox_dispatcher"
+harness = false
+
+[dependencies]
+pharos-core = { path = "../../crates/pharos-core" }
+pharos-app  = { path = "../../crates/pharos-app" }
+pharos-memory = { path = "../../crates/pharos-memory" }
+chrono       = { workspace = true }
+tokio        = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true

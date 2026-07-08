@@ -1,0 +1,25 @@
+[package]
+name = "multi-tenant"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+
+[dependencies]
+pharos-core   = { path = "../../crates/pharos-core" }
+pharos-app    = { path = "../../crates/pharos-app" }
+pharos-memory  = { path = "../../crates/pharos-memory" }
+pharos-postgres = { path = "../../crates/pharos-postgres" }
+
+chrono      = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+
+[lints]
+workspace = true

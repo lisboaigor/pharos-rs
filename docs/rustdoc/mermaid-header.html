@@ -1,0 +1,47 @@
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+mermaid.initialize({
+  startOnLoad: false,
+  securityLevel: "strict",
+  theme: "default"
+});
+
+async function renderMermaidBlocks() {
+  // rustdoc renders a ```mermaid fenced block as
+  // <div class="example-wrap"><pre class="language-mermaid"><code>...</code></pre></div>
+  // so the language class lives on the <pre>, not the <code>.
+  const blocks = document.querySelectorAll("pre.language-mermaid");
+  if (!blocks.length) {
+    return;
+  }
+
+  let i = 0;
+  for (const pre of blocks) {
+    // textContent decodes the HTML entities rustdoc emits for `<`, `>`, `&`, etc.
+    const source = pre.textContent || "";
+    // Replace the whole rustdoc code wrapper so its background/padding don't show.
+    const target = pre.closest(".example-wrap") || pre;
+    if (!target.parentElement) {
+      continue;
+    }
+
+    const id = `mermaid-diagram-${i++}`;
+    try {
+      const { svg } = await mermaid.render(id, source);
+      const container = document.createElement("div");
+      container.className = "mermaid-rendered";
+      container.innerHTML = svg;
+      target.parentElement.replaceChild(container, target);
+    } catch (err) {
+      console.error("Failed to render Mermaid diagram:", err);
+    }
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", renderMermaidBlocks);
+} else {
+  renderMermaidBlocks();
+}
+</script>

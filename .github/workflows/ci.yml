@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      # The container-backed integration tests are part of the normal suite, so
+      # the test job needs a working Docker daemon. ubuntu-latest ships one;
+      # testcontainers uses it to spin up ephemeral PostgreSQL/Redis per test.
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Test (unit + container integration)
+        # `--test-threads=1` keeps the number of concurrently running containers
+        # bounded so the runner does not exhaust resources.
+        run: cargo test --workspace --all-features -- --test-threads=1
+
+  msrv:
+    name: MSRV (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The declared `rust-version` is only honest if CI proves it compiles.
+      - name: Check with MSRV
+        run: cargo check --workspace --all-targets --all-features

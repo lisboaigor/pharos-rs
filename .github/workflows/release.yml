@@ -1,0 +1,20 @@
+# Creates a GitHub Release with auto-generated notes whenever a version tag is
+# pushed. The workspace is never published to crates.io, so there is no
+# publish step — the tag (created and signed locally) is the release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
