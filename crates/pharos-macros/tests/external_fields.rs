@@ -25,14 +25,10 @@ fn external_field_is_not_required_in_the_body() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn external_field_present_in_the_body_is_still_ignored() -> Result<(), Box<dyn std::error::Error>>
-{
+fn external_field_present_in_the_body_is_still_ignored() -> Result<(), Box<dyn std::error::Error>> {
     // skip_deserializing means a client-supplied value never overrides the
     // default — the handler is the only thing allowed to set the real id.
-    let raw = format!(
-        r#"{{"order_id": "{}", "note": "ship it"}}"#,
-        Uuid::new_v4()
-    );
+    let raw = format!(r#"{{"order_id": "{}", "note": "ship it"}}"#, Uuid::new_v4());
     let cmd: ConfirmOrder = serde_json::from_str(&raw)?;
     assert_eq!(cmd.order_id, Uuid::nil());
     Ok(())
