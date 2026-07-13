@@ -16,6 +16,9 @@
 //!   / `#[query(name = "...")]`) and generate the tracing `trace_span` from
 //!   `#[trace]`-annotated fields. `#[derive(Query)]` also needs the read model
 //!   type via `#[query(result = Type)]`.
+//! - `#[external_fields]` attribute macro (paired with `#[external]` on the
+//!   relevant fields) to exempt HTTP-DTO fields sourced from the URL path or
+//!   an auth claim from `Deserialize`'s body requirement.
 //! - `id_type!(...)` for strongly typed UUID wrappers using UUID v7 by default.
 //!
 //! # Typical aggregate shape
@@ -39,7 +42,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, Meta, PathArguments, Token, Type,
-    parse::Parser, parse_macro_input, punctuated::Punctuated, spanned::Spanned,
+    parse::Parser, parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned,
 };
 
 #[proc_macro_derive(Entity, attributes(id))]
@@ -303,6 +306,60 @@ pub fn derive_query(input: TokenStream) -> TokenStream {
     expand_dispatchable(&ast, Dispatchable::Query)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+/// Rewrites `#[external]`-marked fields to `#[serde(skip_deserializing, default)]`.
+///
+/// A recurring shape in HTTP command/query DTOs: some fields are not part of
+/// the caller's JSON body at all — they come from the URL path (a resource id)
+/// or from an auth claim (e.g. the acting user id), and the handler overwrites
+/// them after deserialization. Left to `#[derive(Deserialize)]` alone, such a
+/// field is still required in the body, which either 422s real clients or lets
+/// a client-supplied value smuggle through before the handler's overwrite runs.
+///
+/// Place `#[pharos_macros::external_fields]` above `#[derive(Command, Deserialize)]`
+/// (or `Query`) and mark each such field `#[external]`. The macro strips that
+/// marker and emits `#[serde(skip_deserializing, default)]` in its place, so
+/// `Deserialize` never requires the field from the body and falls back to the
+/// field type's `Default` (e.g. `Uuid::default()` is the nil UUID) until the
+/// handler assigns the real value.
+///
+/// ```ignore
+/// #[pharos_macros::external_fields]
+/// #[derive(Command, Deserialize)]
+/// pub struct ConfirmOrder {
+///     #[external]
+///     pub order_id: Uuid, // set from the URL path, not the JSON body
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn external_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut ast = parse_macro_input!(item as DeriveInput);
+
+    let fields = match &mut ast.data {
+        Data::Struct(s) => match &mut s.fields {
+            Fields::Named(f) => &mut f.named,
+            _ => {
+                return err(ast.span(), "#[external_fields] requires named fields").into();
+            }
+        },
+        _ => {
+            return err(ast.span(), "#[external_fields] only supports structs").into();
+        }
+    };
+
+    for field in fields.iter_mut() {
+        let has_marker = field.attrs.iter().any(|a| a.path().is_ident("external"));
+        if !has_marker {
+            continue;
+        }
+        field.attrs.retain(|a| !a.path().is_ident("external"));
+        field
+            .attrs
+            .push(parse_quote!(#[serde(skip_deserializing, default)]));
+    }
+
+    quote!(#ast).into()
 }
 
 /// Which dispatchable trait a derive targets; captures the small differences
