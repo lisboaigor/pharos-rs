@@ -134,7 +134,7 @@ adapter:
 | `PostgresUnitOfWork`                                 | PostgreSQL         | transactional boundary (`transaction(                                            | conn | ...)`) |
 | `TransactionalRepository<A>` + `save_and_enqueue_in` | PostgreSQL         | atomic aggregate save + outbox for any repository (JSONB or explicit relational) |
 | `PgEventStore<I, E>` / `PgSnapshotStore<I, S>`       | PostgreSQL JSONB   | `EventStore` / `SnapshotStore` (`pharos-es`) with PK-arbitrated OCC on append    |
-| `PgSagaStore<I, S>`                                  | PostgreSQL JSONB   | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`) with a partial index for due deadlines |
+| `PgSagaStore<I, S>`                                  | PostgreSQL JSONB   | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`); `claim_due` uses `FOR UPDATE SKIP LOCKED` + lease over a partial index, so timeout sweeps scale horizontally |
 
 ```rust
 use pharos_postgres::{PostgresOutboxRepository, connect_pool};
@@ -210,7 +210,7 @@ Saga/process-manager primitives:
 
 - `Saga` (with `on_timeout`), `SagaTransition`, `SagaStore`, `SagaTimeoutStore`, `CommandDispatcher`
 - `SagaRunner` for loading state, reacting to an event, persisting state, and dispatching follow-up commands
-- Deadlines: `SagaInstance::running_until` and the `deadline` on `Start`/`Advance` schedule a timeout; `SagaRunner::run_due_timeouts` fires `Saga::on_timeout` for elapsed instances (call it from a periodic task — the app owns the scheduler)
+- Deadlines: `SagaInstance::running_until` and the `deadline` on `Start`/`Advance` schedule a timeout; `SagaRunner::run_due_timeouts` claims elapsed instances (`SagaTimeoutStore::claim_due`, lease-based) and fires `Saga::on_timeout`. Claiming makes the sweep safe to run on multiple service instances concurrently; call it from a periodic task — the app owns the scheduler
 
 ## `pharos-es`
 

@@ -151,16 +151,30 @@ pub trait SagaStore<I, S>: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Saga store that can also query instances with an elapsed deadline.
+/// Saga store that can also claim instances with an elapsed deadline.
 ///
 /// Implement this in addition to [`SagaStore`] to drive timeouts through
 /// [`SagaRunner::run_due_timeouts`].
 pub trait SagaTimeoutStore<I, S>: SagaStore<I, S> {
-    /// Loads up to `limit` [`SagaStatus::Running`] instances whose deadline
-    /// is at or before `now`, soonest deadline first.
-    fn find_due(
+    /// Atomically claims up to `limit` [`SagaStatus::Running`] instances
+    /// whose deadline is at or before `now`, soonest deadline first.
+    ///
+    /// Claiming must postpone the stored deadline to `now + lease` in the
+    /// same operation, so concurrent sweepers never receive the same
+    /// instance twice: the claim either wins the row or skips it. The
+    /// returned instances carry the **original** (elapsed) deadline, which
+    /// is what a timeout handler wants to reason about. If the claimer
+    /// crashes before applying a transition, the instance simply becomes
+    /// due again once the lease expires.
+    ///
+    /// Size `lease` comfortably above the worst-case time to process one
+    /// sweep batch; a lease that is too short lets another sweeper re-claim
+    /// instances that are still being processed, reintroducing duplicate
+    /// timeout transitions.
+    fn claim_due(
         &self,
         now: DateTime<Utc>,
+        lease: chrono::Duration,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<SagaInstance<I, S>>, Self::Error>> + Send;
 }
@@ -321,16 +335,24 @@ where
     /// Fires [`Saga::on_timeout`] for up to `limit` running instances whose
     /// deadline elapsed at `now`, and returns how many were processed.
     ///
+    /// Due instances are **claimed** with `lease` (see
+    /// [`SagaTimeoutStore::claim_due`]), so this is safe to run on multiple
+    /// service instances concurrently: each due saga is delivered to exactly
+    /// one sweeper per lease window.
+    ///
     /// A [`SagaTransition::Fail`] returned by `on_timeout` is a normal
     /// business outcome here (an expired payment, an abandoned checkout):
     /// the instance is persisted as [`SagaStatus::Failed`] and the sweep
-    /// continues. Only saga, store, or dispatch errors abort the sweep.
+    /// continues. Only saga, store, or dispatch errors abort the sweep;
+    /// instances claimed but not yet processed become due again when the
+    /// lease expires.
     ///
     /// Pharos provides the mechanism, not the scheduler: call this from a
     /// periodic task in the application, e.g. a `tokio::time::interval` loop.
     pub async fn run_due_timeouts(
         &self,
         now: DateTime<Utc>,
+        lease: chrono::Duration,
         limit: usize,
     ) -> Result<usize, SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>>
     where
@@ -338,7 +360,7 @@ where
     {
         let due = self
             .store
-            .find_due(now, limit)
+            .claim_due(now, lease, limit)
             .await
             .map_err(SagaRunnerError::Store)?;
 
@@ -488,15 +510,14 @@ mod tests {
     }
 
     impl SagaTimeoutStore<String, BillingState> for InMemorySagaStore {
-        async fn find_due(
+        async fn claim_due(
             &self,
             now: DateTime<Utc>,
+            lease: chrono::Duration,
             limit: usize,
         ) -> Result<Vec<SagaInstance<String, BillingState>>, Self::Error> {
-            let mut due: Vec<_> = self
-                .instances
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+            let mut due: Vec<_> = instances
                 .values()
                 .filter(|i| {
                     i.status == SagaStatus::Running
@@ -506,6 +527,12 @@ mod tests {
                 .collect();
             due.sort_by_key(|i| i.deadline);
             due.truncate(limit);
+            // Claim: postpone the stored deadline, return the original one.
+            for claimed in &due {
+                if let Some(stored) = instances.get_mut(&claimed.id) {
+                    stored.deadline = Some(now + lease);
+                }
+            }
             Ok(due)
         }
     }
@@ -684,7 +711,9 @@ mod tests {
         store.save(expired_instance("order-1")).await?;
         let runner = SagaRunner::new(BillingSaga, store, VecDispatcher::default());
 
-        let processed = runner.run_due_timeouts(Utc::now(), 10).await?;
+        let processed = runner
+            .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+            .await?;
         assert_eq!(processed, 1);
 
         let stored = runner
@@ -696,7 +725,12 @@ mod tests {
         assert_eq!(stored.deadline, None);
 
         // The failed instance is terminal: nothing is due anymore.
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 10).await?, 0);
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            0
+        );
         Ok(())
     }
 
@@ -708,7 +742,12 @@ mod tests {
         let dispatcher = VecDispatcher::default();
         let runner = SagaRunner::new(ExpiringSaga, store, dispatcher.clone());
 
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 10).await?, 1);
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            1
+        );
 
         let stored = runner
             .store
@@ -738,7 +777,12 @@ mod tests {
         store.save(expired_instance("order-3")).await?;
         let runner = SagaRunner::new(SnoozingSaga, store, VecDispatcher::default());
 
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 10).await?, 1);
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            1
+        );
 
         let stored = runner
             .store
@@ -747,7 +791,12 @@ mod tests {
             .ok_or("instance must exist")?;
         assert_eq!(stored.status, SagaStatus::Running);
         assert_eq!(stored.deadline, None);
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 10).await?, 0);
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            0
+        );
         Ok(())
     }
 
@@ -767,8 +816,18 @@ mod tests {
         let runner = SagaRunner::new(BillingSaga, store, VecDispatcher::default());
 
         // Only one of the two due instances fits the limit.
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 1).await?, 1);
-        assert_eq!(runner.run_due_timeouts(Utc::now(), 10).await?, 1);
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 1)
+                .await?,
+            1
+        );
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            1
+        );
 
         // The future deadline stays untouched.
         let future = runner

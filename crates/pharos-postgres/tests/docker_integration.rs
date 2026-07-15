@@ -597,7 +597,7 @@ enum PaymentSagaState {
 }
 
 #[tokio::test]
-async fn pg_saga_store_roundtrips_instances_and_finds_due_deadlines() -> TestResult {
+async fn pg_saga_store_roundtrips_instances_and_claims_due_deadlines() -> TestResult {
     let (_container, pool) = start_postgres().await?;
     let store: PgSagaStore<String, PaymentSagaState> = PgSagaStore::with_saga_type(pool, "payment");
     store.migrate().await?;
@@ -626,7 +626,7 @@ async fn pg_saga_store_roundtrips_instances_and_finds_due_deadlines() -> TestRes
     );
     assert!(store.load(&"missing".to_string()).await?.is_none());
 
-    // find_due skips future deadlines, terminal instances, and no-deadline
+    // claim_due skips future deadlines, terminal instances, and no-deadline
     // instances, and respects the limit ordered by soonest deadline.
     store
         .save(SagaInstance::running_until(
@@ -656,25 +656,126 @@ async fn pg_saga_store_roundtrips_instances_and_finds_due_deadlines() -> TestRes
     completed.status = SagaStatus::Completed;
     store.save(completed).await?;
 
-    let due = store.find_due(Utc::now(), 10).await?;
+    let lease = chrono::Duration::minutes(5);
+
+    // The limit claims only the soonest deadline...
+    let limited = store.claim_due(Utc::now(), lease, 1).await?;
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].id, "pay-due");
+    // ...and the claimed instance carries its original (elapsed) deadline.
+    assert_eq!(
+        limited[0].deadline.map(|d| d.timestamp_millis()),
+        Some(deadline.timestamp_millis())
+    );
+
+    // The claim postponed the stored deadline by the lease, so a second
+    // sweep only sees the remaining due instance — never a double delivery.
+    let due = store.claim_due(Utc::now(), lease, 10).await?;
     assert_eq!(
         due.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["pay-due-later"]
+    );
+    assert!(store.claim_due(Utc::now(), lease, 10).await?.is_empty());
+
+    // Once the lease expires the unprocessed instances become due again.
+    let after_lease = Utc::now() + lease + chrono::Duration::seconds(1);
+    let redue = store.claim_due(after_lease, lease, 10).await?;
+    assert_eq!(
+        redue.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
         vec!["pay-due", "pay-due-later"]
     );
 
-    let limited = store.find_due(Utc::now(), 1).await?;
-    assert_eq!(limited.len(), 1);
-    assert_eq!(limited[0].id, "pay-due");
-
-    // Upsert: completing the due instance takes it out of the sweep.
+    // Upsert: completing an instance takes it out of the sweep for good.
     let mut confirmed = loaded;
     confirmed.state = PaymentSagaState::Confirmed;
     confirmed.status = SagaStatus::Completed;
     confirmed.deadline = None;
     store.save(confirmed).await?;
-    let due = store.find_due(Utc::now(), 10).await?;
+    let after_second_lease = after_lease + lease + chrono::Duration::seconds(1);
+    let due = store.claim_due(after_second_lease, lease, 10).await?;
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].id, "pay-due-later");
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_sweepers_never_claim_the_same_saga() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store: PgSagaStore<String, PaymentSagaState> =
+        PgSagaStore::with_saga_type(pool.clone(), "payment");
+    store.migrate().await?;
+
+    for index in 0..20 {
+        store
+            .save(SagaInstance::running_until(
+                format!("pay-{index:02}"),
+                PaymentSagaState::AwaitingConfirmation { amount_minor: 100 },
+                Utc::now() - chrono::Duration::minutes(1),
+            ))
+            .await?;
+    }
+
+    // Two sweepers race over the same due set; SKIP LOCKED + the lease must
+    // hand every instance to exactly one of them.
+    let second_store: PgSagaStore<String, PaymentSagaState> =
+        PgSagaStore::with_saga_type(pool, "payment");
+    let now = Utc::now();
+    let lease = chrono::Duration::minutes(5);
+    let (first, second) = tokio::join!(
+        store.claim_due(now, lease, 20),
+        second_store.claim_due(now, lease, 20),
+    );
+    let (first, second) = (first?, second?);
+
+    let mut all: Vec<String> = first
+        .iter()
+        .chain(second.iter())
+        .map(|i| i.id.clone())
+        .collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(
+        first.len() + second.len(),
+        all.len(),
+        "a saga was claimed by both sweepers"
+    );
+    assert_eq!(all.len(), 20, "every due saga must be claimed exactly once");
+    Ok(())
+}
+
+#[tokio::test]
+async fn inbox_cleanup_deletes_terminal_rows_and_reopens_idempotency() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store = PostgresInboxStore::new(pool);
+    store.migrate().await?;
+
+    let completed_id = Uuid::now_v7();
+    let failed_id = Uuid::now_v7();
+    let processing_id = Uuid::now_v7();
+    store.begin_processing(completed_id, "billing").await?;
+    store.mark_completed(completed_id, "billing").await?;
+    store.begin_processing(failed_id, "billing").await?;
+    store
+        .mark_failed(failed_id, "billing", "boom".to_string())
+        .await?;
+    store.begin_processing(processing_id, "billing").await?;
+
+    // Zero-duration cutoff deletes completed/failed immediately, but never
+    // an in-flight `processing` record.
+    let deleted = store
+        .cleanup_older_than(std::time::Duration::from_secs(0))
+        .await?;
+    assert_eq!(deleted, 2);
+    assert_eq!(
+        store.begin_processing(processing_id, "billing").await?,
+        IdempotencyDecision::AlreadyProcessing
+    );
+
+    // Cleaned-up messages are new again: the idempotency window shrank.
+    assert_eq!(
+        store.begin_processing(completed_id, "billing").await?,
+        IdempotencyDecision::StartProcessing
+    );
     Ok(())
 }
 

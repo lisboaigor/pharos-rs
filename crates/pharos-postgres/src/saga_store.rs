@@ -13,7 +13,7 @@ use crate::pool::{PgPoolError, Pool};
 
 /// Default PostgreSQL schema for saga instances.
 ///
-/// The partial index serves [`SagaTimeoutStore::find_due`]: only running
+/// The partial index serves [`SagaTimeoutStore::claim_due`]: only running
 /// instances with a deadline are candidates for a timeout sweep.
 pub const POSTGRES_SAGA_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pharos_sagas (
@@ -70,8 +70,10 @@ fn status_from_str(raw: &str) -> Result<SagaStatus, PostgresSagaStoreError> {
 /// PostgreSQL saga instance store with JSONB state.
 ///
 /// Implements both [`SagaStore`] (load/save upsert) and
-/// [`SagaTimeoutStore`] (`find_due` over the partial deadline index), so one
-/// adapter drives event-sourced progress and timeout sweeps.
+/// [`SagaTimeoutStore`] (`claim_due` over the partial deadline index with
+/// `FOR UPDATE SKIP LOCKED` + lease), so one adapter drives event-sourced
+/// progress and timeout sweeps, and sweeps are safe to run on multiple
+/// service instances concurrently.
 pub struct PgSagaStore<I, S> {
     pool: Pool,
     saga_type: String,
@@ -204,30 +206,61 @@ where
     <I as FromStr>::Err: Display + Send + Sync + 'static,
     S: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    async fn find_due(
+    async fn claim_due(
         &self,
         now: DateTime<Utc>,
+        lease: chrono::Duration,
         limit: usize,
     ) -> Result<Vec<SagaInstance<I, S>>, Self::Error> {
         async move {
+            // `FOR UPDATE SKIP LOCKED` arbitrates simultaneous sweepers, and
+            // pushing `deadline_at` to `now + lease` in the same statement
+            // keeps a claimed instance out of later sweeps until the claimer
+            // either applies a transition or crashes and the lease expires.
+            // The RETURNING clause reads the deadline from the CTE, so the
+            // caller sees the original (elapsed) deadline, not the lease.
             let rows = sqlx::query(
-                "SELECT saga_id, state, status, deadline_at, updated_at FROM pharos_sagas
-                 WHERE saga_type = $1
-                   AND status = 'running'
-                   AND deadline_at IS NOT NULL
-                   AND deadline_at <= $2
-                 ORDER BY deadline_at
-                 LIMIT $3",
+                "WITH due AS (
+                     SELECT saga_type, saga_id, deadline_at FROM pharos_sagas
+                     WHERE saga_type = $1
+                       AND status = 'running'
+                       AND deadline_at IS NOT NULL
+                       AND deadline_at <= $2
+                     ORDER BY deadline_at
+                     LIMIT $3
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE pharos_sagas p
+                 SET deadline_at = $4
+                 FROM due
+                 WHERE p.saga_type = due.saga_type AND p.saga_id = due.saga_id
+                 RETURNING p.saga_id, p.state, p.status,
+                           due.deadline_at AS deadline_at, p.updated_at",
             )
             .bind(&self.saga_type)
             .bind(now)
             .bind(limit as i64)
+            .bind(now + lease)
             .fetch_all(&self.pool)
             .await?;
-            rows.iter().map(instance_from_row).collect()
+            let mut claimed = rows
+                .iter()
+                .map(instance_from_row)
+                .collect::<Result<Vec<SagaInstance<I, S>>, _>>()?;
+            // UPDATE ... FROM does not guarantee output order; restore the
+            // soonest-deadline-first contract.
+            claimed.sort_by_key(|instance| instance.deadline);
+            if !claimed.is_empty() {
+                metrics::counter!(
+                    "pharos.postgres.saga_store.claimed_due",
+                    "saga_type" => self.saga_type.clone()
+                )
+                .increment(claimed.len() as u64);
+            }
+            Ok(claimed)
         }
         .instrument(info_span!(
-            "postgres.saga_store.find_due",
+            "postgres.saga_store.claim_due",
             saga_type = self.saga_type,
         ))
         .await

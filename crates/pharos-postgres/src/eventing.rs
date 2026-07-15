@@ -363,6 +363,34 @@ impl PostgresInboxStore {
     pub async fn migrate(&self) -> Result<(), PgPoolError> {
         migrate_postgres_eventing_schema(&self.pool).await
     }
+
+    /// Deletes `completed` and `failed` inbox rows older than `older_than`.
+    ///
+    /// Schedule this periodically (e.g. daily) to prevent unbounded table
+    /// growth. Returns the number of deleted rows.
+    ///
+    /// Deleting a record shrinks the idempotency window: a redelivery of a
+    /// cleaned-up message is processed again as if it were new. Size
+    /// `older_than` above the broker's maximum redelivery horizon (retention
+    /// plus DLQ replay window) so that can only happen for messages the
+    /// broker will no longer redeliver anyway.
+    pub async fn cleanup_older_than(&self, older_than: Duration) -> Result<u64, InboxError> {
+        let cutoff =
+            Utc::now() - chrono::Duration::from_std(older_than).map_err(InboxError::storage)?;
+        let result = sqlx::query(
+            "DELETE FROM pharos_inbox
+             WHERE status IN ('completed', 'failed') AND updated_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(InboxError::storage)?;
+        let deleted = result.rows_affected();
+        if deleted > 0 {
+            metrics::counter!("pharos.postgres.inbox.cleaned_up").increment(deleted);
+        }
+        Ok(deleted)
+    }
 }
 
 impl InboxStore for PostgresInboxStore {
