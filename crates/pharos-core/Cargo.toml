@@ -1,6 +1,6 @@
 [package]
 name = "pharos-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -11,6 +11,14 @@ description = "Domain primitives for Pharos RS: entities, aggregates, repositori
 [dependencies]
 thiserror   = { workspace = true }
 chrono      = { workspace = true }
+serde       = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+# Serde derives for Money/Currency (amount serialized as a decimal string).
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

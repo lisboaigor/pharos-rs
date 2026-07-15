@@ -1,6 +1,6 @@
 [package]
 name = "pharos-testing"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -8,8 +8,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lisboaigor/pharos-rs"
 
 [dependencies]
-pharos-core = { path = "../pharos-core", version = "0.1.0" }
-pharos-app  = { path = "../pharos-app", version = "0.1.0" }
+pharos-core = { path = "../pharos-core", version = "0.2.0" }
+pharos-app  = { path = "../pharos-app", version = "0.2.0" }
 tracing          = { workspace = true }
 tracing-subscriber = { workspace = true }
 

@@ -8,6 +8,8 @@ Apply in numeric order:
 2. 0002_aggregates.sql
 3. 0003_tenant_aggregates.sql
 4. 0004_dead_letter.sql
+5. 0005_event_store.sql
+6. 0006_sagas.sql
 
 Notes:
 - These files mirror the schema constants in `pharos-postgres` and are intended

@@ -15,8 +15,14 @@ Core domain primitives used by the entire framework:
 | `Repository<A>`                | Persistence boundary for aggregate roots                      |
 | `RepositoryError<E>`           | `save` error with a `ConcurrencyConflict` variant             |
 | `ValueObject`                  | Marker for immutable value objects                            |
+| `Money` / `Currency`           | Currency-aware amounts in `i128` minor units (covers wei); checked arithmetic, lossless `allocate` |
 | `DomainError` / `DomainResult` | Shared domain-level result types                              |
 | `value_object!`                | Validated value objects with a single construction point      |
+
+`Money` never touches floats and every operation is checked: mixing currencies
+or overflowing returns a `MoneyError`. With the optional `serde` feature the
+amount serializes as a decimal string, so wei-scale values survive JSON
+consumers that lose precision above 2^53.
 
 Aggregates carry an optimistic-concurrency `version`. Derive it from a
 `#[version] version: u64` field, and `Repository::save(&mut aggregate)` advances
@@ -127,6 +133,8 @@ adapter:
 | `TenantJsonRepository<A>`                            | PostgreSQL JSONB   | multi-tenant `Repository<A>`                                                     |
 | `PostgresUnitOfWork`                                 | PostgreSQL         | transactional boundary (`transaction(                                            | conn | ...)`) |
 | `TransactionalRepository<A>` + `save_and_enqueue_in` | PostgreSQL         | atomic aggregate save + outbox for any repository (JSONB or explicit relational) |
+| `PgEventStore<I, E>` / `PgSnapshotStore<I, S>`       | PostgreSQL JSONB   | `EventStore` / `SnapshotStore` (`pharos-es`) with PK-arbitrated OCC on append    |
+| `PgSagaStore<I, S>`                                  | PostgreSQL JSONB   | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`) with a partial index for due deadlines |
 
 ```rust
 use pharos_postgres::{PostgresOutboxRepository, connect_pool};
@@ -200,8 +208,9 @@ Axum integration for HTTP adapters over application handlers:
 
 Saga/process-manager primitives:
 
-- `Saga`, `SagaTransition`, `SagaStore`, `CommandDispatcher`
+- `Saga` (with `on_timeout`), `SagaTransition`, `SagaStore`, `SagaTimeoutStore`, `CommandDispatcher`
 - `SagaRunner` for loading state, reacting to an event, persisting state, and dispatching follow-up commands
+- Deadlines: `SagaInstance::running_until` and the `deadline` on `Start`/`Advance` schedule a timeout; `SagaRunner::run_due_timeouts` fires `Saga::on_timeout` for elapsed instances (call it from a periodic task — the app owns the scheduler)
 
 ## `pharos-es`
 
@@ -209,6 +218,7 @@ Event-sourcing primitives:
 
 - `EventStore`, `SnapshotStore`, `StoredEvent`, `Snapshot`
 - `EventSourced` and `EventSourcedRepository`
+- Durable adapters live in `pharos-postgres` (`PgEventStore`, `PgSnapshotStore`)
 
 ## `pharos-kafka`
 

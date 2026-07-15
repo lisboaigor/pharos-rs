@@ -1,6 +1,6 @@
 [package]
 name = "pharos-app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -9,8 +9,8 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Application contracts for Pharos RS: command/query handlers, event bus, outbox, inbox, and messaging."
 
 [dependencies]
-pharos-core      = { path = "../pharos-core", version = "0.1.0" }
-pharos-messaging = { path = "../pharos-messaging", version = "0.1.0" }
+pharos-core      = { path = "../pharos-core", version = "0.2.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.2.0" }
 chrono      = { workspace = true }
 serde       = { workspace = true }
 metrics     = { workspace = true }

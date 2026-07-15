@@ -13,6 +13,8 @@
 //! | [`PostgresDeadLetterQueue`] | `DeadLetterQueue` |
 //! | [`PostgresJsonRepository`] | `Repository` |
 //! | [`PostgresUnitOfWork`] | transactional boundary |
+//! | [`PgEventStore`] / [`PgSnapshotStore`] | `EventStore` / `SnapshotStore` (`pharos-es`) |
+//! | [`PgSagaStore`] | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`) |
 //!
 //! For an aggregate save and its outbox inserts that must commit together, use
 //! [`save_aggregate_and_enqueue`] (or compose [`save_aggregate_in_tx`] and
@@ -42,14 +44,20 @@
 //! migration tool for production usage.
 
 mod dead_letter;
+mod event_store;
 mod eventing;
 mod json_repository;
 mod pool;
+mod saga_store;
 mod tenant_repository;
 mod transaction;
 
 pub use dead_letter::{
     POSTGRES_DEAD_LETTER_SCHEMA, PostgresDeadLetterQueue, migrate_postgres_dead_letter_schema,
+};
+pub use event_store::{
+    POSTGRES_EVENT_STORE_SCHEMA, PgEventStore, PgSnapshotStore, PostgresEventStoreError,
+    migrate_postgres_event_store_schema,
 };
 pub use eventing::{
     POSTGRES_EVENTING_SCHEMA, PostgresInboxStore, PostgresOutboxRepository,
@@ -60,6 +68,9 @@ pub use json_repository::{
     migrate_postgres_aggregate_schema,
 };
 pub use pool::{PgPoolError, Pool, connect_pool};
+pub use saga_store::{
+    POSTGRES_SAGA_SCHEMA, PgSagaStore, PostgresSagaStoreError, migrate_postgres_saga_schema,
+};
 pub use tenant_repository::{
     POSTGRES_TENANT_AGGREGATE_SCHEMA, TenantJsonRepository,
     migrate_postgres_tenant_aggregate_schema,

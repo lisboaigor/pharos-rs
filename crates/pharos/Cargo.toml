@@ -1,6 +1,6 @@
 [package]
 name = "pharos-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -12,10 +12,10 @@ description = "DDD, CQRS and event-driven building blocks for Rust applications.
 name = "pharos"
 
 [dependencies]
-pharos-core      = { path = "../pharos-core", version = "0.1.0" }
-pharos-app       = { path = "../pharos-app", version = "0.1.0" }
-pharos-messaging = { path = "../pharos-messaging", version = "0.1.0" }
-pharos-macros    = { path = "../pharos-macros", version = "0.1.0", optional = true }
+pharos-core      = { path = "../pharos-core", version = "0.2.0" }
+pharos-app       = { path = "../pharos-app", version = "0.2.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.2.0" }
+pharos-macros    = { path = "../pharos-macros", version = "0.2.0", optional = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
@@ -27,6 +27,9 @@ uuid   = { workspace = true }
 default = ["macros"]
 
 macros = ["dep:pharos-macros"]
+
+# Serde derives for Money/Currency in pharos-core.
+serde = ["pharos-core/serde"]
 
 [lints]
 workspace = true

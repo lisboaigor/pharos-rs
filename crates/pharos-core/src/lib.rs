@@ -14,6 +14,7 @@
 //! - [`DomainEvent`]: an immutable fact that happened in the domain.
 //! - [`Repository`]: persistence boundary for aggregate roots.
 //! - [`ValueObject`]: marker for immutable value objects.
+//! - [`Money`]/[`Currency`]: currency-aware amounts in `i128` minor units.
 //!
 //! # Relationship between core concepts
 //!
@@ -65,6 +66,7 @@ pub mod aggregate;
 pub mod domain_event;
 pub mod entity;
 pub mod errors;
+pub mod money;
 pub mod repository;
 pub mod value_object;
 
@@ -79,5 +81,6 @@ pub use aggregate::{AggregateEvents, AggregateRoot};
 pub use domain_event::DomainEvent;
 pub use entity::Entity;
 pub use errors::{DomainError, DomainResult};
+pub use money::{Currency, Money, MoneyError};
 pub use repository::{Repository, RepositoryError};
 pub use value_object::ValueObject;

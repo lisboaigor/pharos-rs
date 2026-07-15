@@ -62,8 +62,8 @@ pub mod prelude {
         republish_pending, save_and_enqueue, save_and_publish,
     };
     pub use pharos_core::{
-        AggregateEvents, AggregateRoot, DomainError, DomainEvent, DomainResult, Entity, Repository,
-        RepositoryError, ValueObject,
+        AggregateEvents, AggregateRoot, Currency, DomainError, DomainEvent, DomainResult, Entity,
+        Money, MoneyError, Repository, RepositoryError, ValueObject,
     };
 
     #[cfg(feature = "macros")]

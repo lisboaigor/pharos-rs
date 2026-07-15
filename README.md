@@ -10,6 +10,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 
 - Domain modeling primitives: `Entity`, `AggregateRoot`, `ValueObject`, `DomainEvent`
 - Validated value objects via `value_object!`; strongly typed UUID v7 IDs via `id_type!`
+- `Money`/`Currency` in `i128` minor units — checked arithmetic, lossless allocation, crypto magnitudes (wei) included
 - Command/query handlers with validation + tracing applied by the `dispatch` seam
 - Repository abstraction with optimistic concurrency control
 - Atomic aggregate save + outbox in one transaction (`TransactionalRepository` / `save_and_enqueue_in`)
@@ -18,6 +19,8 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Schema evolution through JSON upcasters (`VersionedJsonCodec`)
 - Outbox dispatcher with per-key ordered concurrency and a failed→DLQ sweep
 - Idempotent consumers in one call (`process_idempotent`)
+- Durable event sourcing and sagas on PostgreSQL (`PgEventStore`, `PgSnapshotStore`, `PgSagaStore`)
+- Saga deadlines: schedule timeouts on `Start`/`Advance` and sweep them with `SagaRunner::run_due_timeouts`
 - Tower as the cross-cutting pipeline seam (timeouts, limits, authorization)
 - Observability with `tracing` spans and `metrics` counters throughout
 

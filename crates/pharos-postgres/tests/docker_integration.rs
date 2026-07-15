@@ -3,14 +3,18 @@ use pharos_app::{
     DeadLetterMessage, DeadLetterQueue, IdempotencyDecision, InboxStore, Message, OutboxMessage,
     OutboxRepository, TenantContext,
 };
-use pharos_core::{AggregateRoot, DomainEvent, Entity, Repository};
-use pharos_postgres::{
-    Pool, PostgresDeadLetterQueue, PostgresInboxStore, PostgresJsonRepository,
-    PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork, TenantJsonRepository,
-    connect_pool, migrate_postgres_aggregate_schema, migrate_postgres_dead_letter_schema,
-    migrate_postgres_eventing_schema, migrate_postgres_tenant_aggregate_schema,
-    save_aggregate_and_enqueue,
+use pharos_core::{
+    AggregateEvents, AggregateRoot, DomainEvent, Entity, Repository, RepositoryError,
 };
+use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, SnapshotStore};
+use pharos_postgres::{
+    PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue, PostgresInboxStore,
+    PostgresJsonRepository, PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork,
+    TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
+    migrate_postgres_dead_letter_schema, migrate_postgres_eventing_schema,
+    migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue,
+};
+use pharos_saga::{SagaInstance, SagaStatus, SagaStore, SagaTimeoutStore};
 use serde::{Deserialize, Serialize};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, runners::AsyncRunner};
@@ -394,6 +398,284 @@ fn map_to_message(event: &TestEvent) -> Message {
         "text/plain",
     )
     .with_key(&event.aggregate_id)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LedgerEntryPosted {
+    ledger_id: String,
+    amount_minor: i64,
+    occurred_at: DateTime<Utc>,
+}
+
+impl DomainEvent for LedgerEntryPosted {
+    fn event_type(&self) -> &'static str {
+        "LedgerEntryPosted"
+    }
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+    fn aggregate_id(&self) -> &str {
+        &self.ledger_id
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Ledger {
+    id: String,
+    balance_minor: i64,
+    version: u64,
+    #[serde(skip)]
+    events: AggregateEvents<LedgerEntryPosted>,
+}
+
+impl Ledger {
+    fn post(&mut self, id: &str, amount_minor: i64) {
+        self.events.raise(LedgerEntryPosted {
+            ledger_id: id.to_string(),
+            amount_minor,
+            occurred_at: Utc::now(),
+        });
+        self.id = id.to_string();
+        self.balance_minor += amount_minor;
+    }
+}
+
+impl Entity for Ledger {
+    type Id = String;
+    fn id(&self) -> &Self::Id {
+        &self.id
+    }
+}
+
+impl AggregateRoot for Ledger {
+    type Event = LedgerEntryPosted;
+    fn pending_events(&self) -> &[Self::Event] {
+        self.events.pending()
+    }
+    fn drain_events(&mut self) -> Vec<Self::Event> {
+        self.events.drain()
+    }
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn set_version(&mut self, version: u64) {
+        self.version = version;
+    }
+}
+
+impl EventSourced for Ledger {
+    fn apply(&mut self, event: &Self::Event) {
+        self.id = event.ledger_id.clone();
+        self.balance_minor += event.amount_minor;
+    }
+}
+
+fn posted(ledger_id: &str, amount_minor: i64) -> LedgerEntryPosted {
+    LedgerEntryPosted {
+        ledger_id: ledger_id.to_string(),
+        amount_minor,
+        occurred_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn pg_event_store_appends_loads_and_enforces_occ() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::with_stream_type(pool, "ledger");
+    store.migrate().await?;
+
+    let id = "ledger-1".to_string();
+    store
+        .append(&id, 0, vec![posted(&id, 1_000), posted(&id, -250)])
+        .await?;
+
+    let events = store.load(&id).await?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(events[1].event.amount_minor, -250);
+
+    // load_after replays only the tail.
+    let tail = store.load_after(&id, 1).await?;
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].sequence, 2);
+
+    // A stale expected_version is a concurrency conflict, both below and
+    // above the current head.
+    let Err(RepositoryError::ConcurrencyConflict { expected, actual }) =
+        store.append(&id, 0, vec![posted(&id, 1)]).await
+    else {
+        panic!("stale append must conflict");
+    };
+    assert_eq!(expected, 0);
+    assert_eq!(actual, Some(2));
+    assert!(matches!(
+        store.append(&id, 5, vec![posted(&id, 1)]).await,
+        Err(RepositoryError::ConcurrencyConflict { .. })
+    ));
+
+    // The stream is untouched by the failed appends.
+    assert_eq!(store.load(&id).await?.len(), 2);
+
+    // Unknown streams load empty; empty appends are no-ops.
+    assert!(store.load(&"missing".to_string()).await?.is_empty());
+    store.append(&id, 2, vec![]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pg_snapshot_store_upserts_and_delete_stream_removes_both() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::with_stream_type(pool.clone(), "ledger");
+    store.migrate().await?;
+    let snapshots: PgSnapshotStore<String, Ledger> =
+        PgSnapshotStore::with_stream_type(pool, "ledger");
+
+    let id = "ledger-2".to_string();
+    store.append(&id, 0, vec![posted(&id, 500)]).await?;
+
+    assert!(snapshots.load(&id).await?.is_none());
+    let ledger = Ledger {
+        id: id.clone(),
+        balance_minor: 500,
+        version: 1,
+        events: AggregateEvents::default(),
+    };
+    snapshots
+        .save(&id, Snapshot::new(ledger.clone(), 1))
+        .await?;
+
+    // Upsert replaces the previous snapshot.
+    let newer = Ledger {
+        balance_minor: 750,
+        version: 2,
+        ..ledger
+    };
+    snapshots.save(&id, Snapshot::new(newer, 2)).await?;
+    let loaded = snapshots.load(&id).await?.ok_or("snapshot must exist")?;
+    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.state.balance_minor, 750);
+
+    // Deleting the stream removes the events and the snapshot together.
+    store.delete_stream(&id).await?;
+    assert!(store.load(&id).await?.is_empty());
+    assert!(snapshots.load(&id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_sourced_repository_rehydrates_against_postgres() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::with_stream_type(pool, "ledger");
+    store.migrate().await?;
+    let repo = EventSourcedRepository::<Ledger, _>::new(store);
+
+    let mut ledger = Ledger::default();
+    ledger.post("ledger-3", 10_000);
+    ledger.post("ledger-3", -3_500);
+    repo.save(&mut ledger).await?;
+    assert_eq!(ledger.version(), 2);
+
+    let loaded = repo
+        .find_by_id(&"ledger-3".to_string())
+        .await?
+        .ok_or("ledger not found")?;
+    assert_eq!(loaded.balance_minor, 6_500);
+    assert_eq!(loaded.version(), 2);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum PaymentSagaState {
+    AwaitingConfirmation { amount_minor: i64 },
+    Confirmed,
+}
+
+#[tokio::test]
+async fn pg_saga_store_roundtrips_instances_and_finds_due_deadlines() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let store: PgSagaStore<String, PaymentSagaState> = PgSagaStore::with_saga_type(pool, "payment");
+    store.migrate().await?;
+
+    // Roundtrip: state, status, and deadline survive persistence.
+    let deadline = Utc::now() - chrono::Duration::minutes(10);
+    store
+        .save(SagaInstance::running_until(
+            "pay-due".to_string(),
+            PaymentSagaState::AwaitingConfirmation { amount_minor: 900 },
+            deadline,
+        ))
+        .await?;
+    let loaded = store
+        .load(&"pay-due".to_string())
+        .await?
+        .ok_or("instance must exist")?;
+    assert_eq!(loaded.status, SagaStatus::Running);
+    assert_eq!(
+        loaded.state,
+        PaymentSagaState::AwaitingConfirmation { amount_minor: 900 }
+    );
+    assert_eq!(
+        loaded.deadline.map(|d| d.timestamp_millis()),
+        Some(deadline.timestamp_millis())
+    );
+    assert!(store.load(&"missing".to_string()).await?.is_none());
+
+    // find_due skips future deadlines, terminal instances, and no-deadline
+    // instances, and respects the limit ordered by soonest deadline.
+    store
+        .save(SagaInstance::running_until(
+            "pay-due-later".to_string(),
+            PaymentSagaState::AwaitingConfirmation { amount_minor: 100 },
+            Utc::now() - chrono::Duration::minutes(1),
+        ))
+        .await?;
+    store
+        .save(SagaInstance::running_until(
+            "pay-future".to_string(),
+            PaymentSagaState::AwaitingConfirmation { amount_minor: 100 },
+            Utc::now() + chrono::Duration::hours(1),
+        ))
+        .await?;
+    store
+        .save(SagaInstance::running(
+            "pay-no-deadline".to_string(),
+            PaymentSagaState::AwaitingConfirmation { amount_minor: 100 },
+        ))
+        .await?;
+    let mut completed = SagaInstance::running_until(
+        "pay-completed".to_string(),
+        PaymentSagaState::Confirmed,
+        Utc::now() - chrono::Duration::minutes(30),
+    );
+    completed.status = SagaStatus::Completed;
+    store.save(completed).await?;
+
+    let due = store.find_due(Utc::now(), 10).await?;
+    assert_eq!(
+        due.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["pay-due", "pay-due-later"]
+    );
+
+    let limited = store.find_due(Utc::now(), 1).await?;
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].id, "pay-due");
+
+    // Upsert: completing the due instance takes it out of the sweep.
+    let mut confirmed = loaded;
+    confirmed.state = PaymentSagaState::Confirmed;
+    confirmed.status = SagaStatus::Completed;
+    confirmed.deadline = None;
+    store.save(confirmed).await?;
+    let due = store.find_due(Utc::now(), 10).await?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].id, "pay-due-later");
+    Ok(())
 }
 
 async fn start_postgres()

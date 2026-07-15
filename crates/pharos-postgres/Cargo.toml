@@ -1,6 +1,6 @@
 [package]
 name = "pharos-postgres"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -9,8 +9,10 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Pooled PostgreSQL adapters (outbox, inbox, JSON aggregate repository) for Pharos RS."
 
 [dependencies]
-pharos-core = { path = "../pharos-core", version = "0.1.0" }
-pharos-app  = { path = "../pharos-app", version = "0.1.0" }
+pharos-core = { path = "../pharos-core", version = "0.2.0" }
+pharos-app  = { path = "../pharos-app", version = "0.2.0" }
+pharos-es   = { path = "../pharos-es", version = "0.2.0" }
+pharos-saga = { path = "../pharos-saga", version = "0.2.0" }
 
 chrono     = { workspace = true }
 metrics    = { workspace = true }
