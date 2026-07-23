@@ -10,9 +10,10 @@ use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, Snap
 use pharos_postgres::{
     PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue, PostgresInboxStore,
     PostgresJsonRepository, PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork,
+    SaveAndEnqueueError,
     TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
     migrate_postgres_dead_letter_schema, migrate_postgres_eventing_schema,
-    migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue,
+    migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue, save_and_enqueue_in,
 };
 use pharos_saga::{SagaInstance, SagaStatus, SagaStore, SagaTimeoutStore};
 use serde::{Deserialize, Serialize};
@@ -343,6 +344,69 @@ async fn tenant_json_repository_isolates_rows_by_tenant() -> TestResult {
     repo_a.delete(&shared_id).await?;
     assert!(repo_a.find_by_id(&shared_id).await?.is_none());
     assert!(repo_b.find_by_id(&shared_id).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    migrate_postgres_tenant_aggregate_schema(&pool).await?;
+    migrate_postgres_eventing_schema(&pool).await?;
+
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let repo = TenantJsonRepository::<TestAggregate>::new(pool.clone(), &tenant, "test_aggregate");
+
+    let agg_id = Uuid::now_v7().to_string();
+    let mut aggregate = TestAggregate {
+        id: agg_id.clone(),
+        name: "Tenant aggregate".to_string(),
+        version: 0,
+        events: vec![
+            TestEvent {
+                aggregate_id: agg_id.clone(),
+                occurred_at: Utc::now(),
+            },
+            TestEvent {
+                aggregate_id: agg_id.clone(),
+                occurred_at: Utc::now(),
+            },
+        ],
+    };
+
+    // Atomic: the tenant-scoped snapshot and both outbox rows commit together.
+    save_and_enqueue_in(&pool, &repo, &mut aggregate, map_to_message).await?;
+    assert_eq!(aggregate.version(), 1);
+
+    let found = repo.find_by_id(&agg_id).await?;
+    assert_eq!(found.map(|a| a.name), Some("Tenant aggregate".to_string()));
+
+    let outbox = PostgresOutboxRepository::new(pool.clone());
+    assert_eq!(outbox.pending(10).await?.len(), 2);
+
+    // A stale write conflicts and leaves no new outbox rows (rolled back).
+    let mut stale = TestAggregate {
+        id: agg_id.clone(),
+        name: "Stale".to_string(),
+        version: 0,
+        events: vec![TestEvent {
+            aggregate_id: agg_id.clone(),
+            occurred_at: Utc::now(),
+        }],
+    };
+    let result = save_and_enqueue_in(&pool, &repo, &mut stale, map_to_message).await;
+    assert!(matches!(
+        result,
+        Err(SaveAndEnqueueError::Repository(
+            RepositoryError::ConcurrencyConflict { expected: 0, .. }
+        ))
+    ));
+    // Still only the two rows from the successful commit; the conflict rolled
+    // back its outbox insert. Count directly — `pending()` above already leased
+    // the rows, so a second `pending()` would report zero regardless.
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM pharos_outbox")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total, 2);
     Ok(())
 }
 

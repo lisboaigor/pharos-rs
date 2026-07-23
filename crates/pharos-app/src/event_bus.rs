@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use pharos_core::DomainEvent;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{Instrument, debug, info_span};
 
@@ -33,6 +34,17 @@ pub enum EventBusError {
         /// The individual handler failures, in registration order.
         errors: Vec<EventBusError>,
     },
+    /// A payload could not be decoded back into its concrete event type during
+    /// [`EventBus::publish_erased`] (the relay/outbox seam). The bytes did not
+    /// match the type registered for `topic` via [`EventBus::register_decoder`].
+    #[error("failed to decode payload for topic '{topic}': {source}")]
+    DecodeError {
+        /// Routing topic whose registered decoder rejected the payload.
+        topic: String,
+        /// The underlying deserialization error.
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Decides what happens when a handler fails during [`EventBus::publish`].
@@ -56,6 +68,14 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Registry of erased handlers keyed by the concrete event `TypeId`.
 type HandlerRegistry = HashMap<TypeId, Vec<Arc<dyn ErasedHandler>>>;
+
+/// Decodes an outbox payload back into a boxed concrete event of a known type.
+type DecodeFn =
+    Arc<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>, serde_json::Error> + Send + Sync>;
+
+/// Registry mapping a routing topic to the concrete event type it decodes into,
+/// used by [`EventBus::publish_erased`] to reconstruct a typed event from bytes.
+type DecoderRegistry = HashMap<String, (TypeId, DecodeFn)>;
 
 trait ErasedHandler: Send + Sync {
     fn call<'a>(
@@ -120,6 +140,7 @@ where
 #[derive(Clone, Default)]
 pub struct EventBus {
     handlers: Arc<RwLock<HandlerRegistry>>,
+    decoders: Arc<RwLock<DecoderRegistry>>,
     error_policy: PublishErrorPolicy,
 }
 
@@ -144,6 +165,7 @@ impl EventBus {
     pub fn with_error_policy(error_policy: PublishErrorPolicy) -> Self {
         Self {
             handlers: Arc::default(),
+            decoders: Arc::default(),
             error_policy,
         }
     }
@@ -234,6 +256,106 @@ impl EventBus {
                 1 => Err(errors.remove(0)),
                 _ => Err(EventBusError::HandlerErrors {
                     event_type: event.event_type(),
+                    errors,
+                }),
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Registers how to decode a serialized event carried on `topic` back into
+    /// its concrete type `E`, so [`publish_erased`](Self::publish_erased) can
+    /// deliver outbox/relay payloads to the same typed handlers as
+    /// [`publish`](Self::publish).
+    ///
+    /// This is the in-process bridge for the durable outbox seam: a background
+    /// relay reads `Message { topic, payload }` rows and has only bytes, while
+    /// dispatch is keyed by `TypeId`. Registering a decoder ties a stable topic
+    /// string to `TypeId::of::<E>()` and a JSON decoder, closing that gap
+    /// without leaking `Any`/`TypeId` into the domain. Register the decoder for
+    /// every event type you route through the outbox, alongside its handlers.
+    ///
+    /// Re-registering the same topic overwrites the previous decoder.
+    pub fn register_decoder<E>(&self, topic: impl Into<String>)
+    where
+        E: DomainEvent + DeserializeOwned,
+    {
+        let decoder: DecodeFn = Arc::new(|bytes: &[u8]| {
+            let event: E = serde_json::from_slice(bytes)?;
+            Ok(Box::new(event) as Box<dyn Any + Send + Sync>)
+        });
+
+        self.decoders
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(topic.into(), (TypeId::of::<E>(), decoder));
+    }
+
+    /// Decodes a serialized event and publishes it to the handlers registered
+    /// for its concrete type — the type-erased counterpart of
+    /// [`publish`](Self::publish) used by the outbox relay.
+    ///
+    /// `topic` must have been registered with
+    /// [`register_decoder`](Self::register_decoder). Behaviour mirrors
+    /// `publish` exactly once the concrete event is reconstructed: same handler
+    /// order, same [`PublishErrorPolicy`], same at-least-once semantics.
+    ///
+    /// - Unknown `topic` (no decoder) is a silent no-op returning `Ok`, so
+    ///   publishing stays decoupled from consumption — matching how `publish`
+    ///   drops events with no registered handler.
+    /// - A payload that fails to decode returns
+    ///   [`EventBusError::DecodeError`] so the relay can retry or dead-letter.
+    pub async fn publish_erased(
+        &self,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), EventBusError> {
+        let span = info_span!("event_bus.publish_erased", event.topic = topic);
+
+        async move {
+            let Some((type_id, decoder)) = ({
+                let decoders = self.decoders.read().unwrap_or_else(|p| p.into_inner());
+                decoders.get(topic).cloned()
+            }) else {
+                debug!("no decoder registered for topic");
+                return Ok(());
+            };
+
+            let boxed = decoder(payload).map_err(|source| EventBusError::DecodeError {
+                topic: topic.to_owned(),
+                source,
+            })?;
+
+            let handlers = {
+                let map = self.handlers.read().unwrap_or_else(|p| p.into_inner());
+                match map.get(&type_id) {
+                    Some(handlers) => handlers.clone(),
+                    None => {
+                        debug!("no handler registered for decoded event");
+                        return Ok(());
+                    }
+                }
+            };
+
+            let any: &(dyn Any + Send + Sync) = &*boxed;
+
+            let mut errors = Vec::new();
+            for handler in &handlers {
+                match handler.call(any).await {
+                    Ok(()) => {}
+                    Err(error) => match self.error_policy {
+                        PublishErrorPolicy::FailFast => return Err(error),
+                        PublishErrorPolicy::CollectAll => errors.push(error),
+                    },
+                }
+            }
+
+            match errors.len() {
+                0 => Ok(()),
+                1 => Err(errors.remove(0)),
+                _ => Err(EventBusError::HandlerErrors {
+                    event_type: "<erased>",
                     errors,
                 }),
             }
@@ -345,5 +467,73 @@ mod tests {
 
         assert!(matches!(result, Err(EventBusError::HandlerError { .. })));
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    // A serde-capable event to exercise the outbox/relay bridge.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Echo {
+        aggregate_id: String,
+        occurred_at: DateTime<Utc>,
+        note: String,
+    }
+
+    impl DomainEvent for Echo {
+        fn event_type(&self) -> &'static str {
+            "Echo"
+        }
+        fn occurred_at(&self) -> DateTime<Utc> {
+            self.occurred_at
+        }
+        fn aggregate_id(&self) -> &str {
+            &self.aggregate_id
+        }
+    }
+
+    struct Recorder(Arc<std::sync::Mutex<Vec<String>>>);
+    impl EventHandler<Echo> for Recorder {
+        type Error = std::convert::Infallible;
+        async fn handle(&self, event: &Echo) -> Result<(), Self::Error> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.note.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn publish_erased_decodes_and_dispatches_to_the_typed_handlers() {
+        let bus = EventBus::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        bus.register::<Echo, _>(Recorder(Arc::clone(&seen)));
+        bus.register_decoder::<Echo>("Echo");
+
+        let event = Echo {
+            aggregate_id: "a-1".to_string(),
+            occurred_at: Utc::now(),
+            note: "hello".to_string(),
+        };
+        let payload = serde_json::to_vec(&event).expect("serialize");
+
+        // The bytes are decoded back into `Echo` and reach the same handler as
+        // a typed `publish` would.
+        bus.publish_erased("Echo", &payload).await.expect("dispatch");
+        assert_eq!(&*seen.lock().unwrap(), &["hello".to_string()]);
+
+        // Unknown topic (no decoder) is a silent no-op, like `publish` with no
+        // handler — publishing stays decoupled from consumption.
+        bus.publish_erased("Unknown", &payload)
+            .await
+            .expect("unknown topic is a no-op");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // A corrupt payload surfaces a DecodeError so the relay can retry or
+        // dead-letter instead of silently dropping the message.
+        let err = bus
+            .publish_erased("Echo", b"not json")
+            .await
+            .expect_err("corrupt payload must fail");
+        assert!(matches!(err, EventBusError::DecodeError { .. }));
     }
 }
