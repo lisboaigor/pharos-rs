@@ -287,3 +287,98 @@ where
         .await
     }
 }
+
+/// Tenant-scoped transactional composition: implementing this alongside
+/// [`Repository`] lets [`save_and_enqueue_in`](crate::save_and_enqueue_in) cover
+/// the aggregate snapshot **and** the outbox inserts in one `BEGIN … COMMIT`,
+/// with row-level isolation preserved. It is the tenant analogue of the
+/// [`PostgresJsonRepository`](crate::PostgresJsonRepository) impl.
+///
+/// The OCC mirrors [`Repository::save`] exactly — only the connection differs:
+/// writes go through the caller's live transaction instead of the pool.
+impl<A> crate::TransactionalRepository<A> for TenantJsonRepository<A>
+where
+    A: AggregateRoot + Serialize + DeserializeOwned + Send + Sync + 'static,
+    <A as Entity>::Id: Display + FromStr + Send + Sync + 'static,
+    <<A as Entity>::Id as FromStr>::Err: Display + Send + Sync + 'static,
+{
+    type Error = PostgresRepositoryError;
+
+    async fn save_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        aggregate: &mut A,
+    ) -> Result<(), RepositoryError<Self::Error>> {
+        let aggregate_id =
+            parse_aggregate_id(&aggregate.id().to_string()).map_err(RepositoryError::Storage)?;
+        let expected = aggregate.version();
+        let new_version = expected + 1;
+
+        // Same contract as `save`: serialize with the new version applied, then
+        // revert it on any failure so the composing caller retries from intact
+        // state (it also reverts if the surrounding transaction later fails).
+        aggregate.set_version(new_version);
+        let payload = serde_json::to_string(&*aggregate).map_err(|e| {
+            aggregate.set_version(expected);
+            RepositoryError::Storage(PostgresRepositoryError::Serialization(e))
+        })?;
+        let now = Utc::now();
+
+        let affected = if expected == 0 {
+            sqlx::query(
+                "INSERT INTO pharos_tenant_aggregates
+                    (tenant_id, aggregate_type, aggregate_id, payload, version, updated_at)
+                 VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+                 ON CONFLICT (tenant_id, aggregate_type, aggregate_id) DO NOTHING",
+            )
+            .bind(self.tenant_id)
+            .bind(&self.aggregate_type)
+            .bind(aggregate_id)
+            .bind(&payload)
+            .bind(new_version as i64)
+            .bind(now)
+            .execute(&mut *conn)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE pharos_tenant_aggregates
+                 SET payload = $4::jsonb, version = $5, updated_at = $6
+                 WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3
+                   AND version = $7",
+            )
+            .bind(self.tenant_id)
+            .bind(&self.aggregate_type)
+            .bind(aggregate_id)
+            .bind(&payload)
+            .bind(new_version as i64)
+            .bind(now)
+            .bind(expected as i64)
+            .execute(&mut *conn)
+            .await
+        }
+        .map_err(|e| {
+            aggregate.set_version(expected); // revert on DB error
+            RepositoryError::Storage(PostgresRepositoryError::Storage(e))
+        })?
+        .rows_affected();
+
+        if affected == 0 {
+            aggregate.set_version(expected); // revert on optimistic lock conflict
+            let actual = sqlx::query(
+                "SELECT version FROM pharos_tenant_aggregates
+                 WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3",
+            )
+            .bind(self.tenant_id)
+            .bind(&self.aggregate_type)
+            .bind(aggregate_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| RepositoryError::Storage(PostgresRepositoryError::Storage(e)))?
+            .map(|r| r.try_get::<i64, _>("version").map(|v| v as u64))
+            .transpose()
+            .map_err(|e| RepositoryError::Storage(PostgresRepositoryError::Storage(e)))?;
+            return Err(RepositoryError::ConcurrencyConflict { expected, actual });
+        }
+        Ok(())
+    }
+}
