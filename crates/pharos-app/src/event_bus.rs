@@ -306,11 +306,7 @@ impl EventBus {
     ///   drops events with no registered handler.
     /// - A payload that fails to decode returns
     ///   [`EventBusError::DecodeError`] so the relay can retry or dead-letter.
-    pub async fn publish_erased(
-        &self,
-        topic: &str,
-        payload: &[u8],
-    ) -> Result<(), EventBusError> {
+    pub async fn publish_erased(&self, topic: &str, payload: &[u8]) -> Result<(), EventBusError> {
         let span = info_span!("event_bus.publish_erased", event.topic = topic);
 
         async move {
@@ -518,7 +514,9 @@ mod tests {
 
         // The bytes are decoded back into `Echo` and reach the same handler as
         // a typed `publish` would.
-        bus.publish_erased("Echo", &payload).await.expect("dispatch");
+        bus.publish_erased("Echo", &payload)
+            .await
+            .expect("dispatch");
         assert_eq!(&*seen.lock().unwrap(), &["hello".to_string()]);
 
         // Unknown topic (no decoder) is a silent no-op, like `publish` with no
