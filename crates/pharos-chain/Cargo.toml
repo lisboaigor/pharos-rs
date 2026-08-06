@@ -1,0 +1,28 @@
+[package]
+name = "pharos-chain"
+version = "0.2.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Chain-agnostic UTXO/eUTXO core for Pharos: observe and submit ports, reorg/finality-aware types, and smart-contract interaction vocabulary."
+
+[dependencies]
+pharos-core = { path = "../pharos-core", version = "0.2.0", features = ["serde"] }
+pharos-app  = { path = "../pharos-app",  version = "0.2.0" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+uuid        = { workspace = true, features = ["v5"] }
+chrono      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+pharos-saga    = { path = "../pharos-saga",    version = "0.2.0" }
+pharos-memory  = { path = "../pharos-memory",  version = "0.2.0" }
+pharos-testing = { path = "../pharos-testing", version = "0.2.0" }
+tokio          = { workspace = true }
+
+[lints]
+workspace = true
