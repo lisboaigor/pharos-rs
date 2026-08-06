@@ -15,9 +15,13 @@ axum = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+# The official Rust client: the `metrics` ecosystem has no exemplar support
+# (open issue upstream), and without exemplars there is no jump from a latency
+# observation to the trace behind it.
+prometheus-client = "0.25"
 
 [dev-dependencies]
-# Captura o que o span efetivamente emite (um span sem subscriber é inerte).
+# Captures what a span actually emits (a span without a subscriber is inert).
 pharos-testing = { path = "../pharos-testing", version = "0.2.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true }

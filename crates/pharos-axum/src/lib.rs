@@ -4,8 +4,10 @@
 //! expose command and query handlers through Axum routes.
 //!
 //! See [`observability`] for the request span that correlates everything one
-//! HTTP call sets off.
+//! HTTP call sets off, and [`metrics`] for RED metrics whose exemplars link a
+//! latency observation back to that trace.
 
+pub mod metrics;
 pub mod observability;
 
 pub use observability::{
