@@ -89,10 +89,14 @@ pub trait Command: Send + Sync + 'static {
 
     /// Builds the tracing span under which this command is handled.
     ///
-    /// The default span carries only `command = Self::NAME`. Override it to
-    /// record command-specific fields (ids, quantities, …): they describe the
-    /// command's own data, so they live on the DTO and keep handlers free of
-    /// any tracing concern.
+    /// This bare trait default carries only `command = Self::NAME`.
+    /// [`#[derive(Command)]`] overrides it with a span recording **every**
+    /// field, so an error in the logs can be traced back to the arguments that
+    /// caused it; see the derive's docs for opting a field out with
+    /// `#[trace(skip)]`.
+    ///
+    /// Implement it by hand only when the fields to record are not the struct's
+    /// own (a computed total, the length of a collection):
     ///
     /// ```ignore
     /// fn trace_span(&self) -> tracing::Span {
@@ -100,6 +104,7 @@ pub trait Command: Send + Sync + 'static {
     ///         "command.handle",
     ///         command = Self::NAME,
     ///         order_id = %self.order_id,
+    ///         itens = self.itens.len(),
     ///     )
     /// }
     /// ```

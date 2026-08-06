@@ -68,6 +68,7 @@ pub mod entity;
 pub mod errors;
 pub mod money;
 pub mod repository;
+pub mod secret;
 pub mod value_object;
 
 /// Re-exports used by the code generated in `pharos-macros`, so deriving
@@ -83,4 +84,5 @@ pub use entity::Entity;
 pub use errors::{DomainError, DomainResult};
 pub use money::{Currency, Money, MoneyError};
 pub use repository::{Repository, RepositoryError};
+pub use secret::{REDACTED, Secret};
 pub use value_object::ValueObject;

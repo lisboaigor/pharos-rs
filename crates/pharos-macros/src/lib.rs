@@ -13,9 +13,11 @@
 //!   be string-like so `aggregate_id()` can borrow it).
 //! - `#[derive(Command)]` / `#[derive(Query)]` for application DTOs: derive the
 //!   `NAME` label (default = type name, override with `#[command(name = "...")]`
-//!   / `#[query(name = "...")]`) and generate the tracing `trace_span` from
-//!   `#[trace]`-annotated fields. `#[derive(Query)]` also needs the read model
-//!   type via `#[query(result = Type)]`.
+//!   / `#[query(name = "...")]`) and generate a tracing `trace_span` recording
+//!   every field, so a failure is always traceable to the arguments that caused
+//!   it (`#[trace(skip)]` opts a field out; wrap secrets in
+//!   `pharos_core::Secret`). `#[derive(Query)]` also needs the read model type
+//!   via `#[query(result = Type)]`.
 //! - `#[external_fields]` attribute macro (paired with `#[external]` on the
 //!   relevant fields) to exempt HTTP-DTO fields sourced from the URL path or
 //!   an auth claim from `Deserialize`'s body requirement.
@@ -240,9 +242,34 @@ pub fn derive_domain_event(input: TokenStream) -> TokenStream {
 /// Derives `pharos_app::Command` for a struct.
 ///
 /// The command's `NAME` defaults to the type name; override it with
-/// `#[command(name = "...")]`. Annotate fields with `#[trace]` to have the
-/// generated `trace_span` record them — so the DTO declares its observability
-/// and the handler stays pure business logic.
+/// `#[command(name = "...")]`.
+///
+/// ## Tracing
+///
+/// The generated `trace_span` records **every field** — so an error in the logs
+/// can always be traced back to the command and the arguments that caused it,
+/// and the DTO declares its own observability while the handler stays pure
+/// business logic.
+///
+/// Fields are recorded via `Debug` by default, which is the only mode a derive
+/// macro can pick without knowing the type; a field whose type lacks `Debug`
+/// is a compile error, not a silent omission. Override per field with
+/// `#[trace(value)]` (types implementing `tracing::Value`), `#[trace(display)]`,
+/// `#[trace(name = "...")]`, or drop it with `#[trace(skip)]`.
+///
+/// Use `#[trace(skip)]` for blobs and personal data. Do **not** use it for
+/// secrets: wrap those in `pharos_core::Secret`, so a field added later cannot
+/// leak just because nobody remembered to annotate it.
+///
+/// ```ignore
+/// #[derive(Command, Deserialize)]
+/// pub struct Login {
+///     pub username: String,          // recorded
+///     pub senha: Secret<String>,     // recorded as "[redacted]"
+///     #[trace(skip)]
+///     pub xml: String,               // omitted
+/// }
+/// ```
 ///
 /// ## Input validation with garde
 ///
@@ -290,14 +317,15 @@ pub fn derive_command(input: TokenStream) -> TokenStream {
 ///
 /// Like [`macro@Command`], but the read model type is required:
 /// `#[query(result = Option<u64>)]`. `NAME` defaults to the type name
-/// (override with `#[query(name = "...")]`), and `#[trace]` fields feed the
-/// generated `query.handle` span.
+/// (override with `#[query(name = "...")]`), and every field feeds the
+/// generated `query.handle` span under the same rules as the command derive —
+/// `Debug` by default, `#[trace(skip)]` to opt out.
 ///
 /// ```ignore
 /// #[derive(Query)]
 /// #[query(result = Option<u64>)]
 /// pub struct GetOrderTotal {
-///     #[trace(display)] pub order_id: Uuid,
+///     pub order_id: Uuid,
 /// }
 /// ```
 #[proc_macro_derive(Query, attributes(query, trace))]
@@ -514,22 +542,36 @@ fn expand_dispatchable(
     })
 }
 
-/// How a `#[trace]` field is recorded on the span.
+/// How a field is recorded on the span.
 enum TraceMode {
     /// `field = self.field` (the type implements `tracing::Value`).
     Value,
     /// `field = %self.field` (recorded via `Display`).
     Display,
-    /// `field = ?self.field` (recorded via `Debug`).
+    /// `field = ?self.field` (recorded via `Debug`). The default for an
+    /// unannotated field: it is the only mode that works without knowing the
+    /// type, which a derive macro cannot.
     Debug,
+    /// The field is left off the span entirely.
+    Skip,
 }
 
-/// Builds the span-field tokens for every `#[trace]`-annotated named field.
+/// Builds the span-field tokens for every named field.
+///
+/// Every field is recorded unless it opts out with `#[trace(skip)]`. The
+/// inverse (opt in per field) was the original design and it failed in
+/// practice: the annotation is invisible when missing, so spans silently stayed
+/// empty and the command that caused an error could not be identified from the
+/// logs. Recording by default makes the omission the loud case instead —
+/// a field whose type lacks `Debug` fails to compile.
+///
+/// Secrets must not rely on someone remembering `skip`: wrap them in
+/// `pharos_core::Secret`, whose `Debug` writes a placeholder.
 fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let fields = match &ast.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(f) => &f.named,
-            // Tuple/unit structs cannot carry `#[trace]` fields; nothing to record.
+            // Tuple/unit structs have no field names to record.
             _ => return Ok(Vec::new()),
         },
         _ => return Ok(Vec::new()),
@@ -537,21 +579,33 @@ fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::Token
 
     let mut out = Vec::new();
     for field in fields {
-        let Some(attr) = field.attrs.iter().find(|a| a.path().is_ident("trace")) else {
-            continue;
-        };
+        let attr = field.attrs.iter().find(|a| a.path().is_ident("trace"));
         let ident = field
             .ident
             .as_ref()
             .ok_or_else(|| syn::Error::new(field.span(), "`#[trace]` requires a named field"))?;
 
-        let mut mode = TraceMode::Value;
+        // Unannotated fields are recorded via `Debug`; `#[trace]` alone still
+        // means `Value`, so the pre-existing annotations keep their meaning.
+        let mut mode = match attr {
+            Some(a) if matches!(a.meta, Meta::Path(_)) => TraceMode::Value,
+            Some(_) => TraceMode::Debug,
+            None => TraceMode::Debug,
+        };
         let mut rename: Option<LitStr> = None;
-        // `#[trace]` is a bare path; `#[trace(display)]`, `#[trace(debug)]`,
-        // `#[trace(name = "...")]` (and combinations) carry options.
-        if !matches!(attr.meta, Meta::Path(_)) {
+        // `#[trace]` is a bare path; `#[trace(skip)]`, `#[trace(display)]`,
+        // `#[trace(debug)]`, `#[trace(name = "...")]` carry options.
+        if let Some(attr) = attr
+            && !matches!(attr.meta, Meta::Path(_))
+        {
             attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("display") {
+                if meta.path.is_ident("skip") {
+                    mode = TraceMode::Skip;
+                    Ok(())
+                } else if meta.path.is_ident("value") {
+                    mode = TraceMode::Value;
+                    Ok(())
+                } else if meta.path.is_ident("display") {
                     mode = TraceMode::Display;
                     Ok(())
                 } else if meta.path.is_ident("debug") {
@@ -561,7 +615,8 @@ fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::Token
                     rename = Some(meta.value()?.parse()?);
                     Ok(())
                 } else {
-                    Err(meta.error("expected `display`, `debug`, or `name = \"...\"`"))
+                    Err(meta
+                        .error("expected `skip`, `value`, `display`, `debug`, or `name = \"...\"`"))
                 }
             })?;
         }
@@ -571,6 +626,7 @@ fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::Token
             None => quote!(#ident),
         };
         out.push(match mode {
+            TraceMode::Skip => continue,
             TraceMode::Value => quote!(#key = self.#ident),
             TraceMode::Display => quote!(#key = %self.#ident),
             TraceMode::Debug => quote!(#key = ?self.#ident),
