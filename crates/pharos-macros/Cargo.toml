@@ -19,12 +19,15 @@ proc-macro-crate = { workspace = true }
 
 [dev-dependencies]
 # Integration tests derive the real `pharos-app` traits and run them.
-pharos-app = { path = "../pharos-app", version = "0.2.0" }
-tokio      = { workspace = true }
-tracing    = { workspace = true }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-uuid       = { workspace = true }
+pharos-app     = { path = "../pharos-app", version = "0.2.0" }
+# `Secret` is asserted to stay redacted inside the generated span.
+pharos-core    = { path = "../pharos-core", version = "0.2.0" }
+pharos-testing = { path = "../pharos-testing", version = "0.2.0" }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+uuid           = { workspace = true }
 
 [lints]
 workspace = true

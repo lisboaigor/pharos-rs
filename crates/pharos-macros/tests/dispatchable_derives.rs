@@ -106,3 +106,76 @@ const _: fn() = || {
     fn assert_result<Q: Query<Result = Option<u64>>>() {}
     assert_result::<GetThing>();
 };
+
+// ── Span contents: recorded by default, `skip` opts out, `Secret` redacts ─────
+
+#[derive(Command)]
+struct PayInvoice {
+    // No annotation: recorded via `Debug`, which is the whole point — nobody
+    // has to remember anything for the command to be traceable.
+    invoice_id: u64,
+    // Wrapped rather than skipped: the value is unprintable by construction, so
+    // a future edit cannot expose it.
+    password: pharos_core::Secret<String>,
+    // Opted out: a blob would drown the span. Never read precisely because it
+    // is skipped — that absence is what the test asserts.
+    #[trace(skip)]
+    #[expect(dead_code, reason = "exists to prove #[trace(skip)] omits it")]
+    payload: String,
+}
+
+struct PayInvoiceHandler;
+impl CommandHandler<PayInvoice> for PayInvoiceHandler {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn handle(&self, _cmd: PayInvoice) -> Result<(), Self::Error> {
+        // The span is only observable from a log emitted inside the handler —
+        // this stands in for a real handler's own logging.
+        tracing::info!("paying");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn span_records_every_field_unless_skipped() -> Result<(), Box<dyn std::error::Error>> {
+    let subscriber = pharos_testing::TestSubscriber::new();
+    let _guard = subscriber.install();
+
+    dispatch(
+        &PayInvoiceHandler,
+        PayInvoice {
+            invoice_id: 4242,
+            password: pharos_core::Secret::new("hunter2".into()),
+            payload: "a very large blob".into(),
+        },
+    )
+    .await?;
+
+    let lines = subscriber.lines();
+    let span_line = lines
+        .iter()
+        .find(|l| l.contains("command.handle"))
+        .ok_or("no line was emitted inside the command.handle span")?;
+
+    // Recorded without any annotation at all — the behaviour this derive exists
+    // to guarantee.
+    assert!(
+        span_line.contains("4242"),
+        "an unannotated field should appear on the span, got:\n{span_line}"
+    );
+    // Present as evidence the field was filled, but never as the value.
+    assert!(
+        span_line.contains(pharos_core::REDACTED),
+        "Secret should appear redacted, got:\n{span_line}"
+    );
+    assert!(
+        !span_line.contains("hunter2"),
+        "SECRET LEAKED onto the span:\n{span_line}"
+    );
+    assert!(
+        !span_line.contains("a very large blob"),
+        "a #[trace(skip)] field should not appear on the span, got:\n{span_line}"
+    );
+    Ok(())
+}

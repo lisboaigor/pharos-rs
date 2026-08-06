@@ -50,6 +50,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::error::Error;
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -78,15 +79,12 @@ pub enum UpcastError {
         from_version: u32,
         /// Error returned by the upcaster.
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        source: Box<dyn Error + Send + Sync + 'static>,
     },
 }
 
-type UpcastFn = Box<
-    dyn Fn(Value) -> Result<Value, Box<dyn std::error::Error + Send + Sync + 'static>>
-        + Send
-        + Sync,
->;
+type UpcastFn =
+    Box<dyn Fn(Value) -> Result<Value, Box<dyn Error + Send + Sync + 'static>> + Send + Sync>;
 
 /// Registry of JSON payload upcasters keyed by `(event_type, from_version)`.
 ///
@@ -126,7 +124,7 @@ impl JsonUpcasterRegistry {
     ) -> Self
     where
         F: Fn(Value) -> Result<Value, E> + Send + Sync + 'static,
-        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+        E: Into<Box<dyn Error + Send + Sync + 'static>>,
     {
         self.upcasters.insert(
             (event_type.into(), from_version),
