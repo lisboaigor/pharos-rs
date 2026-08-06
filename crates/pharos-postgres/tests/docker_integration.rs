@@ -10,8 +10,7 @@ use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, Snap
 use pharos_postgres::{
     PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue, PostgresInboxStore,
     PostgresJsonRepository, PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork,
-    SaveAndEnqueueError,
-    TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
+    SaveAndEnqueueError, TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
     migrate_postgres_dead_letter_schema, migrate_postgres_eventing_schema,
     migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue, save_and_enqueue_in,
 };

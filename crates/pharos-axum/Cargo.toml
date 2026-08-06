@@ -17,6 +17,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Captura o que o span efetivamente emite (um span sem subscriber é inerte).
+pharos-testing = { path = "../pharos-testing", version = "0.2.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

@@ -2,6 +2,16 @@
 //!
 //! This crate keeps HTTP concerns outside `pharos-app` while making it easy to
 //! expose command and query handlers through Axum routes.
+//!
+//! See [`observability`] for the request span that correlates everything one
+//! HTTP call sets off.
+
+pub mod observability;
+
+pub use observability::{
+    TRACEPARENT_HEADER, Traceparent, record_tenant, record_trace_id, record_user, request_span,
+    traceparent_value,
+};
 
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
