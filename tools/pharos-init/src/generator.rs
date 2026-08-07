@@ -2,6 +2,7 @@ use std::fs;
 
 use indoc::formatdoc;
 
+use crate::assets;
 use crate::config::{EventDelivery, Http, Persistence, ProjectConfig, Serialization};
 
 // ── public surface ────────────────────────────────────────────────────────────
@@ -51,6 +52,18 @@ pub fn generate(cfg: &ProjectConfig) -> std::io::Result<Vec<GeneratedFile>> {
         emit!("src/infrastructure/repository.rs", repository_rs(cfg));
     }
 
+    emit!("Dockerfile", dockerfile(cfg));
+    emit!(".dockerignore", dockerignore());
+    emit!("docker-compose.yml", docker_compose(cfg));
+    emit!(".env.example", env_example(cfg));
+    emit!(
+        "docker/grafana/provisioning/dashboards/dashboards.yml",
+        dashboards_provisioning(cfg)
+    );
+    for asset in assets::OBSERVABILITY {
+        emit!(asset.rel_path, asset.contents.to_string());
+    }
+
     if cfg.uses_axum() {
         emit!("src/web/mod.rs", web_mod_rs(cfg));
         emit!("src/web/state.rs", web_state_rs(cfg));
@@ -59,6 +72,199 @@ pub fn generate(cfg: &ProjectConfig) -> std::io::Result<Vec<GeneratedFile>> {
     }
 
     Ok(files)
+}
+
+fn docker_compose(cfg: &ProjectConfig) -> String {
+    let name = &cfg.project_name;
+
+    // Plain string, not `formatdoc!`: that macro strips the common indentation,
+    // which would lift `postgres:` out of `services:` and produce a compose file
+    // the schema rejects. Here the indentation is the payload.
+    let postgres = if cfg.uses_postgres() {
+        r#"  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+"#
+    } else {
+        ""
+    };
+
+    let depends = if cfg.uses_postgres() {
+        "    depends_on:\n      postgres:\n        condition: service_healthy\n"
+    } else {
+        ""
+    };
+    let pg_volume = if cfg.uses_postgres() {
+        "  postgres_data:\n"
+    } else {
+        ""
+    };
+
+    let obs_services = assets::COMPOSE_SERVICES;
+    let obs_volumes = assets::COMPOSE_VOLUMES;
+
+    formatdoc!(
+        r#"
+        # Everything this application needs to run, plus the observability that
+        # makes it explainable: metrics, logs and traces, already wired.
+        #
+        #   docker compose up -d
+        #   open http://localhost:3002        # Grafana (admin/admin)
+        #
+        # The service is named `app` on purpose: the Prometheus job, the log
+        # pipeline and the dashboards all key off that name, which is what lets
+        # their configuration ship unmodified.
+        #
+        # Editing a mounted config file (docker/**) does NOT reach a running
+        # container — `up -d` only recreates a service whose definition changed.
+        # Apply those with:
+        #   docker compose up -d --force-recreate prometheus grafana loki tempo alloy
+        name: {name}
+
+        services:
+          app:
+            build:
+              context: .
+              # Forwards the SSH agent, which the build needs to fetch the
+              # framework from its private repository.
+              ssh:
+                - default
+            env_file: [.env]
+            ports:
+              - "3000:3000"
+        {depends}    restart: unless-stopped
+
+        {postgres}{obs_services}
+        volumes:
+        {pg_volume}{obs_volumes}
+        "#
+    )
+}
+
+// ── containers ────────────────────────────────────────────────────────────────
+
+fn dockerfile(cfg: &ProjectConfig) -> String {
+    let name = &cfg.project_name;
+    formatdoc!(
+        r#"
+        # syntax=docker/dockerfile:1
+        #
+        # `--mount=type=ssh` is not optional here: the framework is a private git
+        # dependency fetched over SSH, and a build has no agent of its own. Build
+        # with `docker build --ssh default .`, or through the compose file, which
+        # already forwards it.
+
+        FROM rust:1-bookworm AS builder
+        WORKDIR /app
+
+        # Dependencies first, so editing source does not rebuild the world. The
+        # stub is enough to resolve and compile them.
+        COPY Cargo.toml Cargo.lock* ./
+        COPY .cargo ./.cargo
+        RUN mkdir src && echo 'fn main() {{}}' > src/main.rs && echo '' > src/lib.rs \
+            && --mount=type=ssh cargo build --release || true
+        RUN rm -rf src
+
+        COPY src ./src
+        # `touch` invalidates the cached artifact so the real code is compiled.
+        RUN --mount=type=ssh touch src/main.rs src/lib.rs \
+            && cargo build --release --bin {name}
+
+        FROM debian:bookworm-slim AS runtime
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends ca-certificates \
+            && rm -rf /var/lib/apt/lists/*
+
+        RUN useradd --system --uid 10001 appuser
+        USER appuser
+
+        COPY --from=builder /app/target/release/{name} /usr/local/bin/{name}
+
+        # 3000 serves the API; 9464 serves the metrics scrape and is deliberately
+        # not published on the host.
+        EXPOSE 3000
+        CMD ["{name}"]
+        "#
+    )
+}
+
+fn dockerignore() -> String {
+    formatdoc!(
+        r#"
+        target/
+        .git/
+        .github/
+        **/*.log
+        .env
+        .env.*
+        !.env.example
+        .DS_Store
+        "#
+    )
+}
+
+fn env_example(cfg: &ProjectConfig) -> String {
+    let db = if cfg.uses_postgres() {
+        formatdoc!(
+            r#"
+            # Reachable under this name from inside the compose network.
+            DATABASE_URL=postgres://postgres:postgres@postgres:5432/app
+            "#
+        )
+    } else {
+        String::new()
+    };
+    formatdoc!(
+        r#"
+        {db}
+        # Filter directives. The framework's own targets are merged in by
+        # `pharos_observability::init`, so they cannot be dropped by accident.
+        RUST_LOG=info
+
+        # `json` sends span fields to the log store as data, which makes queries
+        # like `| json | span_user="alice"` possible. Anything else keeps the
+        # readable text a terminal wants.
+        LOG_FORMAT=json
+
+        # Where spans go. Empty disables export; the application still logs.
+        OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+        OTEL_TRACES_SAMPLER_ARG=1.0
+
+        GRAFANA_ADMIN_USER=admin
+        GRAFANA_ADMIN_PASSWORD=admin
+        "#
+    )
+}
+
+fn dashboards_provisioning(cfg: &ProjectConfig) -> String {
+    let name = &cfg.project_name;
+    formatdoc!(
+        r#"
+        apiVersion: 1
+
+        providers:
+          - name: {name}
+            folder: {name}
+            type: file
+            updateIntervalSeconds: 30
+            allowUiUpdates: true
+            options:
+              path: /var/lib/grafana/dashboards
+        "#
+    )
 }
 
 // ── Cargo.toml ────────────────────────────────────────────────────────────────
@@ -94,6 +300,16 @@ fn cargo_toml(cfg: &ProjectConfig) -> String {
     if cfg.uses_axum() {
         deps.push_str(&format!("pharos-axum     = {{ git = \"{git}\" }}\n"));
     }
+    // Logging, metrics and traces. Without the `axum` feature it still installs
+    // the filter and the log pipeline, which is all a worker needs.
+    let obs_feat = if cfg.uses_axum() {
+        r#", features = ["otel", "axum"]"#
+    } else {
+        r#", default-features = false, features = ["otel"]"#
+    };
+    deps.push_str(&format!(
+        "pharos-observability = {{ git = \"{git}\"{obs_feat} }}\n"
+    ));
     if cfg.uses_proto() {
         deps.push_str(&format!(
             "pharos-proto    = {{ git = \"{git}\" }}\nprost = \"0.14\"\n"
@@ -211,9 +427,39 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
         use {pkg}::application::handlers::Create{agg}Handler;
         use {pkg}::domain::{module}::{agg};
 
+        /// Serves the metrics scrape on its own port, so `/metrics` is never part
+        /// of the public API surface. OpenMetrics is the only exposition that
+        /// carries exemplars, which is what links a latency spike to its trace.
+        async fn serve_metrics(metrics: std::sync::Arc<pharos_axum::metrics::HttpMetrics>) {{
+            let app = axum::Router::new().route(
+                "/metrics",
+                axum::routing::get(move || {{
+                    let metrics = std::sync::Arc::clone(&metrics);
+                    async move {{
+                        match metrics.encode() {{
+                            Ok(body) => Ok(([(axum::http::header::CONTENT_TYPE,
+                                pharos_axum::metrics::CONTENT_TYPE)], body)),
+                            Err(_) => Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+                        }}
+                    }}
+                }}),
+            );
+            let addr = SocketAddr::from(([0, 0, 0, 0], 9464));
+            match tokio::net::TcpListener::bind(addr).await {{
+                Ok(listener) => {{
+                    let _ = axum::serve(listener, app).await;
+                }}
+                Err(error) => tracing::error!(%error, "could not open the metrics port"),
+            }}
+        }}
+
         #[tokio::main]
         async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-            tracing_subscriber::fmt::init();
+            // Logging, metrics and traces in one call. The guard flushes pending
+            // spans when it drops, so the last trace before a shutdown survives.
+            let _observability = pharos_observability::init(env!("CARGO_PKG_NAME"))?;
+            let metrics = pharos_observability::http::http_metrics();
+            tokio::spawn(serve_metrics(std::sync::Arc::clone(&metrics)));
             {pg_setup}
             let repo = {repo_expr};
             {outbox_setup}
@@ -223,7 +469,9 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
                 bus.clone(),
             ));
 
-            let app  = {pkg}::web::router(handler);
+            // `instrument` applies the observability layers in the one order
+            // where both the request span and its exemplars work.
+            let app  = pharos_observability::http::instrument({pkg}::web::router(handler), metrics);
             let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
             tracing::info!("listening on http://{{addr}}");
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -238,10 +486,12 @@ fn minimal_main_rs() -> String {
     formatdoc!(
         r#"
         #[tokio::main]
-        async fn main() {{
-            tracing_subscriber::fmt::init();
+        async fn main() -> Result<(), Box<dyn std::error::Error>> {{
+            // Logging and traces; the guard flushes pending spans on the way out.
+            let _observability = pharos_observability::init(env!("CARGO_PKG_NAME"))?;
             tracing::info!("service starting");
             // TODO: wire handlers and start the processing loop
+            Ok(())
         }}
     "#
     )
@@ -756,4 +1006,158 @@ fn postgres_repo_and_outbox_types(cfg: &ProjectConfig, agg: &str) -> (String, St
         "pharos_memory::InMemoryOutboxRepository".to_string()
     };
     (repo, outbox)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Broker, SystemKind};
+
+    /// The interactive prompt needs a terminal, which is why the generator went
+    /// untested. Building the config directly is what makes it verifiable.
+    fn config(into: &std::path::Path) -> ProjectConfig {
+        ProjectConfig {
+            project_name: "demoapp".into(),
+            context_name: "order".into(),
+            location: into.to_path_buf(),
+            kind: SystemKind::SingleService,
+            persistence: Persistence::PostgresJson,
+            event_delivery: EventDelivery::InProcess,
+            broker: Broker::None,
+            serialization: Serialization::Json,
+            http: Http::Axum,
+        }
+    }
+
+    /// A directory per call: tests run in parallel, and a shared one had them
+    /// deleting each other's output.
+    fn generate_into_temp() -> std::io::Result<(std::path::PathBuf, Vec<GeneratedFile>)> {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("pharos-init-{}-{seq}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let cfg = config(&root);
+        let files = generate(&cfg)?;
+        Ok((cfg.output_path(), files))
+    }
+
+    /// Assets ship byte-for-byte: a project gets exactly what the framework
+    /// carries, which is what makes refreshing them meaningful later.
+    #[test]
+    fn every_asset_lands_verbatim() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        for asset in assets::OBSERVABILITY {
+            let written = fs::read_to_string(root.join(asset.rel_path))?;
+            assert_eq!(
+                written, asset.contents,
+                "{} was altered on the way out",
+                asset.rel_path
+            );
+        }
+        Ok(())
+    }
+
+    /// A malformed dashboard is silently ignored by Grafana — the panel simply
+    /// never appears — so the parse belongs in a test.
+    #[test]
+    fn dashboards_are_valid_json() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        for asset in assets::OBSERVABILITY {
+            if !asset.rel_path.ends_with(".json") {
+                continue;
+            }
+            let raw = fs::read_to_string(root.join(asset.rel_path))?;
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", asset.rel_path));
+        }
+        Ok(())
+    }
+
+    /// `{service=~".*"}` is a parse error in Loki: a query needs at least one
+    /// matcher that cannot match empty. It costs nothing to catch here.
+    #[test]
+    fn no_dashboard_query_matches_the_empty_label() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let logs = fs::read_to_string(root.join("docker/grafana/dashboards/logs.json"))?;
+        assert!(
+            !logs.contains(r#"\"allValue\": \".*\""#) && !logs.contains(r#"service=~\\\".*\\\""#),
+            "a query would be rejected by Loki for matching the empty label"
+        );
+        Ok(())
+    }
+
+    /// The whole promise is `docker compose up`, and it runs against a private
+    /// git dependency: without the SSH mount the build cannot fetch it.
+    #[test]
+    fn the_build_forwards_an_ssh_agent() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
+        assert!(
+            dockerfile.contains("--mount=type=ssh"),
+            "the build would fail fetching the framework from its private repository"
+        );
+        let compose = fs::read_to_string(root.join("docker-compose.yml"))?;
+        assert!(
+            compose.contains("ssh:") && compose.contains("- default"),
+            "compose does not forward the agent the Dockerfile expects"
+        );
+        Ok(())
+    }
+
+    /// The service name is the invariant that lets every config ship unmodified.
+    #[test]
+    fn the_application_service_is_named_app() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let compose = fs::read_to_string(root.join("docker-compose.yml"))?;
+        assert!(
+            compose.contains("\n  app:\n"),
+            "renaming the service breaks the Prometheus job and the log pipeline"
+        );
+        for service in ["prometheus", "grafana", "loki", "tempo", "alloy"] {
+            assert!(
+                compose.contains(&format!("\n  {service}:\n")),
+                "{service} missing from the stack"
+            );
+        }
+        Ok(())
+    }
+
+    /// `formatdoc!` strips common indentation, which once lifted `postgres:`
+    /// out of `services:` and produced a file the schema rejects. Compose is the
+    /// only authority on its own format, so ask it — skipped where it is absent.
+    #[test]
+    fn compose_is_accepted_by_compose_itself() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        fs::copy(root.join(".env.example"), root.join(".env"))?;
+
+        let Ok(output) = std::process::Command::new("docker")
+            .args(["compose", "config", "--quiet"])
+            .current_dir(&root)
+            .output()
+        else {
+            return Ok(());
+        };
+        assert!(
+            output.status.success(),
+            "compose rejected the generated file:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    /// A generated project must reach the pipeline, not just depend on it.
+    #[test]
+    fn the_entrypoint_installs_observability() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let main = fs::read_to_string(root.join("src/main.rs"))?;
+        assert!(main.contains("pharos_observability::init"));
+        assert!(
+            main.contains("pharos_observability::http::instrument"),
+            "the router is not instrumented, so requests carry no span"
+        );
+        let manifest = fs::read_to_string(root.join("Cargo.toml"))?;
+        assert!(manifest.contains("pharos-observability"));
+        Ok(())
+    }
 }

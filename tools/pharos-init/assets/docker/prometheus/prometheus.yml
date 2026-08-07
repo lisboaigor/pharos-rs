@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # The application's own metrics. `app` is the compose service name, and the
+  # port is not published on the host — only this container reaches it.
+  #
+  # Running the application outside Docker instead (`cargo run`)? Point this at
+  # `host.docker.internal:9464` and add
+  #   extra_hosts: ["host.docker.internal:host-gateway"]
+  # to this service, which makes the name resolve on Linux engines too.
+  - job_name: app
+    static_configs:
+      - targets: ["app:9464"]
+        labels:
+          service: app
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Host CPU, memory, disk and network.
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Per-container resource usage, via the Docker API.
+  - job_name: docker
+    static_configs:
+      - targets: ["telegraf:9273"]

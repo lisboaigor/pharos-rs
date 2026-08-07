@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      exemplarTraceIdDestinations:
+        # Turns the trace id on a latency exemplar into a link: click a spike,
+        # land on the trace behind it. Needs Prometheus started with
+        # --enable-feature=exemplar-storage, or exemplars are parsed and dropped.
+        - name: trace_id
+          datasourceUid: tempo

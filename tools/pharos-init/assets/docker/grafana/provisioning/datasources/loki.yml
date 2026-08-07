@@ -1,0 +1,22 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # Ceiling per query, so opening a wide range without a filter does not
+      # stall the browser.
+      maxLines: 1000
+      # The log-to-trace jump: recognises the trace id the application writes on
+      # every record and turns it into a button. The id matches because the
+      # OpenTelemetry SDK mints it and the log is filled from that same value.
+      derivedFields:
+        - name: TraceID
+          matcherRegex: 'trace_id=([0-9a-f]{32})'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: 'View trace'

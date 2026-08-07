@@ -1,0 +1,67 @@
+# Loki as a single binary with local storage: the log volume of one application
+# does not justify object storage or a microservice split.
+#
+# No published port — only Grafana reaches it, over the compose network.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # `info` narrates every query Grafana makes, and the collector ships those
+  # back as logs: noise feeding on itself.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    # TSDB with schema v13 is the only combination Loki 3.x recommends; earlier
+    # schemas exist for migrating older installations.
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 30d
+  reject_old_samples: true
+  # Matched to the retention on purpose. On its first boot the collector reads
+  # each container's whole existing log file; with the 168h default, anything
+  # older than a week comes back as HTTP 400 and is dropped in bulk.
+  reject_old_samples_max_age: 720h
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  max_query_series: 5000
+  allow_structured_metadata: true
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  # Required once retention is enabled; without it Loki refuses to start.
+  delete_request_store: filesystem
+  retention_enabled: true
+  retention_delete_delay: 2h
+  compaction_interval: 10m
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-tmp
+
+analytics:
+  reporting_enabled: false

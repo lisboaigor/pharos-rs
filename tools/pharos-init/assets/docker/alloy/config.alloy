@@ -1,0 +1,125 @@
+// Collects every container's stdout through the Docker API and ships it to
+// Loki. It reads the same socket Telegraf uses for metrics, so the daemon's
+// logging driver stays untouched and no existing container has to be recreated
+// for logs to start flowing.
+//
+// Flow: discovery.docker -> discovery.relabel -> loki.source.docker
+//       -> loki.process -> loki.write -> Loki
+//
+// NOTE: Alloy reads this file once, at startup. `docker compose up -d` will not
+// restart a service whose definition did not change, so editing this config and
+// redeploying leaves the old pipeline running — silently. Apply changes with:
+//   docker compose up -d --force-recreate alloy
+
+logging {
+  level  = "warn"
+  format = "logfmt"
+}
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Docker prefixes the name with "/": /project-app-1 -> project-app-1
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  // The compose service name. Unlike `container`, it survives recreates and
+  // replica renumbering, which is why queries and dashboards use it.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.containers.output
+  forward_to       = [loki.process.stack.receiver]
+  refresh_interval = "15s"
+}
+
+loki.process "stack" {
+  forward_to = [loki.write.default.receiver]
+
+  // `tracing`'s text formatter colours its output by default, even with no TTY.
+  // Left in, the escapes keep the level from matching below and make lines ugly
+  // in Grafana. Harmless for anything already logging without colour.
+  //
+  // The parentheses are not decorative: stage.replace substitutes capture
+  // groups, not the whole match — without a group the pattern matches and
+  // nothing is removed.
+  stage.replace {
+    expression = "(\\x1b\\[[0-9;]*m)"
+    replace    = ""
+  }
+
+  // ── The application ────────────────────────────────────────────────────────
+  // In production it logs JSON (LOG_FORMAT=json), so level and trace id come
+  // from fields rather than a regular expression.
+  stage.match {
+    selector = "{service=\"app\"}"
+
+    // A Rust panic spans dozens of lines; without joining them each frame
+    // becomes its own entry in Grafana and the error is unreadable. Applies to
+    // both formats: a panic escapes the subscriber and arrives as raw text.
+    stage.multiline {
+      firstline     = "^(\\{|\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})"
+      max_wait_time = "3s"
+      max_lines     = 256
+    }
+
+    stage.json {
+      expressions = {
+        level_field = "level",
+        trace       = "span.trace_id",
+      }
+    }
+
+    // Fallback for the text format (development, or LOG_FORMAT unset): the line
+    // is not JSON, the stage above extracts nothing, and the level comes from
+    // the pattern instead.
+    stage.regex {
+      expression = "^\\S+\\s+(?P<level_field>TRACE|DEBUG|INFO|WARN|ERROR)\\b"
+    }
+
+    stage.labels {
+      values = { level = "level_field" }
+    }
+
+    // trace_id is deliberately NOT a label: one value per request would explode
+    // Loki's index. As structured metadata it stays queryable, and the
+    // datasource's derived field still finds it in the line.
+    stage.structured_metadata {
+      values = { trace_id = "trace" }
+    }
+  }
+
+  // ── PostgreSQL ─────────────────────────────────────────────────────────────
+  // Format: 2026-01-01 12:00:00.123 UTC [123] ERROR:  duplicate key ...
+  // Its own severity vocabulary is kept as-is; dashboards query ERROR|FATAL|PANIC.
+  stage.match {
+    selector = "{service=\"postgres\"}"
+
+    stage.regex {
+      expression = "\\[\\d+\\]\\s+(?P<level_field>DEBUG|INFO|NOTICE|LOG|WARNING|ERROR|FATAL|PANIC):"
+    }
+
+    stage.labels {
+      values = { level = "level_field" }
+    }
+  }
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
