@@ -1,0 +1,53 @@
+[package]
+name = "pharos-observability"
+version = "0.2.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Ready-to-use logging, metrics and tracing pipeline for Pharos RS applications."
+
+[dependencies]
+pharos-axum = { path = "../pharos-axum", version = "0.2.0", optional = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
+thiserror          = { workspace = true }
+
+axum       = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+# Pinned as a set: tracing-opentelemetry 0.33 is the release built against
+# opentelemetry 0.32. Mixing minors across these crates fails to compile in ways
+# that point at the wrong crate.
+opentelemetry         = { version = "0.32", optional = true }
+opentelemetry_sdk     = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp    = { version = "0.32", features = ["grpc-tonic"], optional = true }
+opentelemetry-http    = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
+
+[features]
+default = ["otel", "axum"]
+# Export spans over OTLP. Without it the crate still installs logging and the
+# filter, so an application that only wants correlated logs pays nothing for the
+# OpenTelemetry dependency tree.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+# HTTP wiring: the request span, the metrics middleware and the layer order.
+axum = ["dep:pharos-axum", "dep:axum", "dep:tower-http", "dep:opentelemetry-http"]
+
+[dev-dependencies]
+pharos-testing        = { path = "../pharos-testing", version = "0.2.0" }
+opentelemetry         = "0.32"
+opentelemetry_sdk     = { version = "0.32", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.33"
+tokio          = { workspace = true }
+tower          = { workspace = true }
+
+[lints]
+workspace = true

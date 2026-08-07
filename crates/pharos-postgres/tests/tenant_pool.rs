@@ -168,7 +168,11 @@ async fn row_level_security_scopes_reads_to_the_tenant_in_scope() -> TestResult 
     };
 
     scope.set(Some(&alice.to_string()));
-    assert_eq!(visible(pool.clone()).await?, 1, "should see only its own row");
+    assert_eq!(
+        visible(pool.clone()).await?,
+        1,
+        "should see only its own row"
+    );
 
     scope.set(None);
     assert_eq!(

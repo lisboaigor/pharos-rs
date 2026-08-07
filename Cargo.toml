@@ -10,6 +10,7 @@ members = [
     "crates/pharos-redis",
     "crates/pharos-testing",
     "crates/pharos-axum",
+    "crates/pharos-observability",
     "crates/pharos-saga",
     "crates/pharos-es",
     "crates/pharos-kafka",
@@ -48,6 +49,9 @@ sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "r
 redis = { version = "1.3.0", features = ["tokio-comp"] }
 tower = { version = "0.5.2", features = ["util"] }
 axum = "0.8.7"
+# `pharos_axum::observability::request_span` was written for its `make_span_with`,
+# yet nothing in the workspace instantiated a TraceLayer until now.
+tower-http = { version = "0.7.0", features = ["trace", "request-id"] }
 http = "1.3.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 async-nats = "0.49.1"
