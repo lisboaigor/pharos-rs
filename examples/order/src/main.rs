@@ -27,15 +27,14 @@ use order::domain::events::OrderEvent;
 use order::web::{in_memory_state, router};
 use pharos_app::EventBus;
 use tracing::info;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
-        .with_target(false)
-        .compact()
-        .init();
+    // One call installs logging, the filter that keeps the framework's own
+    // spans, and — with OTEL_EXPORTER_OTLP_ENDPOINT set — trace export. The
+    // guard flushes pending spans on the way out.
+    let _observability = pharos_observability::init("order")?;
+    let metrics = pharos_observability::http::http_metrics();
 
     // In-process domain event handlers run synchronously after each command.
     let bus = EventBus::new();
@@ -43,7 +42,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     bus.register::<OrderEvent, _>(NotifyCustomer);
     bus.register::<OrderEvent, _>(UpdateInventory);
 
-    let app = router(in_memory_state(bus));
+    // `instrument` applies the observability layers in the one order where the
+    // request span and its exemplars both work; getting it wrong fails silently.
+    let app = pharos_observability::http::instrument(router(in_memory_state(bus)), metrics);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 

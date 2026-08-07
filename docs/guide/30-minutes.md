@@ -9,7 +9,7 @@ This tutorial goes from `cargo new` to a small but real domain model with:
 
 ## 1. Create the workspace
 
-Start with the template in `templates/workspace/`, or create a fresh app and add:
+Run `pharos-init` for a project that already builds and observes itself, or create a fresh app and add:
 
 ```toml
 [dependencies]

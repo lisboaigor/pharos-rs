@@ -113,7 +113,7 @@ Adapter crates depend on `app`/`core`; never the other way.
 
 - The dedicated docs site source lives under `docs/site/` and is built with `mdbook build docs/site`.
 - The 30-minute tutorial lives in `docs/guide/30-minutes.md` and should stay runnable against the current API.
-- The starter workspace template lives in `templates/workspace/` and should compile when copied into a fresh folder.
+- `pharos-init` is the only scaffolding path; its generated project is covered by tests in `tools/pharos-init/src/generator.rs`.
 - RFCs live in `docs/rfc/`; use `docs/rfc/0000-template.md` as the starting point.
 
 ## Licensing

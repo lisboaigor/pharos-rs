@@ -93,7 +93,7 @@ pharos-rs/
 
 ### Scaffold a new project with `pharos-init`
 
-`pharos-init` is an interactive CLI that asks three high-level questions about your system and scaffolds the right project structure automatically — no Docker, Redis, or PostgreSQL knowledge required up front.
+`pharos-init` is an interactive CLI that asks three high-level questions about your system and scaffolds the right project structure automatically — no Docker, Redis, or PostgreSQL knowledge required up front. The project it writes comes up with `docker compose up`, its database and observability stack included.
 
 ```sh
 cargo install --path tools/pharos-init
@@ -107,6 +107,12 @@ You will be asked:
 3. **Does it need to persist state?** — in-memory or durable storage (skipped for event-driven/high-throughput)
 
 From those answers `pharos-init` derives persistence, event delivery, broker, serialization format, and HTTP layer automatically, and generates a ready-to-build project.
+
+It also writes the infrastructure to run it: a Dockerfile, a compose file, and a
+configured observability stack — Prometheus, Grafana, Loki, Tempo, Alloy — with
+metrics, logs and traces already joined by a shared trace id. See
+[the observability guide](docs/guide/observability.md); `pharos-init
+observability --update` refreshes those files as the framework fixes them.
 
 ### Manual setup
 

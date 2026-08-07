@@ -13,6 +13,7 @@ pharos-app    = { path = "../../crates/pharos-app", features = ["tower"] }
 pharos-memory  = { path = "../../crates/pharos-memory" }
 pharos-postgres = { path = "../../crates/pharos-postgres" }
 pharos-axum   = { path = "../../crates/pharos-axum" }
+pharos-observability = { path = "../../crates/pharos-observability" }
 
 garde       = { workspace = true }
 thiserror   = { workspace = true }
