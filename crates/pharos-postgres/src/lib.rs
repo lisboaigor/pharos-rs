@@ -67,7 +67,7 @@ pub use json_repository::{
     POSTGRES_AGGREGATE_SCHEMA, PostgresJsonRepository, PostgresRepositoryError,
     migrate_postgres_aggregate_schema,
 };
-pub use pool::{PgPoolError, Pool, connect_pool};
+pub use pool::{PgPoolError, Pool, TENANT_SETTING, connect_pool, tenant_pool};
 pub use saga_store::{
     POSTGRES_SAGA_SCHEMA, PgSagaStore, PostgresSagaStoreError, migrate_postgres_saga_schema,
 };
