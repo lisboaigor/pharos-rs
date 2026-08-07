@@ -66,6 +66,10 @@ pub const OBSERVABILITY: &[Asset] = &[
         rel_path: "docker/grafana/dashboards/logs.json",
         contents: include_str!("../assets/docker/grafana/dashboards/logs.json"),
     },
+    Asset {
+        rel_path: "docker/grafana/dashboards/infra.json",
+        contents: include_str!("../assets/docker/grafana/dashboards/infra.json"),
+    },
 ];
 
 /// The seven observability services, already indented to sit under `services:`.
