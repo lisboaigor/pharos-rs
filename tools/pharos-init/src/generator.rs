@@ -63,6 +63,9 @@ pub fn generate(cfg: &ProjectConfig) -> std::io::Result<Vec<GeneratedFile>> {
     for asset in assets::OBSERVABILITY {
         emit!(asset.rel_path, asset.contents.to_string());
     }
+    // Baseline for `pharos-init observability --update`: it is what later tells
+    // a file nobody touched from one the project edited on purpose.
+    crate::update::write_baseline(&root)?;
 
     if cfg.uses_axum() {
         emit!("src/web/mod.rs", web_mod_rs(cfg));
