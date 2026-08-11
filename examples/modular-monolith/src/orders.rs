@@ -70,6 +70,10 @@ impl AggregateRoot for Order {
         self.events.drain()
     }
 
+    fn restore_events(&mut self, events: Vec<Self::Event>) {
+        self.events.restore(events);
+    }
+
     fn version(&self) -> u64 {
         self.version
     }

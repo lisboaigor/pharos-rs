@@ -144,6 +144,15 @@ fn is_lower_hex(s: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Renders a request URI for logging, with the query string replaced by a
+/// marker rather than included verbatim. See [`request_span`] for why.
+fn loggable_uri(uri: &axum::http::Uri) -> String {
+    match uri.query() {
+        Some(_) => format!("{}?<redacted>", uri.path()),
+        None => uri.path().to_owned(),
+    }
+}
+
 /// Builds the span every request runs under.
 ///
 /// Shaped for `tower_http`'s `make_span_with`. `tenant` and `user` start empty
@@ -154,6 +163,17 @@ fn is_lower_hex(s: &str) -> bool {
 /// The span is created at `INFO` on purpose: `tower_http`'s default builds it at
 /// `DEBUG`, which a typical `RUST_LOG=info` discards — taking the request
 /// context off every event inside it.
+///
+/// `uri` records the path only — the query string is dropped, replaced with
+/// a marker that one was present. A query string is not a private channel
+/// (it lands in access logs, proxy logs, and `Referer` headers on any link
+/// out of the page), but writing it into an INFO-level span turns *this
+/// crate's own logs* into one more place a credential leaks — including the
+/// realtime handshake token `pharos_realtime::ConnectionAuthenticator`
+/// deliberately warns against putting there in the first place. There is no
+/// reliable way to redact selectively (a token can arrive under any
+/// parameter name), so the whole query string is dropped rather than
+/// guessed at.
 pub fn request_span<B>(request: &Request<B>) -> Span {
     let traceparent = request
         .headers()
@@ -164,7 +184,7 @@ pub fn request_span<B>(request: &Request<B>) -> Span {
     let span = info_span!(
         "request",
         method = %request.method(),
-        uri = %request.uri(),
+        uri = %loggable_uri(request.uri()),
         trace_id = field::Empty,
         parent_span_id = field::Empty,
         tenant = field::Empty,
@@ -338,6 +358,31 @@ mod tests {
             line.contains("acme") && line.contains("carlos"),
             "fields declared Empty should be fillable later, got:\n{line}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_query_string_never_reaches_the_span() -> Caso {
+        let request = Request::builder()
+            .uri("/ws/game:1?token=super-secret-session-token")
+            .body(())?;
+
+        let line = span_line(&request, || {});
+        assert!(
+            !line.contains("super-secret-session-token"),
+            "a token in the query string must never reach the logs, got:\n{line}"
+        );
+        assert!(
+            line.contains("/ws/game:1"),
+            "the path must still be logged, got:\n{line}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_uri_with_no_query_string_is_unaffected() -> Caso {
+        let uri: axum::http::Uri = "/orders".parse()?;
+        assert_eq!(loggable_uri(&uri), "/orders");
         Ok(())
     }
 

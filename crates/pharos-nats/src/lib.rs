@@ -60,47 +60,110 @@ impl MessagePublisher for NatsPublisher {
     }
 }
 
+/// Payload size ceiling applied when no explicit limit is configured.
+///
+/// Nothing in this crate sets a max-payload option on the `async_nats`
+/// client — that client is built and configured by the caller. This is a
+/// second, independent ceiling enforced in-process: without it, `message
+/// .payload.to_vec()` copies whatever core NATS delivered with no cap at all,
+/// and this crate has no way to tell that a producer sent something huge.
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 /// NATS consumer bound to a concrete subject subscription.
 pub struct NatsConsumer {
     subscriber: tokio::sync::Mutex<Subscriber>,
+    max_payload_bytes: usize,
 }
 
 impl NatsConsumer {
-    /// Creates a consumer from an existing subscription.
+    /// Creates a consumer from an existing subscription, with the default
+    /// payload size ceiling ([`DEFAULT_MAX_PAYLOAD_BYTES`]).
     pub fn new(subscriber: Subscriber) -> Self {
         Self {
             subscriber: tokio::sync::Mutex::new(subscriber),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
+    }
+
+    /// Overrides the payload size ceiling.
+    ///
+    /// A message over this size is never handed to the caller: `next()`
+    /// drops it and keeps pulling from the subscription. Core NATS has no
+    /// offset to skip past — unlike Kafka there is nothing to commit — so
+    /// dropping is simply not yielding the message; no acknowledgment is
+    /// needed either way (see the module doc).
+    pub fn with_max_payload_size(mut self, max_payload_bytes: usize) -> Self {
+        self.max_payload_bytes = max_payload_bytes;
+        self
     }
 }
 
 impl MessageConsumer for NatsConsumer {
+    /// `topic` is unused: a [`NatsConsumer`] already wraps one live
+    /// [`Subscriber`], whose subject (or wildcard pattern) was fixed when the
+    /// subscription was created — there is no second subject to select
+    /// between here. The parameter exists only to satisfy
+    /// [`MessageConsumer`]'s shared signature.
     async fn next(&self, _topic: &str) -> Result<Option<Delivery>, MessagingError> {
         async move {
-			let mut subscriber = self.subscriber.lock().await;
-			let Some(message) = subscriber.next().await else {
-				return Ok(None);
-			};
+            let mut subscriber = self.subscriber.lock().await;
 
-			let delivery = Delivery::new(Message {
-				message_id: extract_message_id(message.headers.as_ref()).unwrap_or_else(uuid::Uuid::now_v7),
-				topic: message.subject.to_string(),
-				key: None,
-				headers: header_map_to_btree(message.headers.as_ref()),
-				payload: message.payload.to_vec(),
-				content_type: message
-					.headers
-					.as_ref()
-					.and_then(|headers| headers.get("content-type"))
-					.map(|value| value.as_str().to_string())
-					.unwrap_or_else(|| "application/octet-stream".to_string()),
-			});
-			metrics::counter!("pharos.nats.messages.consumed", "topic" => delivery.message.topic.clone())
-				.increment(1);
-			Ok(Some(delivery))
-		}
-		.instrument(info_span!("nats.message.next"))
-		.await
+            loop {
+                let Some(message) = subscriber.next().await else {
+                    return Ok(None);
+                };
+
+                if message.payload.len() > self.max_payload_bytes {
+                    tracing::warn!(
+                        subject = message.subject.as_str(),
+                        payload_len = message.payload.len(),
+                        max = self.max_payload_bytes,
+                        "dropping oversized NATS message without delivering it"
+                    );
+                    metrics::counter!(
+                        "pharos.nats.messages.oversized",
+                        "topic" => message.subject.to_string()
+                    )
+                    .increment(1);
+                    continue;
+                }
+
+                let headers = header_map_to_btree(message.headers.as_ref());
+                let attempt = extract_retry_attempt(&headers);
+                let inner = Message {
+                    message_id: extract_message_id(message.headers.as_ref())
+                        .unwrap_or_else(uuid::Uuid::now_v7),
+                    // The *delivery* subject, not the subscription pattern —
+                    // for a wildcard subscription (`orders.*`) these differ,
+                    // and the delivery subject is the one downstream code
+                    // needs (e.g. to route by exact topic).
+                    topic: message.subject.to_string(),
+                    key: None,
+                    headers,
+                    payload: message.payload.to_vec(),
+                    content_type: message
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get("content-type"))
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                };
+                metrics::counter!(
+                    "pharos.nats.messages.consumed",
+                    "topic" => inner.topic.clone()
+                )
+                .increment(1);
+                // `attempt` reflects this consumer's own prior
+                // `nack(_, true)` (via the `pharos.retry.attempt` header it
+                // wrote), not a fresh `Delivery::new`'s hardcoded `1`.
+                return Ok(Some(Delivery {
+                    message: inner,
+                    attempt,
+                }));
+            }
+        }
+        .instrument(info_span!("nats.message.next"))
+        .await
     }
 }
 
@@ -127,9 +190,20 @@ impl MessageAcknowledger for NatsAcknowledger {
     async fn nack(&self, delivery: &Delivery, requeue: bool) -> Result<(), MessagingError> {
         async move {
             if requeue {
+                // Without this, `Delivery::attempt` would stay pinned at `1`
+                // forever on every subsequent delivery — `NatsConsumer::next`
+                // reads this same header back — and a `RetryPolicy` consulted
+                // against it would never see anything but a first attempt,
+                // never dead-lettering a message whose handler can never
+                // succeed. See `pharos_app::process_idempotent_with_retry`.
+                let redelivery = delivery
+                    .message
+                    .clone()
+                    .with_header("pharos.retry.attempt", (delivery.attempt + 1).to_string());
+
                 let publisher = NatsPublisher::new(self.client.clone());
                 publisher
-                    .publish(delivery.message.clone())
+                    .publish(redelivery)
                     .await
                     .map_err(MessagingError::nack)?;
             }
@@ -182,6 +256,15 @@ fn extract_message_id(headers: Option<&HeaderMap>) -> Option<uuid::Uuid> {
         .and_then(|value| uuid::Uuid::parse_str(value.as_str()).ok())
 }
 
+/// Reads back the retry attempt this consumer's own `nack(_, true)` wrote,
+/// defaulting to `1` (a first delivery) when absent.
+fn extract_retry_attempt(headers: &BTreeMap<String, String>) -> u32 {
+    headers
+        .get("pharos.retry.attempt")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +282,27 @@ mod tests {
             Some("corr-1")
         );
         assert_eq!(extract_message_id(Some(&headers)), Some(message.message_id));
+    }
+
+    #[test]
+    fn retry_attempt_defaults_to_one_when_the_header_is_absent() {
+        assert_eq!(extract_retry_attempt(&BTreeMap::new()), 1);
+    }
+
+    #[test]
+    fn retry_attempt_reads_back_the_header_this_crate_writes_on_nack() {
+        let mut headers = BTreeMap::new();
+        headers.insert("pharos.retry.attempt".to_string(), "4".to_string());
+        assert_eq!(extract_retry_attempt(&headers), 4);
+    }
+
+    #[test]
+    fn retry_attempt_falls_back_to_one_on_a_garbled_header() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "pharos.retry.attempt".to_string(),
+            "not-a-number".to_string(),
+        );
+        assert_eq!(extract_retry_attempt(&headers), 1);
     }
 }

@@ -30,6 +30,20 @@ impl<E: DomainEvent> AggregateEvents<E> {
     pub fn drain(&mut self) -> Vec<E> {
         std::mem::take(&mut self.pending)
     }
+
+    /// Puts previously drained events back at the front of the buffer.
+    ///
+    /// Used by `pharos_app::save_and_publish` when publishing fails partway
+    /// through a batch: the events that were not published yet go back, ahead
+    /// of anything raised since, so a retry republishes them in their original
+    /// order and never republishes one that already reached its handlers.
+    pub fn restore(&mut self, events: Vec<E>) {
+        if events.is_empty() {
+            return;
+        }
+        let raised_since = std::mem::replace(&mut self.pending, events);
+        self.pending.extend(raised_since);
+    }
 }
 
 /// Represents an aggregate root that can raise domain events.
@@ -45,6 +59,18 @@ pub trait AggregateRoot: Entity {
     fn pending_events(&self) -> &[Self::Event];
     /// Removes and returns all pending events.
     fn drain_events(&mut self) -> Vec<Self::Event>;
+
+    /// Puts previously drained events back at the front of the pending buffer.
+    ///
+    /// This is the counterpart of [`drain_events`](Self::drain_events) that
+    /// makes a failed publish recoverable: `pharos_app::save_and_publish`
+    /// drains the batch it persisted, and if a handler rejects one of them it
+    /// restores the ones that never got published so
+    /// `pharos_app::republish_pending` can retry exactly those.
+    ///
+    /// Implementations must preserve order and put `events` *ahead* of
+    /// anything raised since the drain.
+    fn restore_events(&mut self, events: Vec<Self::Event>);
 
     /// Returns the optimistic-concurrency version of the aggregate.
     ///

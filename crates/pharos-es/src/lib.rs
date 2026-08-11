@@ -173,6 +173,21 @@ where
         Ok(Some(aggregate))
     }
 
+    /// Appends the aggregate's pending events and advances its version.
+    ///
+    /// **Drains** the pending buffer, and that is load-bearing rather than
+    /// incidental: a state-based repository overwrites a row and so is
+    /// idempotent under a repeated `save`, but an event-sourced one
+    /// *appends*. Leaving the batch in the buffer while advancing the version
+    /// makes a second `save` look indistinguishable from a legitimate fresh
+    /// one — the stream head matches the bumped `expected_version`, the
+    /// sequences `N+1..2N` are free, so the primary key does not object and
+    /// the same events land in immutable history twice, silently.
+    ///
+    /// `pharos_app::save_and_publish` therefore does not re-read the buffer
+    /// after calling `save`; it takes ownership of the batch beforehand and
+    /// publishes from that copy, restoring whatever it could not publish via
+    /// [`AggregateRoot::restore_events`].
     async fn save(&self, aggregate: &mut A) -> Result<(), RepositoryError<Self::Error>> {
         let expected_version = aggregate.version();
         let events = aggregate.drain_events();
@@ -200,6 +215,25 @@ where
 /// load or save failure is logged and the repository falls back to the full
 /// event stream, so a broken snapshot store degrades performance, not
 /// correctness.
+///
+/// # Why a snapshot's `version` is not cross-checked against the live stream
+///
+/// `save` derives a snapshot's version from the exact count it just appended
+/// in the same call (`expected_version + event_count`), so under normal
+/// operation a snapshot can never legitimately claim a version beyond the
+/// stream's real head — the invariant is enforced by construction, not by a
+/// read-time check. The only way to produce an inconsistent snapshot is
+/// external tampering with the store directly (a manual edit, a bug bypassing
+/// this repository), which is already a higher-privilege threat than this
+/// type can defend against with a version comparison — a tamperer capable of
+/// writing `pharos_snapshots` directly could set `version` and `payload`
+/// self-consistently just as easily. Given that, an extra head-count query on
+/// every read — paid on the hot path this type exists to speed up — was not
+/// judged worth it for a threat model this type cannot fully close anyway.
+/// A concrete `SnapshotStore`'s `save` (see `pharos-postgres`'s
+/// `PgSnapshotStore`) can still guard against the *reachable* failure mode —
+/// a regression from a delayed writer racing a newer save — by refusing to
+/// overwrite a snapshot with one at an equal or lower version.
 pub struct SnapshottingEventSourcedRepository<A, Store, Snap> {
     store: Store,
     snapshots: Snap,
@@ -266,6 +300,16 @@ where
         Ok(Some(aggregate))
     }
 
+    /// Appends the aggregate's pending events, advances its version, and —
+    /// past the snapshot boundary — refreshes the snapshot.
+    ///
+    /// Drains the pending buffer for the same reason
+    /// [`EventSourcedRepository::save`] does: see that method's doc comment
+    /// for why leaving the batch in place turns a repeated `save` into
+    /// silent duplication of immutable history. Because the buffer is empty
+    /// by the time the snapshot is taken, the snapshot is simply a clone of
+    /// the live aggregate — a rehydrated aggregate correctly starts with no
+    /// pending events.
     async fn save(&self, aggregate: &mut A) -> Result<(), RepositoryError<Self::Error>> {
         let expected_version = aggregate.version();
         let events = aggregate.drain_events();
@@ -374,6 +418,10 @@ mod tests {
             self.events.drain()
         }
 
+        fn restore_events(&mut self, events: Vec<Self::Event>) {
+            self.events.restore(events);
+        }
+
         fn version(&self) -> u64 {
             self.version
         }
@@ -393,6 +441,18 @@ mod tests {
     #[derive(Default)]
     struct InMemoryEventStore {
         streams: Mutex<HashMap<String, Vec<StoredEvent<AccountOpened>>>>,
+    }
+
+    impl InMemoryEventStore {
+        /// Number of events currently in a stream. Exposed so tests can assert
+        /// that a repeated `save` did not append the same batch twice.
+        fn stream_len(&self, id: &str) -> usize {
+            self.streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(id)
+                .map_or(0, Vec::len)
+        }
     }
 
     impl EventStore<String, AccountOpened> for InMemoryEventStore {
@@ -495,6 +555,115 @@ mod tests {
         // Unknown streams still come back as None even with a snapshot store.
         assert!(repo.find_by_id(&"missing".to_string()).await?.is_none());
         Ok(())
+    }
+
+    /// `save` drains, so a repeated `save` on the same live aggregate is a
+    /// no-op instead of appending the same events to immutable history a
+    /// second time.
+    ///
+    /// The duplication is what makes this worth a test: a repeated `save` on
+    /// an undrained aggregate passes the optimistic-concurrency check (the
+    /// stream head matches the already-advanced `expected_version`) and lands
+    /// on free sequence numbers, so neither the pre-check nor the primary key
+    /// objects. The stream silently doubles and a replayed balance doubles
+    /// with it.
+    #[tokio::test]
+    async fn a_second_save_does_not_duplicate_the_stream() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let repo = EventSourcedRepository::<Account, _>::new(InMemoryEventStore::default());
+        let mut account = Account::open("acc-twice", "Igor");
+        assert_eq!(
+            account.pending_events().len(),
+            1,
+            "AccountOpened is raised by `open`"
+        );
+
+        repo.save(&mut account).await?;
+        assert!(
+            account.pending_events().is_empty(),
+            "save() takes ownership of the batch it persisted"
+        );
+        assert_eq!(
+            account.version(),
+            1,
+            "the version advances by the batch size"
+        );
+
+        // The mistake this guards against: retrying the whole save after a
+        // downstream failure instead of retrying only the publish step.
+        repo.save(&mut account).await?;
+
+        assert_eq!(
+            repo.store().stream_len("acc-twice"),
+            1,
+            "the second save must not have appended the same event again"
+        );
+        assert_eq!(
+            account.version(),
+            1,
+            "and must not have advanced the version again"
+        );
+        Ok(())
+    }
+
+    /// The snapshotting repository drains for the same reason, and its
+    /// snapshot must not carry an already-persisted event as still pending —
+    /// a rehydrated aggregate has to start with an empty buffer.
+    #[tokio::test]
+    async fn snapshotting_save_drains_and_snapshots_clean_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = SnapshottingEventSourcedRepository::<Account, _, _>::new(
+            InMemoryEventStore::default(),
+            InMemorySnapshotStore::default(),
+            1, // snapshot after every event, to exercise the boundary every time
+        );
+        let mut account = Account::open("acc-pending-snap", "Igor");
+
+        repo.save(&mut account).await?;
+
+        assert!(
+            account.pending_events().is_empty(),
+            "save() takes ownership of the batch it persisted"
+        );
+
+        let snapshot = repo
+            .snapshots()
+            .load(&"acc-pending-snap".to_string())
+            .await?
+            .ok_or("snapshot must have been taken")?;
+        assert!(
+            snapshot.state.pending_events().is_empty(),
+            "a snapshot must not carry the already-persisted event as still pending"
+        );
+
+        repo.save(&mut account).await?;
+        assert_eq!(
+            repo.store().stream_len("acc-pending-snap"),
+            1,
+            "the second save must not have appended the same event again"
+        );
+        Ok(())
+    }
+
+    /// `restore_events` puts an unpublished remainder back *ahead* of anything
+    /// raised since, which is what lets `pharos_app::republish_pending` retry
+    /// exactly the events that never reached a handler, in order.
+    #[test]
+    fn restore_events_puts_the_remainder_back_in_front() {
+        let mut account = Account::open("acc-restore", "Igor");
+        let drained = account.drain_events();
+        assert_eq!(drained.len(), 1);
+
+        account.events.raise(AccountOpened {
+            account_id: "acc-restore".to_string(),
+            owner: "Raised After".to_string(),
+        });
+        account.restore_events(drained);
+
+        let pending = account.pending_events();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].owner, "Igor", "the restored event comes first");
+        assert_eq!(pending[1].owner, "Raised After");
     }
 
     #[tokio::test]

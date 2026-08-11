@@ -58,9 +58,9 @@ impl MessagePublisher for KafkaPublisher {
             if let Some(key) = &message.key {
                 record = record.key(key);
             }
-            if !message.headers.is_empty() {
-                record = record.headers(kafka_headers_from_map(&message.headers));
-            }
+
+            let headers = with_message_id_header(&message.headers, message.message_id);
+            record = record.headers(kafka_headers_from_map(&headers));
 
             self.producer
                 .send(record, self.queue_timeout)
@@ -75,20 +75,45 @@ impl MessagePublisher for KafkaPublisher {
     }
 }
 
+/// Payload size ceiling applied when no explicit limit is configured.
+///
+/// Nothing in this crate sets `fetch.max.bytes`/`message.max.bytes` on the
+/// `StreamConsumer` it wraps — that consumer is built and configured by the
+/// caller. This is a second, independent ceiling enforced in-process: without
+/// it, a broker-side limit misconfigured too high (or simply left at its
+/// default) means every in-flight message is copied into a fresh `Vec<u8>`
+/// with no cap at all, and this crate has no way to tell that happened.
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 /// Kafka consumer over an existing `StreamConsumer`.
 #[derive(Clone)]
 pub struct KafkaConsumer {
     consumer: Arc<StreamConsumer>,
     subscribed: Arc<std::sync::Mutex<Option<String>>>,
+    max_payload_bytes: usize,
 }
 
 impl KafkaConsumer {
-    /// Creates a consumer wrapper.
+    /// Creates a consumer wrapper with the default payload size ceiling
+    /// ([`DEFAULT_MAX_PAYLOAD_BYTES`]).
     pub fn new(consumer: StreamConsumer) -> Self {
         Self {
             consumer: Arc::new(consumer),
             subscribed: Arc::new(std::sync::Mutex::new(None)),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
+    }
+
+    /// Overrides the payload size ceiling.
+    ///
+    /// A message over this size is never handed to the caller: `next()`
+    /// commits past it directly and keeps polling, so a single oversized
+    /// message cannot stall the topic waiting for a caller that will never
+    /// receive it. Set generously above your real payloads — this exists to
+    /// bound worst-case memory, not to police normal traffic.
+    pub fn with_max_payload_size(mut self, max_payload_bytes: usize) -> Self {
+        self.max_payload_bytes = max_payload_bytes;
+        self
     }
 
     /// Subscribes to `topic` only when it is not the current subscription.
@@ -114,35 +139,82 @@ impl MessageConsumer for KafkaConsumer {
     async fn next(&self, topic: &str) -> Result<Option<Delivery>, MessagingError> {
         async move {
             self.ensure_subscribed(topic)?;
-            let borrowed = self
-                .consumer
-                .recv()
-                .await
-                .map_err(MessagingError::consume)?;
 
-            let mut headers = headers_to_map(borrowed.headers());
-            headers.insert(
-                HEADER_PARTITION.to_string(),
-                borrowed.partition().to_string(),
-            );
-            headers.insert(HEADER_OFFSET.to_string(), borrowed.offset().to_string());
+            loop {
+                let borrowed = self
+                    .consumer
+                    .recv()
+                    .await
+                    .map_err(MessagingError::consume)?;
 
-            let message = Message {
-                message_id: extract_message_id(&headers).unwrap_or_else(uuid::Uuid::now_v7),
-                topic: borrowed.topic().to_string(),
-                key: borrowed
-                    .key()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
-                headers,
-                payload: borrowed.payload().unwrap_or_default().to_vec(),
-                content_type: borrowed
-                    .headers()
-                    .and_then(|headers| header_value(headers, "content-type"))
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-            };
-            metrics::counter!("pharos.kafka.messages.consumed", "topic" => topic.to_string())
-                .increment(1);
-            Ok(Some(Delivery::new(message)))
+                let payload_len = borrowed.payload().map_or(0, <[u8]>::len);
+                if payload_len > self.max_payload_bytes {
+                    // Committed directly, bypassing `Delivery`/the ack API
+                    // entirely: this message is never constructed, let alone
+                    // handed to a caller, so there is nothing for a handler
+                    // to reject and no `Delivery` to nack — an oversized
+                    // payload is not a processing failure to retry, it is a
+                    // shape this consumer refuses to hold in memory at all.
+                    tracing::warn!(
+                        topic = borrowed.topic(),
+                        partition = borrowed.partition(),
+                        offset = borrowed.offset(),
+                        payload_len,
+                        max = self.max_payload_bytes,
+                        "dropping oversized Kafka message without delivering it"
+                    );
+                    metrics::counter!(
+                        "pharos.kafka.messages.oversized",
+                        "topic" => topic.to_string()
+                    )
+                    .increment(1);
+                    commit_offset(
+                        &self.consumer,
+                        borrowed.topic(),
+                        borrowed.partition(),
+                        borrowed.offset(),
+                    )?;
+                    continue;
+                }
+
+                // `commit_delivery` trusts `HEADER_PARTITION`/`HEADER_OFFSET`
+                // on `delivery.message.headers` to know what to commit —
+                // that is only safe because the real values are inserted
+                // *after* copying the wire headers, so they win over
+                // anything a producer put there under the same key.
+                // Reversing this order would let a crafted message choose
+                // which offset gets committed on which partition (skip ahead
+                // past unprocessed messages, or rewind and force a replay)
+                // the next time this delivery is acked.
+                let mut headers = headers_to_map(borrowed.headers());
+                headers.insert(
+                    HEADER_PARTITION.to_string(),
+                    borrowed.partition().to_string(),
+                );
+                headers.insert(HEADER_OFFSET.to_string(), borrowed.offset().to_string());
+
+                let attempt = extract_retry_attempt(&headers);
+                let message = Message {
+                    message_id: extract_message_id(&headers).unwrap_or_else(uuid::Uuid::now_v7),
+                    topic: borrowed.topic().to_string(),
+                    key: borrowed
+                        .key()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+                    headers,
+                    payload: borrowed.payload().unwrap_or_default().to_vec(),
+                    content_type: borrowed
+                        .headers()
+                        .and_then(|headers| header_value(headers, "content-type"))
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                };
+                metrics::counter!("pharos.kafka.messages.consumed", "topic" => topic.to_string())
+                    .increment(1);
+                // `attempt` reflects this consumer's own prior `nack(_, true)`
+                // (via the `pharos.retry.attempt` header it wrote), not a
+                // fresh `Delivery::new`'s hardcoded `1` — see
+                // `extract_retry_attempt`.
+                return Ok(Some(Delivery { message, attempt }));
+            }
         }
         .instrument(info_span!("kafka.message.next", topic))
         .await
@@ -261,20 +333,40 @@ async fn commit_delivery(
         .parse::<i64>()
         .map_err(MessagingError::ack)?;
 
+    commit_offset(consumer, &delivery.message.topic, partition, offset)?;
+    metrics::counter!("pharos.kafka.messages.acked", "topic" => delivery.message.topic.clone())
+        .increment(1);
+    Ok(())
+}
+
+/// Commits `offset + 1` (Kafka's "next offset to read" convention) for one
+/// partition, without going through a [`Delivery`].
+///
+/// Shared by [`commit_delivery`] and [`KafkaConsumer::next`]'s oversized-
+/// message path: both need "mark this exact position consumed," the latter
+/// for a message that is never handed to the caller at all (see
+/// [`KafkaConsumer::with_max_payload_size`]) and so has no `Delivery` to
+/// build headers from.
+fn commit_offset(
+    consumer: &Arc<StreamConsumer>,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(), MessagingError> {
     let mut topic_partition = rdkafka::TopicPartitionList::new();
     topic_partition
         .add_partition_offset(
-            &delivery.message.topic,
+            topic,
             partition,
-            rdkafka::Offset::Offset(offset + 1),
+            // Kafka offsets never reach `i64::MAX` in practice, but a plain
+            // `+ 1` at that boundary would panic in a debug build and wrap in
+            // release — neither should ever be how this fails.
+            rdkafka::Offset::Offset(offset.saturating_add(1)),
         )
         .map_err(MessagingError::ack)?;
     consumer
         .commit(&topic_partition, CommitMode::Async)
-        .map_err(MessagingError::ack)?;
-    metrics::counter!("pharos.kafka.messages.acked", "topic" => delivery.message.topic.clone())
-        .increment(1);
-    Ok(())
+        .map_err(MessagingError::ack)
 }
 
 /// Default timeout applied to schema registry HTTP requests.
@@ -353,7 +445,9 @@ impl ApicurioSchemaRegistry {
     fn artifact_url(&self, event_type: &str) -> String {
         format!(
             "{}/apis/registry/v2/groups/{}/artifacts/{}",
-            self.base_url, self.group, event_type
+            self.base_url,
+            percent_encode_path_segment(&self.group),
+            percent_encode_path_segment(event_type)
         )
     }
 }
@@ -393,7 +487,7 @@ impl ConfluentSchemaRegistry {
     }
 
     fn subject_for(&self, event_type: &str) -> String {
-        format!("{event_type}-value")
+        format!("{}-value", percent_encode_path_segment(event_type))
     }
 
     fn subject_url(&self, event_type: &str) -> String {
@@ -657,11 +751,69 @@ fn header_value<H: Headers>(headers: &H, key: &str) -> Option<String> {
     None
 }
 
+/// Ensures `headers` carries a `message_id` header, defaulting to
+/// `message_id` when absent.
+///
+/// `Message::message_id` travels in the struct field, not in `headers` — but
+/// the inbox in `pharos-postgres` dedups on the *wire* header, not on
+/// anything private to this process, so a message that leaves without it can
+/// never be deduplicated by whoever consumes it. Only fills the gap: a
+/// republish/nack that already set the header keeps its original id rather
+/// than getting a fresh one that would defeat the very dedup this exists for.
+fn with_message_id_header(
+    headers: &BTreeMap<String, String>,
+    message_id: uuid::Uuid,
+) -> BTreeMap<String, String> {
+    let mut headers = headers.clone();
+    headers
+        .entry("message_id".to_string())
+        .or_insert_with(|| message_id.to_string());
+    headers
+}
+
 fn extract_message_id(headers: &BTreeMap<String, String>) -> Option<uuid::Uuid> {
     headers
         .get("message_id")
         .or_else(|| headers.get("message-id"))
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
+}
+
+/// Reads back the retry attempt this consumer's own `nack(_, true)` wrote,
+/// defaulting to `1` (a first delivery) when absent.
+///
+/// Without this, `Delivery::attempt` stays pinned at `1` forever — the value
+/// `Delivery::new` sets and nothing here ever advanced — so a `RetryPolicy`
+/// consulted against it never sees anything but a first attempt and never
+/// dead-letters. `pharos_app::process_idempotent_with_retry` is what actually
+/// consults this value.
+fn extract_retry_attempt(headers: &BTreeMap<String, String>) -> u32 {
+    headers
+        .get("pharos.retry.attempt")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Percent-encodes `s` for safe use as a single URL path segment.
+///
+/// `event_type` can be attacker-influenced (an envelope field that arrived
+/// over the wire) and is interpolated directly into a schema-registry request
+/// path in [`ApicurioSchemaRegistry::artifact_url`] and
+/// [`ConfluentSchemaRegistry::subject_for`]. Unescaped, a value containing
+/// `/`, `..`, `?`, or `#` could redirect the request to a different path or
+/// smuggle in a query string. Only RFC 3986 unreserved characters
+/// (`A-Za-z0-9-._~`) pass through unescaped; everything else becomes
+/// `%XX`.
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 async fn ensure_success(
@@ -739,6 +891,80 @@ mod tests {
         assert_eq!(
             registry.artifact_url("OrderPlaced"),
             "http://localhost:8080/apis/registry/v2/groups/billing/artifacts/OrderPlaced"
+        );
+    }
+
+    /// A malicious or malformed `event_type` must not be able to redirect the
+    /// registry request to a different path or smuggle in a query string.
+    #[test]
+    fn schema_registry_urls_percent_encode_a_hostile_event_type() {
+        let confluent = ConfluentSchemaRegistry::new("http://localhost:8081");
+        let apicurio = ApicurioSchemaRegistry::with_group("http://localhost:8080", "billing");
+        let hostile = "../../admin?x=1#f";
+
+        assert!(
+            !confluent.subject_url(hostile).contains("/../"),
+            "must not traverse: {}",
+            confluent.subject_url(hostile)
+        );
+        assert!(!confluent.subject_url(hostile).contains('?'));
+        assert!(!confluent.subject_url(hostile).contains('#'));
+
+        assert!(!apicurio.artifact_url(hostile).contains("/../"));
+        assert!(!apicurio.artifact_url(hostile).contains('?'));
+        assert!(!apicurio.artifact_url(hostile).contains('#'));
+    }
+
+    #[test]
+    fn ordinary_event_types_round_trip_unchanged_through_encoding() {
+        let confluent = ConfluentSchemaRegistry::new("http://localhost:8081");
+        assert_eq!(
+            confluent.subject_for("OrderPlaced.v2"),
+            "OrderPlaced.v2-value"
+        );
+    }
+
+    #[test]
+    fn retry_attempt_defaults_to_one_when_the_header_is_absent() {
+        let headers = BTreeMap::new();
+        assert_eq!(extract_retry_attempt(&headers), 1);
+    }
+
+    #[test]
+    fn retry_attempt_reads_back_the_header_this_crate_writes_on_nack() {
+        let mut headers = BTreeMap::new();
+        headers.insert("pharos.retry.attempt".to_string(), "4".to_string());
+        assert_eq!(extract_retry_attempt(&headers), 4);
+    }
+
+    #[test]
+    fn retry_attempt_falls_back_to_one_on_a_garbled_header() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "pharos.retry.attempt".to_string(),
+            "not-a-number".to_string(),
+        );
+        assert_eq!(extract_retry_attempt(&headers), 1);
+    }
+
+    #[test]
+    fn publish_stamps_a_missing_message_id_header() {
+        let id = uuid::Uuid::now_v7();
+        let headers = with_message_id_header(&BTreeMap::new(), id);
+        assert_eq!(headers.get("message_id"), Some(&id.to_string()));
+    }
+
+    /// A republish/nack must keep the original id, not mint a new one — a
+    /// fresh id on every retry would defeat the inbox's dedup entirely.
+    #[test]
+    fn publish_never_overwrites_an_existing_message_id_header() {
+        let mut existing = BTreeMap::new();
+        existing.insert("message_id".to_string(), "original-id".to_string());
+
+        let headers = with_message_id_header(&existing, uuid::Uuid::now_v7());
+        assert_eq!(
+            headers.get("message_id").map(String::as_str),
+            Some("original-id")
         );
     }
 }

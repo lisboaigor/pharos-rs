@@ -10,6 +10,7 @@ Apply in numeric order:
 4. 0004_dead_letter.sql
 5. 0005_event_store.sql
 6. 0006_sagas.sql
+7. 0007_event_store_tenant_id.sql
 
 Notes:
 - These files mirror the schema constants in `pharos-postgres` and are intended

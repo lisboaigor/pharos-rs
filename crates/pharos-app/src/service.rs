@@ -27,29 +27,44 @@ where
 /// Persists an aggregate and publishes all of its pending domain events.
 ///
 /// The aggregate is saved first (advancing its optimistic-concurrency
-/// version); its pending events are published afterwards and only drained once
-/// every handler ran. A failed save — e.g. a `ConcurrencyConflict`, the normal
-/// retry case — therefore never discards events: the aggregate keeps them and a
-/// retry starts from intact state. If a handler fails midway the remaining
-/// events also stay pending, so a retry republishes the batch; event handlers
-/// must be idempotent under this at-least-once semantic.
+/// version), then the batch it persisted is published. A failed save — e.g. a
+/// `ConcurrencyConflict`, the normal retry case — never discards events: the
+/// aggregate keeps them and a retry starts from intact state.
+///
+/// # Why the batch is copied before the save, not re-read afterwards
+///
+/// The events are copied up front and published from that owned copy, which
+/// is what `A::Event: Clone` buys. Re-reading `pending_events()` after the
+/// save would require the buffer to survive it, and a surviving buffer paired
+/// with an already-advanced version is what turns a repeated `save` into
+/// duplicated history on an event-sourced repository: the stream head matches
+/// the bumped expected version and the next sequence numbers are free, so
+/// neither the concurrency check nor the primary key objects. Event-sourced
+/// repositories therefore drain while appending, and this function never
+/// depends on what the repository left behind.
 ///
 /// # Retrying after a handler failure
 ///
 /// When this function fails **after** the save succeeded (an
 /// [`ApplicationError::EventBus`] error), the aggregate is already persisted
 /// and its version already advanced. Do **not** call `save_and_publish` again
-/// to retry — that would save (and version-bump) the aggregate a second time.
-/// Retry only the publishing step with [`republish_pending`]:
+/// to retry — that would version-bump the aggregate a second time. The events
+/// that were not published are restored onto the aggregate, so retry only the
+/// publishing step with [`republish_pending`]:
 ///
 /// ```ignore
 /// if let Err(ApplicationError::EventBus(_)) =
 ///     save_and_publish(&repo, &bus, &mut order).await
 /// {
-///     // the save already succeeded; retry only the events
+///     // the save already succeeded; retry only the events that did not publish
 ///     republish_pending(&bus, &mut order).await?;
 /// }
 /// ```
+///
+/// Only the *unpublished remainder* comes back, so a retry does not re-deliver
+/// events whose handlers already ran. Handlers may still see an event more
+/// than once if one of them fails after another succeeded, so they must stay
+/// idempotent.
 pub async fn save_and_publish<A, R>(
     repo: &R,
     bus: &EventBus,
@@ -57,39 +72,64 @@ pub async fn save_and_publish<A, R>(
 ) -> Result<(), ApplicationError>
 where
     A: AggregateRoot,
+    A::Event: Clone,
     R: Repository<A>,
 {
     let aggregate_type = std::any::type_name::<A>();
 
     async move {
+        let events = aggregate.pending_events().to_vec();
         repo.save(aggregate).await.map_err(map_repository_error)?;
+        // An event-sourced repository already drained while appending; a
+        // state-based one did not. Clearing here leaves both in the same
+        // state, with the batch owned by this function either way.
+        aggregate.drain_events();
 
         tracing::info!(
             aggregate = aggregate_type,
             version = aggregate.version(),
-            event_count = aggregate.pending_events().len(),
+            event_count = events.len(),
             "aggregate persisted; publishing pending events"
         );
 
-        for event in aggregate.pending_events() {
-            bus.publish(event).await?;
-            metrics::counter!("pharos.events.published", "event_type" => event.event_type())
-                .increment(1);
-        }
-        aggregate.drain_events();
-        Ok(())
+        publish_batch(bus, aggregate, events).await
     }
     .instrument(info_span!("save_and_publish", aggregate = aggregate_type))
     .await
+}
+
+/// Publishes an owned batch, restoring whatever did not make it onto the
+/// aggregate so the caller can retry exactly the remainder.
+async fn publish_batch<A>(
+    bus: &EventBus,
+    aggregate: &mut A,
+    events: Vec<A::Event>,
+) -> Result<(), ApplicationError>
+where
+    A: AggregateRoot,
+{
+    let mut remaining = events.into_iter();
+    while let Some(event) = remaining.next() {
+        if let Err(error) = bus.publish(&event).await {
+            let mut unpublished = vec![event];
+            unpublished.extend(remaining);
+            aggregate.restore_events(unpublished);
+            return Err(error.into());
+        }
+        metrics::counter!("pharos.events.published", "event_type" => event.event_type())
+            .increment(1);
+    }
+    Ok(())
 }
 
 /// Publishes an aggregate's pending domain events without saving it.
 ///
 /// This is the safe retry path after [`save_and_publish`] failed on the
 /// publishing side: the aggregate is already persisted, so a retry must not
-/// save (and version-bump) it again. Events are drained only after every
-/// handler ran; on failure they stay pending for the next retry. Handlers may
-/// see the same event more than once across retries and must be idempotent.
+/// save (and version-bump) it again. Whatever fails to publish is restored
+/// onto the aggregate, so this can be called repeatedly and each attempt only
+/// covers the events still outstanding. Handlers may still see the same event
+/// more than once across retries and must be idempotent.
 pub async fn republish_pending<A>(bus: &EventBus, aggregate: &mut A) -> Result<(), ApplicationError>
 where
     A: AggregateRoot,
@@ -97,13 +137,8 @@ where
     let aggregate_type = std::any::type_name::<A>();
 
     async move {
-        for event in aggregate.pending_events() {
-            bus.publish(event).await?;
-            metrics::counter!("pharos.events.published", "event_type" => event.event_type())
-                .increment(1);
-        }
-        aggregate.drain_events();
-        Ok(())
+        let events = aggregate.drain_events();
+        publish_batch(bus, aggregate, events).await
     }
     .instrument(info_span!("republish_pending", aggregate = aggregate_type))
     .await
@@ -123,6 +158,7 @@ pub async fn save_and_enqueue<A, R, O, F>(
 ) -> Result<(), ApplicationError>
 where
     A: AggregateRoot,
+    A::Event: Clone,
     R: Repository<A>,
     O: OutboxRepository,
     F: Fn(&A::Event) -> Message + Send + Sync,
@@ -130,32 +166,43 @@ where
     let aggregate_type = std::any::type_name::<A>();
 
     async move {
+        // Same reasoning as `save_and_publish`: own the batch before the save
+        // rather than re-reading a buffer that must not survive it.
+        let events = aggregate.pending_events().to_vec();
         repo.save(aggregate).await.map_err(map_repository_error)?;
+        aggregate.drain_events();
 
         tracing::info!(
             aggregate = aggregate_type,
             version = aggregate.version(),
-            event_count = aggregate.pending_events().len(),
+            event_count = events.len(),
             "aggregate persisted; enqueueing pending events to outbox"
         );
 
-        for event in aggregate.pending_events() {
+        let mut remaining = events.into_iter();
+        while let Some(event) = remaining.next() {
             let outbox_span = info_span!(
                 "enqueue_pending_event",
                 event_type = event.event_type(),
                 event.aggregate_id = event.aggregate_id(),
             );
-            async {
-                let message = map_event(event);
+            let result = async {
+                let message = map_event(&event);
                 outbox.insert(OutboxMessage::new(message)).await?;
-                metrics::counter!("pharos.outbox.enqueued", "event_type" => event.event_type())
-                    .increment(1);
                 Ok::<(), ApplicationError>(())
             }
             .instrument(outbox_span)
-            .await?;
+            .await;
+
+            if let Err(error) = result {
+                let mut unenqueued = vec![event];
+                unenqueued.extend(remaining);
+                aggregate.restore_events(unenqueued);
+                return Err(error);
+            }
+            metrics::counter!("pharos.outbox.enqueued", "event_type" => event.event_type())
+                .increment(1);
         }
-        aggregate.drain_events();
 
         Ok(())
     }
@@ -236,6 +283,10 @@ mod tests {
 
         fn drain_events(&mut self) -> Vec<Self::Event> {
             self.events.drain()
+        }
+
+        fn restore_events(&mut self, events: Vec<Self::Event>) {
+            self.events.restore(events);
         }
 
         fn version(&self) -> u64 {
@@ -391,6 +442,66 @@ mod tests {
         Ok(())
     }
 
+    /// Stands in for an event-sourced repository, whose `save` takes ownership
+    /// of the batch it appends rather than leaving it in the buffer.
+    #[derive(Default)]
+    struct DrainingRepository {
+        appended: Mutex<Vec<TestEvent>>,
+    }
+
+    impl Repository<TestAggregate> for DrainingRepository {
+        type Error = Infallible;
+
+        async fn find_by_id(&self, _id: &u64) -> Result<Option<TestAggregate>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            aggregate: &mut TestAggregate,
+        ) -> Result<(), RepositoryError<Self::Error>> {
+            let events = aggregate.drain_events();
+            aggregate.set_version(aggregate.version() + events.len() as u64);
+            self.appended.lock().await.extend(events);
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &u64) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Regression test: `save_and_publish` must publish the events even when
+    /// the repository drained them while saving.
+    ///
+    /// Reading `pending_events()` back after the save — which an earlier
+    /// version did — meant an event-sourced aggregate's domain events were
+    /// appended to the store and then silently never delivered to any
+    /// `EventBus` handler, because the buffer the loop read was already empty.
+    #[tokio::test]
+    async fn save_and_publish_publishes_even_when_the_repository_drains()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = DrainingRepository::default();
+        let bus = EventBus::new();
+        let seen = Arc::new(Mutex::new(0));
+        bus.register::<TestEvent, _>(CountingHandler {
+            seen: Arc::clone(&seen),
+        });
+        let mut aggregate = TestAggregate::new(11);
+
+        save_and_publish(&repo, &bus, &mut aggregate).await?;
+
+        assert_eq!(
+            repo.appended.lock().await.len(),
+            1,
+            "the event was persisted"
+        );
+        assert_eq!(*seen.lock().await, 1, "and it also reached the handler");
+        assert!(aggregate.pending_events().is_empty());
+        assert_eq!(aggregate.version(), 1);
+        Ok(())
+    }
+
     #[derive(Debug, thiserror::Error)]
     #[error("handler failed")]
     struct FailOnce;
@@ -440,6 +551,68 @@ mod tests {
         assert!(aggregate.pending_events().is_empty());
         assert_eq!(*seen.lock().await, 1);
         assert_eq!(repo.saved.lock().await.len(), 1);
+        Ok(())
+    }
+
+    /// Fails on the event whose `aggregate_id` matches, letting a test place
+    /// the failure at a chosen position inside a batch.
+    struct FailOnAggregateId {
+        id: String,
+        published: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EventHandler<TestEvent> for FailOnAggregateId {
+        type Error = FailOnce;
+
+        async fn handle(&self, event: &TestEvent) -> Result<(), Self::Error> {
+            if event.aggregate_id == self.id {
+                return Err(FailOnce);
+            }
+            self.published.lock().await.push(event.aggregate_id.clone());
+            Ok(())
+        }
+    }
+
+    /// Only the events that never reached a handler come back, in order — a
+    /// retry must not re-deliver the ones that already published.
+    #[tokio::test]
+    async fn a_failed_publish_restores_only_the_unpublished_remainder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestRepository::default();
+        let bus = EventBus::new();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        bus.register::<TestEvent, _>(FailOnAggregateId {
+            id: "second".to_string(),
+            published: Arc::clone(&published),
+        });
+
+        let mut aggregate = TestAggregate::new(3);
+        aggregate.events.drain();
+        for id in ["first", "second", "third"] {
+            aggregate.events.raise(TestEvent {
+                aggregate_id: id.to_string(),
+                occurred_at: Utc::now(),
+            });
+        }
+
+        let result = save_and_publish(&repo, &bus, &mut aggregate).await;
+        assert!(matches!(result, Err(ApplicationError::EventBus(_))));
+
+        assert_eq!(
+            *published.lock().await,
+            vec!["first".to_string()],
+            "only the event before the failure published"
+        );
+        let pending: Vec<_> = aggregate
+            .pending_events()
+            .iter()
+            .map(|e| e.aggregate_id.clone())
+            .collect();
+        assert_eq!(
+            pending,
+            vec!["second".to_string(), "third".to_string()],
+            "the failed event and everything after it came back, in order"
+        );
         Ok(())
     }
 

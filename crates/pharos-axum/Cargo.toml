@@ -1,6 +1,6 @@
 [package]
 name = "pharos-axum"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -9,8 +9,8 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Axum integration for Pharos command and query handlers."
 
 [dependencies]
-pharos-app  = { path = "../pharos-app", version = "0.2.0" }
-pharos-core = { path = "../pharos-core", version = "0.2.0" }
+pharos-app  = { path = "../pharos-app", version = "0.3.0" }
+pharos-core = { path = "../pharos-core", version = "0.3.0" }
 axum = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
@@ -22,7 +22,7 @@ prometheus-client = "0.25"
 
 [dev-dependencies]
 # Captures what a span actually emits (a span without a subscriber is inert).
-pharos-testing = { path = "../pharos-testing", version = "0.2.0" }
+pharos-testing = { path = "../pharos-testing", version = "0.3.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

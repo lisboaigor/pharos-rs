@@ -16,6 +16,7 @@ members = [
     "crates/pharos-kafka",
     "crates/pharos-nats",
     "crates/pharos-proto",
+    "crates/pharos-realtime",
     "crates/pharos",
     "examples/order",
     "examples/multi-tenant",

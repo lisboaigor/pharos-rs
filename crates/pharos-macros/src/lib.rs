@@ -145,6 +145,11 @@ pub fn derive_aggregate_root(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
+            fn restore_events(&mut self, events: ::std::vec::Vec<Self::Event>) {
+                self.#field_name.restore(events);
+            }
+
+            #[inline]
             fn version(&self) -> u64 {
                 self.#version_name
             }
@@ -556,7 +561,7 @@ enum TraceMode {
     Skip,
 }
 
-/// Builds the span-field tokens for every named field.
+/// Builds the span-field tokens for every field, named or positional.
 ///
 /// Every field is recorded unless it opts out with `#[trace(skip)]`. The
 /// inverse (opt in per field) was the original design and it failed in
@@ -565,25 +570,34 @@ enum TraceMode {
 /// logs. Recording by default makes the omission the loud case instead —
 /// a field whose type lacks `Debug` fails to compile.
 ///
+/// A tuple-struct field has no name to key the span field on, so it gets
+/// `_0`, `_1`, … by position — overridable with `#[trace(name = "...")]` the
+/// same as a named field.
+///
 /// Secrets must not rely on someone remembering `skip`: wrap them in
 /// `pharos_core::Secret`, whose `Debug` writes a placeholder.
 fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let fields = match &ast.data {
-        Data::Struct(s) => match &s.fields {
-            Fields::Named(f) => &f.named,
-            // Tuple/unit structs have no field names to record.
-            _ => return Ok(Vec::new()),
-        },
-        _ => return Ok(Vec::new()),
+    let Some(fields) = struct_fields(ast) else {
+        return Ok(Vec::new());
     };
 
     let mut out = Vec::new();
-    for field in fields {
+    for (index, field) in fields.iter().enumerate() {
         let attr = field.attrs.iter().find(|a| a.path().is_ident("trace"));
-        let ident = field
-            .ident
-            .as_ref()
-            .ok_or_else(|| syn::Error::new(field.span(), "`#[trace]` requires a named field"))?;
+        let access = match &field.ident {
+            Some(ident) => quote!(#ident),
+            None => {
+                let index = syn::Index::from(index);
+                quote!(#index)
+            }
+        };
+        let default_key = match &field.ident {
+            Some(ident) => quote!(#ident),
+            None => {
+                let key = Ident::new(&format!("_{index}"), field.span());
+                quote!(#key)
+            }
+        };
 
         // Unannotated fields are recorded via `Debug`; `#[trace]` alone still
         // means `Value`, so the pre-existing annotations keep their meaning.
@@ -623,13 +637,13 @@ fn collect_trace_fields(ast: &DeriveInput) -> syn::Result<Vec<proc_macro2::Token
 
         let key = match rename {
             Some(lit) => quote!(#lit),
-            None => quote!(#ident),
+            None => default_key,
         };
         out.push(match mode {
             TraceMode::Skip => continue,
-            TraceMode::Value => quote!(#key = self.#ident),
-            TraceMode::Display => quote!(#key = %self.#ident),
-            TraceMode::Debug => quote!(#key = ?self.#ident),
+            TraceMode::Value => quote!(#key = self.#access),
+            TraceMode::Display => quote!(#key = %self.#access),
+            TraceMode::Debug => quote!(#key = ?self.#access),
         });
     }
     Ok(out)
@@ -693,6 +707,24 @@ pub fn id_type(input: TokenStream) -> TokenStream {
     out.into()
 }
 
+/// Returns the struct's fields regardless of whether they are named
+/// (`struct Foo { bar: T }`) or positional (`struct Foo(T)`) — everything
+/// that inspects field-level attributes needs both shapes, and treating only
+/// named fields as "the fields" is exactly the gap that let a tuple-struct
+/// command through `dispatch` with `#[garde(...)]` rules that never ran (and,
+/// separately, an empty trace span): garde's own derive validates tuple
+/// structs fine, so the omission here was pharos's, not garde's.
+fn struct_fields(ast: &DeriveInput) -> Option<&Punctuated<syn::Field, Token![,]>> {
+    match &ast.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(f) => Some(&f.named),
+            Fields::Unnamed(f) => Some(&f.unnamed),
+            Fields::Unit => None,
+        },
+        _ => None,
+    }
+}
+
 /// Returns `true` when any field carries a `#[garde(...)]` attribute with at
 /// least one rule other than `skip`, which means the struct needs
 /// `validate_input` to run real garde validation.
@@ -703,12 +735,8 @@ pub fn id_type(input: TokenStream) -> TokenStream {
 /// is real. The nested meta is parsed properly — a rule that merely contains
 /// "skip" in its name (e.g. `custom(skip_empty)`) still counts as a rule.
 fn has_garde_fields(ast: &DeriveInput) -> bool {
-    let fields = match &ast.data {
-        Data::Struct(s) => match &s.fields {
-            Fields::Named(f) => &f.named,
-            _ => return false,
-        },
-        _ => return false,
+    let Some(fields) = struct_fields(ast) else {
+        return false;
     };
     fields.iter().any(|field| {
         field

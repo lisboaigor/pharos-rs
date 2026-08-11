@@ -1,0 +1,31 @@
+[package]
+name = "pharos-realtime"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lisboaigor/pharos-rs"
+description = "Real-time WebSocket / pub-sub primitives for Pharos RS (room broadcast fan-out, no ack/nack)."
+
+[dependencies]
+# The workspace's `axum` dependency does not enable `ws` by default (nothing
+# else in the workspace needed WebSockets before this crate) — enabled here.
+axum      = { workspace = true, features = ["ws"] }
+dashmap   = { workspace = true }
+futures   = { workspace = true }
+metrics   = { workspace = true }
+thiserror = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "time"] }
+tower = { workspace = true }
+# WebSocket test client for the real-socket integration test in
+# `tests/hub_flow.rs` — not needed anywhere in production code, only to drive
+# a real client against a real `axum::serve` server in-process.
+tokio-tungstenite = "0.28"
+
+[lints]
+workspace = true

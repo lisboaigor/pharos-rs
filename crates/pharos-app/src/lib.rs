@@ -123,7 +123,8 @@ pub use pharos_messaging::{
     MessageAcknowledger, MessageConsumer, MessagePublisher, MessagingError, OutboxDispatchError,
     OutboxDispatcher, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     PartitionAssignment, ProcessError, ProcessOutcome, RetryDecision, RetryPolicy, SchemaRegistry,
-    SchemaRegistryError, SweepError, process_idempotent, sweep_failed_to_dead_letter,
+    SchemaRegistryError, SweepError, process_idempotent, process_idempotent_with_retry,
+    sweep_failed_to_dead_letter,
 };
 pub use query::{Query, QueryHandler, dispatch as query_dispatch};
 #[cfg(feature = "retry")]

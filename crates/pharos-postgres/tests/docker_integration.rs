@@ -8,11 +8,12 @@ use pharos_core::{
 };
 use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, SnapshotStore};
 use pharos_postgres::{
-    PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue, PostgresInboxStore,
-    PostgresJsonRepository, PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork,
-    SaveAndEnqueueError, TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
-    migrate_postgres_dead_letter_schema, migrate_postgres_eventing_schema,
-    migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue, save_and_enqueue_in,
+    PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue,
+    PostgresEventStoreError, PostgresInboxStore, PostgresJsonRepository, PostgresOutboxRepository,
+    PostgresTransactionError, PostgresUnitOfWork, SaveAndEnqueueError, TenantJsonRepository,
+    connect_pool, migrate_postgres_aggregate_schema, migrate_postgres_dead_letter_schema,
+    migrate_postgres_eventing_schema, migrate_postgres_tenant_aggregate_schema,
+    save_aggregate_and_enqueue, save_and_enqueue_in,
 };
 use pharos_saga::{SagaInstance, SagaStatus, SagaStore, SagaTimeoutStore};
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,10 @@ impl AggregateRoot for TestAggregate {
     }
     fn drain_events(&mut self) -> Vec<Self::Event> {
         std::mem::take(&mut self.events)
+    }
+    fn restore_events(&mut self, events: Vec<Self::Event>) {
+        let raised_since = std::mem::replace(&mut self.events, events);
+        self.events.extend(raised_since);
     }
     fn version(&self) -> u64 {
         self.version
@@ -518,6 +523,9 @@ impl AggregateRoot for Ledger {
     fn drain_events(&mut self) -> Vec<Self::Event> {
         self.events.drain()
     }
+    fn restore_events(&mut self, events: Vec<Self::Event>) {
+        self.events.restore(events);
+    }
     fn version(&self) -> u64 {
         self.version
     }
@@ -544,8 +552,8 @@ fn posted(ledger_id: &str, amount_minor: i64) -> LedgerEntryPosted {
 #[tokio::test]
 async fn pg_event_store_appends_loads_and_enforces_occ() -> TestResult {
     let (_container, pool) = start_postgres().await?;
-    let store: PgEventStore<String, LedgerEntryPosted> =
-        PgEventStore::with_stream_type(pool, "ledger");
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let store: PgEventStore<String, LedgerEntryPosted> = PgEventStore::new(pool, &tenant, "ledger");
     store.migrate().await?;
 
     let id = "ledger-1".to_string();
@@ -592,11 +600,11 @@ async fn pg_event_store_appends_loads_and_enforces_occ() -> TestResult {
 #[tokio::test]
 async fn pg_snapshot_store_upserts_and_delete_stream_removes_both() -> TestResult {
     let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
     let store: PgEventStore<String, LedgerEntryPosted> =
-        PgEventStore::with_stream_type(pool.clone(), "ledger");
+        PgEventStore::new(pool.clone(), &tenant, "ledger");
     store.migrate().await?;
-    let snapshots: PgSnapshotStore<String, Ledger> =
-        PgSnapshotStore::with_stream_type(pool, "ledger");
+    let snapshots: PgSnapshotStore<String, Ledger> = PgSnapshotStore::new(pool, &tenant, "ledger");
 
     let id = "ledger-2".to_string();
     store.append(&id, 0, vec![posted(&id, 500)]).await?;
@@ -630,11 +638,224 @@ async fn pg_snapshot_store_upserts_and_delete_stream_removes_both() -> TestResul
     Ok(())
 }
 
+/// Regression test for the monotonicity guard on the snapshot upsert: a
+/// delayed writer (a retried snapshot task, a race between two callers)
+/// saving an older version must not regress an already-newer snapshot.
+#[tokio::test]
+async fn pg_snapshot_store_upsert_refuses_to_regress_the_version() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let snapshots: PgSnapshotStore<String, Ledger> = PgSnapshotStore::new(pool, &tenant, "ledger");
+    snapshots.migrate().await?;
+
+    let id = "ledger-regress".to_string();
+    let at = |version: u64, balance: i64| Ledger {
+        id: id.clone(),
+        balance_minor: balance,
+        version,
+        events: AggregateEvents::default(),
+    };
+
+    snapshots.save(&id, Snapshot::new(at(5, 500), 5)).await?;
+
+    // A delayed writer for an older version must not win.
+    snapshots.save(&id, Snapshot::new(at(3, 300), 3)).await?;
+    let loaded = snapshots.load(&id).await?.ok_or("snapshot must exist")?;
+    assert_eq!(
+        loaded.version, 5,
+        "an older version must not regress a newer snapshot"
+    );
+    assert_eq!(loaded.state.balance_minor, 500);
+
+    // A genuinely newer version still wins.
+    snapshots.save(&id, Snapshot::new(at(7, 700), 7)).await?;
+    let loaded = snapshots.load(&id).await?.ok_or("snapshot must exist")?;
+    assert_eq!(loaded.version, 7);
+    assert_eq!(loaded.state.balance_minor, 700);
+    Ok(())
+}
+
+/// Two tenants using the identical `stream_id` must get two separate
+/// streams — not one shared/interleaved stream and not a spurious
+/// concurrency conflict between unrelated tenants.
+#[tokio::test]
+async fn pg_event_store_isolates_tenants_sharing_the_same_stream_id() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant_a = TenantContext::new(Uuid::now_v7());
+    let tenant_b = TenantContext::new(Uuid::now_v7());
+    let store_a: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool.clone(), &tenant_a, "ledger");
+    let store_b: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool, &tenant_b, "ledger");
+    store_a.migrate().await?;
+
+    let shared_id = "ledger-shared".to_string();
+
+    // Both tenants append to a stream_id they picked independently, unaware
+    // of each other — the natural shape of a sequential or human-chosen key.
+    store_a
+        .append(&shared_id, 0, vec![posted(&shared_id, 1_000)])
+        .await?;
+    store_b
+        .append(&shared_id, 0, vec![posted(&shared_id, 50_000)])
+        .await?;
+
+    let events_a = store_a.load(&shared_id).await?;
+    let events_b = store_b.load(&shared_id).await?;
+
+    assert_eq!(events_a.len(), 1, "tenant A must see only its own event");
+    assert_eq!(events_a[0].event.amount_minor, 1_000);
+    assert_eq!(events_b.len(), 1, "tenant B must see only its own event");
+    assert_eq!(events_b[0].event.amount_minor, 50_000);
+
+    // Each tenant's stream has its own independent head — a second append at
+    // `expected_version = 1` succeeds for both, rather than one tenant's
+    // prior append blocking the other's.
+    store_a
+        .append(&shared_id, 1, vec![posted(&shared_id, -100)])
+        .await?;
+    store_b
+        .append(&shared_id, 1, vec![posted(&shared_id, -5_000)])
+        .await?;
+    assert_eq!(store_a.load(&shared_id).await?.len(), 2);
+    assert_eq!(store_b.load(&shared_id).await?.len(), 2);
+    Ok(())
+}
+
+/// `load`/`load_after` must refuse to return more than the configured
+/// ceiling rather than silently truncating — a caller that got back a
+/// partial stream and treated it as the whole thing would rehydrate an
+/// aggregate from incomplete history.
+#[tokio::test]
+async fn pg_event_store_refuses_to_load_a_stream_over_its_ceiling() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool, &tenant, "ledger").with_max_events_per_load(3);
+    store.migrate().await?;
+
+    let id = "ledger-bounded".to_string();
+    store
+        .append(&id, 0, vec![posted(&id, 1), posted(&id, 2), posted(&id, 3)])
+        .await?;
+
+    // Exactly at the ceiling still succeeds.
+    assert_eq!(store.load(&id).await?.len(), 3);
+
+    // One event past it must be refused, not truncated to 3.
+    store.append(&id, 3, vec![posted(&id, 4)]).await?;
+    let Err(error) = store.load(&id).await else {
+        panic!("must refuse an oversized stream");
+    };
+    assert!(
+        matches!(&error, PostgresEventStoreError::StreamTooLarge { limit, .. } if *limit == 3),
+        "expected StreamTooLarge, got {error:?}"
+    );
+    Ok(())
+}
+
+/// The riskiest part of adding `tenant_id`: an installation created with the
+/// pre-tenant schema (no `tenant_id` column, primary key without it) must
+/// upgrade cleanly when `migrate()` runs again — existing rows keep their
+/// data, gain the sentinel tenant, and the primary key ends up scoped by
+/// tenant, all without a manual intervention.
+#[tokio::test]
+async fn migrate_upgrades_a_pre_tenant_event_store_schema_in_place() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+
+    // Recreate exactly the schema this crate shipped before tenant scoping
+    // existed (see migrations/0005_event_store.sql), then insert a row the
+    // way a pre-upgrade deployment would have.
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE pharos_event_streams (
+            stream_type TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            sequence BIGINT NOT NULL,
+            payload JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (stream_type, stream_id, sequence)
+        );
+        CREATE TABLE pharos_snapshots (
+            stream_type TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            version BIGINT NOT NULL,
+            taken_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (stream_type, stream_id)
+        );
+        INSERT INTO pharos_event_streams (stream_type, stream_id, sequence, payload, recorded_at)
+        VALUES ('ledger', 'pre-existing', 1,
+                '{"ledger_id":"pre-existing","amount_minor":42,"occurred_at":"2024-01-01T00:00:00Z"}'::jsonb,
+                now());
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // The tenant-aware constructor's `migrate()` runs the upgraded schema
+    // (ADD COLUMN + primary-key swap) against the pre-existing table.
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool.clone(), &tenant, "ledger");
+    store.migrate().await?;
+
+    // The primary key now includes tenant_id.
+    let pk_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT kcu.column_name
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON kcu.constraint_name = tc.constraint_name
+          AND kcu.table_schema = tc.table_schema
+         WHERE tc.table_name = 'pharos_event_streams' AND tc.constraint_type = 'PRIMARY KEY'
+         ORDER BY kcu.ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        pk_columns,
+        vec!["tenant_id", "stream_type", "stream_id", "sequence"]
+    );
+
+    // The pre-existing row survived, under the sentinel tenant, and is
+    // reachable through the deprecated non-tenant-scoped constructor.
+    #[allow(deprecated)]
+    let legacy_store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::with_stream_type(pool.clone(), "ledger");
+    let events = legacy_store.load(&"pre-existing".to_string()).await?;
+    assert_eq!(
+        events.len(),
+        1,
+        "the pre-migration row must not have been lost"
+    );
+    assert_eq!(events[0].event.amount_minor, 42);
+
+    // And it is correctly invisible to a real tenant using the same stream_id.
+    assert!(store.load(&"pre-existing".to_string()).await?.is_empty());
+
+    // Migrating again is a no-op, not a repeated constraint rebuild — proves
+    // the upgrade path is idempotent, safe to run on every app startup.
+    store.migrate().await?;
+    let pk_columns_again: Vec<String> = sqlx::query_scalar(
+        "SELECT kcu.column_name
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON kcu.constraint_name = tc.constraint_name
+          AND kcu.table_schema = tc.table_schema
+         WHERE tc.table_name = 'pharos_event_streams' AND tc.constraint_type = 'PRIMARY KEY'
+         ORDER BY kcu.ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(pk_columns_again, pk_columns);
+    Ok(())
+}
+
 #[tokio::test]
 async fn event_sourced_repository_rehydrates_against_postgres() -> TestResult {
     let (_container, pool) = start_postgres().await?;
-    let store: PgEventStore<String, LedgerEntryPosted> =
-        PgEventStore::with_stream_type(pool, "ledger");
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let store: PgEventStore<String, LedgerEntryPosted> = PgEventStore::new(pool, &tenant, "ledger");
     store.migrate().await?;
     let repo = EventSourcedRepository::<Ledger, _>::new(store);
 

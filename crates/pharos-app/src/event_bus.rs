@@ -265,8 +265,9 @@ impl EventBus {
     }
 
     /// Registers how to decode a serialized event carried on `topic` back into
-    /// its concrete type `E`, so [`publish_erased`](Self::publish_erased) can
-    /// deliver outbox/relay payloads to the same typed handlers as
+    /// its concrete type `E`, so
+    /// [`publish_trusted_bytes`](Self::publish_trusted_bytes) can deliver
+    /// outbox/relay payloads to the same typed handlers as
     /// [`publish`](Self::publish).
     ///
     /// This is the in-process bridge for the durable outbox seam: a background
@@ -296,18 +297,43 @@ impl EventBus {
     /// for its concrete type — the type-erased counterpart of
     /// [`publish`](Self::publish) used by the outbox relay.
     ///
+    /// # This deserializes `payload` straight into a domain event — call it
+    /// # only with bytes you already trust
+    ///
+    /// There is no aggregate here, no `decide`/`handle` step, no signature or
+    /// provenance check: a decoder registered via
+    /// [`register_decoder`](Self::register_decoder) turns any bytes that
+    /// happen to deserialize into `E` into a real event delivered to every
+    /// handler registered for it, and `E::aggregate_id()`/`occurred_at()`
+    /// come straight from those bytes — a forged payload can claim any
+    /// aggregate and any timestamp.
+    ///
+    /// The intended caller is your own outbox relay reading rows it wrote
+    /// itself. **Never** feed this a payload whose `topic` or bytes came
+    /// from a network-facing broker subject or connection without your own
+    /// authentication and provenance check first — a wildcard subscription
+    /// or attacker-chosen subject can otherwise select which decoder runs.
+    ///
     /// `topic` must have been registered with
     /// [`register_decoder`](Self::register_decoder). Behaviour mirrors
     /// `publish` exactly once the concrete event is reconstructed: same handler
     /// order, same [`PublishErrorPolicy`], same at-least-once semantics.
     ///
-    /// - Unknown `topic` (no decoder) is a silent no-op returning `Ok`, so
+    /// - Unknown `topic` (no decoder) returns `Ok` without dispatching, so
     ///   publishing stays decoupled from consumption — matching how `publish`
-    ///   drops events with no registered handler.
+    ///   drops events with no registered handler. It also increments
+    ///   `pharos.event_bus.unknown_topic` (in addition to a debug log), so a
+    ///   misrouted or unexpected topic is visible in metrics rather than
+    ///   silently invisible — an unknown topic is not necessarily hostile,
+    ///   but it is always worth being able to see.
     /// - A payload that fails to decode returns
     ///   [`EventBusError::DecodeError`] so the relay can retry or dead-letter.
-    pub async fn publish_erased(&self, topic: &str, payload: &[u8]) -> Result<(), EventBusError> {
-        let span = info_span!("event_bus.publish_erased", event.topic = topic);
+    pub async fn publish_trusted_bytes(
+        &self,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), EventBusError> {
+        let span = info_span!("event_bus.publish_trusted_bytes", event.topic = topic);
 
         async move {
             let Some((type_id, decoder)) = ({
@@ -315,6 +341,8 @@ impl EventBus {
                 decoders.get(topic).cloned()
             }) else {
                 debug!("no decoder registered for topic");
+                metrics::counter!("pharos.event_bus.unknown_topic", "topic" => topic.to_owned())
+                    .increment(1);
                 return Ok(());
             };
 
@@ -358,6 +386,17 @@ impl EventBus {
         }
         .instrument(span)
         .await
+    }
+
+    /// Deprecated alias for [`publish_trusted_bytes`](Self::publish_trusted_bytes).
+    ///
+    /// Renamed to make the trust requirement impossible to miss at the call
+    /// site: this method deserializes `payload` straight into a domain event
+    /// with no aggregate, no signature, and no provenance check, so it must
+    /// only ever be called with bytes you already trust.
+    #[deprecated(note = "renamed to publish_trusted_bytes to make its trust requirement explicit")]
+    pub async fn publish_erased(&self, topic: &str, payload: &[u8]) -> Result<(), EventBusError> {
+        self.publish_trusted_bytes(topic, payload).await
     }
 }
 
@@ -499,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
-    async fn publish_erased_decodes_and_dispatches_to_the_typed_handlers() {
+    async fn publish_trusted_bytes_decodes_and_dispatches_to_the_typed_handlers() {
         let bus = EventBus::new();
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         bus.register::<Echo, _>(Recorder(Arc::clone(&seen)));
@@ -514,14 +553,16 @@ mod tests {
 
         // The bytes are decoded back into `Echo` and reach the same handler as
         // a typed `publish` would.
-        bus.publish_erased("Echo", &payload)
+        bus.publish_trusted_bytes("Echo", &payload)
             .await
             .expect("dispatch");
         assert_eq!(&*seen.lock().unwrap(), &["hello".to_string()]);
 
-        // Unknown topic (no decoder) is a silent no-op, like `publish` with no
-        // handler — publishing stays decoupled from consumption.
-        bus.publish_erased("Unknown", &payload)
+        // Unknown topic (no decoder) is a no-op, like `publish` with no
+        // handler — publishing stays decoupled from consumption. (It also
+        // increments `pharos.event_bus.unknown_topic`, not asserted here
+        // since this crate has no metrics-recorder test harness.)
+        bus.publish_trusted_bytes("Unknown", &payload)
             .await
             .expect("unknown topic is a no-op");
         assert_eq!(seen.lock().unwrap().len(), 1);
@@ -529,9 +570,32 @@ mod tests {
         // A corrupt payload surfaces a DecodeError so the relay can retry or
         // dead-letter instead of silently dropping the message.
         let err = bus
-            .publish_erased("Echo", b"not json")
+            .publish_trusted_bytes("Echo", b"not json")
             .await
             .expect_err("corrupt payload must fail");
         assert!(matches!(err, EventBusError::DecodeError { .. }));
+    }
+
+    /// The deprecated alias must keep working identically, unrenamed callers
+    /// included — deprecation is a warning, not a break.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
+    async fn the_deprecated_alias_still_dispatches() {
+        let bus = EventBus::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        bus.register::<Echo, _>(Recorder(Arc::clone(&seen)));
+        bus.register_decoder::<Echo>("Echo");
+
+        let event = Echo {
+            aggregate_id: "a-1".to_string(),
+            occurred_at: Utc::now(),
+            note: "still works".to_string(),
+        };
+        let payload = serde_json::to_vec(&event).expect("serialize");
+
+        bus.publish_erased("Echo", &payload)
+            .await
+            .expect("dispatch");
+        assert_eq!(&*seen.lock().unwrap(), &["still works".to_string()]);
     }
 }

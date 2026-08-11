@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use chrono::DateTime;
 use prost::Message;
@@ -63,8 +63,18 @@ pub struct IntegrationEventEnvelope {
     pub payload: Vec<u8>,
 
     /// Arbitrary string metadata forwarded by adapters and consumers.
-    #[prost(map = "string, string", tag = "12")]
-    pub metadata: HashMap<String, String>,
+    ///
+    /// `BTreeMap`, not `HashMap`: prost emits a map field's entries in
+    /// iteration order, which `HashMap` does not guarantee to be stable
+    /// across processes or even across two runs of the same binary. Nothing
+    /// in this crate depends on that today, but [`IntegrationEvent`]'s own
+    /// `metadata` is already a `BTreeMap` for exactly this reason — a
+    /// checksum, HMAC, or content-addressed id computed over the encoded
+    /// bytes would otherwise vary for what is logically the same envelope.
+    /// Matching the JSON side's ordering here means that guarantee, whenever
+    /// it is added, does not have to special-case one wire format.
+    #[prost(btree_map = "string, string", tag = "12")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl IntegrationEventEnvelope {
@@ -130,5 +140,60 @@ impl IntegrationEventEnvelope {
     /// Decodes an envelope from a Protobuf-encoded byte slice.
     pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, ProtobufSerializationError> {
         Ok(Self::decode(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope_with_metadata(pairs: &[(&str, &str)]) -> IntegrationEventEnvelope {
+        IntegrationEventEnvelope {
+            // Fixed rather than freshly generated: only `metadata`'s
+            // ordering is under test, so every other field must be
+            // identical between the two envelopes being compared.
+            event_id: "018ffc00-e489-7b82-8512-54d0383152b8".to_string(),
+            event_type: "TestEvent".to_string(),
+            schema_version: 1,
+            occurred_at_ms: 0,
+            aggregate_id: None,
+            correlation_id: None,
+            causation_id: None,
+            source: "test".to_string(),
+            tenant_id: None,
+            trace_id: None,
+            payload: Vec::new(),
+            metadata: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// `metadata` must serialize to the exact same bytes regardless of
+    /// insertion order — a `HashMap` field would not guarantee this, and
+    /// anything computed over the encoded bytes (a checksum, an HMAC, a
+    /// content-addressed id) would then vary for what is logically the same
+    /// envelope.
+    #[test]
+    fn metadata_encodes_deterministically_regardless_of_insertion_order() {
+        let forward = envelope_with_metadata(&[("a", "1"), ("m", "2"), ("z", "3")]);
+        let reverse = envelope_with_metadata(&[("z", "3"), ("m", "2"), ("a", "1")]);
+
+        assert_eq!(forward.encode_to_bytes(), reverse.encode_to_bytes());
+    }
+
+    #[test]
+    fn metadata_round_trips_through_encode_and_decode() -> Result<(), Box<dyn std::error::Error>> {
+        let original = envelope_with_metadata(&[("region", "us-east-1"), ("shard", "7")]);
+
+        let decoded = IntegrationEventEnvelope::decode_from_bytes(&original.encode_to_bytes())?;
+
+        assert_eq!(
+            decoded.metadata.get("region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(decoded.metadata.get("shard").map(String::as_str), Some("7"));
+        Ok(())
     }
 }

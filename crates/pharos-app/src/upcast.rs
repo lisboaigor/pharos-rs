@@ -70,6 +70,36 @@ pub enum UpcastError {
     /// `schema_version` fields.
     #[error("envelope is not a JSON object with event_type and schema_version")]
     MalformedEnvelope,
+    /// `schema_version` does not fit in a `u32`.
+    ///
+    /// The wire field is a JSON number; deserializing it with a narrowing
+    /// `as u32` cast (rather than a checked conversion) would silently wrap —
+    /// `4294967297` becomes `1` — and the envelope would then be upcast and
+    /// interpreted as if it had actually claimed version 1. Rejecting it
+    /// outright is the only option that does not risk misinterpreting the
+    /// payload.
+    #[error("schema_version {0} does not fit in a u32")]
+    VersionOutOfRange(u64),
+    /// `schema_version` is higher than any version this registry's upcaster
+    /// chain for `event_type` reaches — a message claiming to be from a
+    /// future schema this consumer has not been upgraded to understand.
+    ///
+    /// Only raised for an `event_type` the registry has at least one
+    /// upcaster registered for; a type with none registered is assumed to
+    /// have never evolved and is passed through unchanged, matching the
+    /// existing behavior for event types outside the registry's concern.
+    #[error(
+        "'{event_type}' claims schema_version {version}, but this registry's upcaster chain \
+         only reaches version {known_up_to}"
+    )]
+    UnsupportedVersion {
+        /// Logical event type.
+        event_type: String,
+        /// The version the envelope claimed.
+        version: u32,
+        /// The highest version this registry's chain for `event_type` reaches.
+        known_up_to: u32,
+    },
     /// A registered upcaster rejected the payload.
     #[error("upcast of '{event_type}' from version {from_version} failed: {source}")]
     Transform {
@@ -146,6 +176,22 @@ impl JsonUpcasterRegistry {
     fn get(&self, event_type: &str, from_version: u32) -> Option<&UpcastFn> {
         self.upcasters.get(&(event_type.to_string(), from_version))
     }
+
+    /// The highest version this registry's upcaster chain for `event_type`
+    /// reaches — one past the largest registered `from_version` — or `None`
+    /// if no upcaster is registered for `event_type` at all.
+    ///
+    /// Meaningful only when `from_version`s were registered contiguously
+    /// starting at the type's actual first version (as the module doc's
+    /// example does); a registry with a gap can still under-detect an
+    /// out-of-range version on the far side of the gap.
+    fn max_known_version(&self, event_type: &str) -> Option<u32> {
+        self.upcasters
+            .keys()
+            .filter(|(et, _)| et == event_type)
+            .map(|(_, from_version)| from_version + 1)
+            .max()
+    }
 }
 
 /// JSON [`MessageCodec`] that applies registered upcasters during decode.
@@ -202,10 +248,12 @@ where
             .and_then(Value::as_str)
             .ok_or(UpcastError::MalformedEnvelope)?
             .to_string();
-        let mut version = obj
+        let raw_version = obj
             .get("schema_version")
             .and_then(Value::as_u64)
-            .ok_or(UpcastError::MalformedEnvelope)? as u32;
+            .ok_or(UpcastError::MalformedEnvelope)?;
+        let mut version =
+            u32::try_from(raw_version).map_err(|_| UpcastError::VersionOutOfRange(raw_version))?;
 
         while let Some(upcast) = self.registry.get(&event_type, version) {
             let payload = obj
@@ -219,6 +267,23 @@ where
             obj.insert("payload".to_string(), upgraded);
             version += 1;
             obj.insert("schema_version".to_string(), Value::from(version));
+        }
+
+        // A version beyond anything this registry's chain reaches, for a
+        // type it does have opinions about, is not "already current" — it is
+        // a schema this consumer was never upgraded to understand. Passing
+        // it through and deserializing into `P` (which models the version
+        // the registry's chain tops out at) risks silently misinterpreting
+        // fields, exactly the schema-evolution corruption this codec exists
+        // to prevent.
+        if let Some(known_up_to) = self.registry.max_known_version(&event_type)
+            && version > known_up_to
+        {
+            return Err(UpcastError::UnsupportedVersion {
+                event_type,
+                version,
+                known_up_to,
+            });
         }
 
         Ok(serde_json::from_value(envelope)?)
@@ -313,6 +378,63 @@ mod tests {
         let decoded: IntegrationEvent<Other> = codec.decode(&wire)?;
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.payload, Other { qty: 7 });
+        Ok(())
+    }
+
+    /// A version beyond anything the registry's chain reaches must be
+    /// rejected, not silently deserialized into the shape the chain tops out
+    /// at — the "schema-version confusion" corruption path.
+    #[test]
+    fn a_version_beyond_the_known_chain_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let codec = VersionedJsonCodec::new(registry_v1_to_v3());
+
+        // The registry's chain for "OrderPlaced" only reaches version 3.
+        let from_the_future = IntegrationEvent::new(
+            "OrderPlaced",
+            99,
+            "orders",
+            json!({ "quantity": 3, "currency": "BRL" }),
+        );
+        let wire = MessageCodec::<Value>::encode(&codec, &from_the_future)?;
+
+        let result: Result<IntegrationEvent<V3>, _> = codec.decode(&wire);
+        let Err(UpcastError::UnsupportedVersion {
+            event_type,
+            version,
+            known_up_to,
+        }) = result
+        else {
+            panic!("expected UnsupportedVersion, got {result:?}");
+        };
+        assert_eq!(event_type, "OrderPlaced");
+        assert_eq!(version, 99);
+        assert_eq!(known_up_to, 3);
+        Ok(())
+    }
+
+    /// `schema_version` values that overflow `u32` must be rejected rather
+    /// than silently truncated (`4294967297 as u32 == 1`, which would have
+    /// this decode — and upcast — as if it were a legitimate version 1).
+    #[test]
+    fn a_schema_version_that_overflows_u32_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let codec = VersionedJsonCodec::new(registry_v1_to_v3());
+
+        let envelope = json!({
+            "event_id": "018f9a2b-0000-7000-8000-000000000000",
+            "event_type": "OrderPlaced",
+            "schema_version": 4_294_967_297u64,
+            "occurred_at": "2024-01-01T00:00:00Z",
+            "source": "test",
+            "payload": { "qty": 3 },
+            "metadata": {},
+        });
+        let wire = SerializedEvent::new("application/json", serde_json::to_vec(&envelope)?);
+
+        let result: Result<IntegrationEvent<Value>, _> = codec.decode(&wire);
+        assert!(
+            matches!(result, Err(UpcastError::VersionOutOfRange(4_294_967_297))),
+            "expected VersionOutOfRange, got {result:?}"
+        );
         Ok(())
     }
 

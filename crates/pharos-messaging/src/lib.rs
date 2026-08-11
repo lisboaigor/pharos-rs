@@ -26,7 +26,9 @@ pub mod outbox;
 pub mod outbox_dispatcher;
 pub mod schema_registry;
 
-pub use consume::{ProcessError, ProcessOutcome, process_idempotent};
+pub use consume::{
+    ProcessError, ProcessOutcome, process_idempotent, process_idempotent_with_retry,
+};
 pub use consumer_group::{ConsumerGroupCoordinator, ConsumerGroupError, PartitionAssignment};
 pub use dead_letter::{DeadLetterError, DeadLetterMessage, DeadLetterQueue};
 pub use inbox::{IdempotencyDecision, InboxError, InboxMessage, InboxStatus, InboxStore};
