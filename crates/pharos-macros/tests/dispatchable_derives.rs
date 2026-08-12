@@ -82,10 +82,11 @@ async fn command_name_can_be_overridden() -> Result<(), Box<dyn std::error::Erro
 const _: () = assert!(!CreateThing::INTERNAL_ONLY);
 const _: () = assert!(!ArchiveThing::INTERNAL_ONLY);
 
+// The derived `trace_span` reads every field, so `wager_id` is not dead code
+// even though no test body touches it.
 #[derive(Command)]
 #[command(internal)]
 struct ReleasePayout {
-    #[expect(dead_code, reason = "the derive only needs the field to exist")]
     wager_id: u64,
 }
 
@@ -95,7 +96,6 @@ struct ReleasePayout {
 #[derive(Command)]
 #[command(internal, name = "wager.refunded")]
 struct RefundStakes {
-    #[expect(dead_code, reason = "the derive only needs the field to exist")]
     wager_id: u64,
 }
 

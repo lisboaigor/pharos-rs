@@ -546,7 +546,9 @@ fn expand_dispatchable(
     // Emitted only when `#[command(internal)]` is present; otherwise the trait
     // default (`false`) stands, keeping the command HTTP-reachable.
     let internal_const = if is_internal {
-        quote!(const INTERNAL_ONLY: bool = true;)
+        quote!(
+            const INTERNAL_ONLY: bool = true;
+        )
     } else {
         quote!()
     };
