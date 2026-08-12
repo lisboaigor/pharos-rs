@@ -203,6 +203,7 @@ Axum integration for HTTP adapters over application handlers:
 
 - `CommandHandlerState<C, H>` and `QueryHandlerState<Q, H>` extract typed handlers from router state.
 - `run_command` and `run_query` adapt JSON bodies / query parameters to `CommandHandler` and `QueryHandler`.
+- `run_command` (and `run_command_from_state`) refuse a command whose `Command::INTERNAL_ONLY` is `true` — set by `#[command(internal)]` — returning `404 Not Found` before the handler runs, so a saga-only command (payout, refund) accidentally wired to a route is never HTTP-reachable. In-process dispatch through a saga's `CommandDispatcher` is unaffected.
 
 ## `pharos-saga`
 
@@ -211,6 +212,8 @@ Saga/process-manager primitives:
 - `Saga` (with `on_timeout`), `SagaTransition`, `SagaStore`, `SagaTimeoutStore`, `CommandDispatcher`
 - `SagaRunner` for loading state, reacting to an event, persisting state, and dispatching follow-up commands
 - Deadlines: `SagaInstance::running_until` and the `deadline` on `Start`/`Advance` schedule a timeout; `SagaRunner::run_due_timeouts` claims elapsed instances (`SagaTimeoutStore::claim_due`, lease-based) and fires `Saga::on_timeout`. Claiming makes the sweep safe to run on multiple service instances concurrently; call it from a periodic task — the app owns the scheduler
+- Compensation on failure: `SagaTransition::Fail { reason, commands }` carries follow-up commands the runner dispatches like a `Complete`'s (after persisting the `Failed` state, before surfacing `SagaRunnerError::Failed`), so an abandoned or expired saga can refund/release atomically with the terminal transition. Pass an empty `Vec` when failing needs no compensation
+- Cross-context sagas: `SagaRunner::handle_any<E: Into<Saga::Event>>` accepts events from several bounded contexts. Define one unifying `Event` enum with a `From` impl per source and register one `EventBus` handler per source type, each forwarding through `handle_any` — the `Saga` trait stays single-event and the fan-in lives in the wiring
 
 ## `pharos-es`
 

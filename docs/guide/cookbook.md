@@ -176,6 +176,84 @@ async fn place_order(
 }
 ```
 
+## Internal-only command (never HTTP-reachable)
+
+Some commands must only ever be issued in-process — by a saga, a worker, an
+event handler — never by an HTTP caller. A payout, a refund, a saga-driven
+`StartGame`: routing one would let a client trigger it directly. Mark it
+`#[command(internal)]` and the axum entry points refuse it even if a route is
+wired up by mistake.
+
+```rust
+#[derive(Command, serde::Deserialize)]
+#[command(internal)]
+pub struct ReleasePayout {
+    pub wager_id: Uuid,
+}
+```
+
+`run_command`/`run_command_from_state` return `404 Not Found` (and log the
+wiring bug) before the handler runs when `Command::INTERNAL_ONLY` is `true`.
+The in-process path a saga uses stays open — that is exactly how the command is
+meant to run:
+
+```rust
+// A saga's CommandDispatcher dispatches it normally; only HTTP is refused.
+dispatcher.dispatch(ReleasePayout { wager_id }).await?;
+```
+
+## Saga that compensates on failure
+
+Failing a saga is not always a no-op: an abandoned or expired instance may still
+hold real work to undo — refund an escrow, release a reservation.
+`SagaTransition::Fail` carries `commands` the runner dispatches like a
+`Complete`'s, so the compensation happens atomically with the terminal
+transition. Pass an empty `Vec` when there is nothing to undo.
+
+```rust
+async fn on_timeout(
+    &self,
+    instance: &SagaInstance<Self::Id, Self::State>,
+) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error> {
+    // Funding window elapsed: fail the saga and refund whoever deposited.
+    Ok(SagaTransition::Fail {
+        reason: "funding window expired".into(),
+        commands: vec![EscrowCommand::RefundStakes { wager_id: instance.id.clone() }],
+    })
+}
+```
+
+The runner persists the instance as `Failed`, dispatches the commands, then
+returns `SagaRunnerError::Failed`. On the `run_due_timeouts` sweep a timeout
+`Fail` is a normal business outcome — the instance is counted as processed and
+the sweep continues.
+
+## Cross-context saga (one instance, many event sources)
+
+A saga that must react to events from more than one bounded context — an escrow
+watching both a wagering `StakeConfirmed` and a game's `GameEnded`, correlated
+by a shared id — keeps the `Saga` trait single-event and folds the sources in at
+the wiring with `SagaRunner::handle_any`.
+
+```rust
+// One unifying event enum with a From impl per source context.
+pub enum EscrowEvent { Wager(WagerEvent), Game(GameEvent) }
+impl From<WagerEvent> for EscrowEvent { fn from(e: WagerEvent) -> Self { Self::Wager(e) } }
+impl From<GameEvent>  for EscrowEvent { fn from(e: GameEvent)  -> Self { Self::Game(e) } }
+
+// Register one EventBus handler per source type; each forwards through handle_any.
+wager_bus.register::<WagerEvent, _>({
+    let runner = Arc::clone(&runner);
+    move |e: &WagerEvent| { let runner = Arc::clone(&runner); let e = e.clone();
+        async move { runner.handle_any(e).await } }
+});
+game_bus.register::<GameEvent, _>({
+    let runner = Arc::clone(&runner);
+    move |e: &GameEvent| { let runner = Arc::clone(&runner); let e = e.clone();
+        async move { runner.handle_any(e).await } }
+});
+```
+
 ## Cross-cutting pipeline with Tower (timeouts, retry, authorization)
 
 Tower is Pharos's pipeline seam: cross-cutting behavior wraps the handler as
