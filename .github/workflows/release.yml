@@ -14,7 +14,24 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub release
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
+      - name: Create or update the GitHub release
+        # A version tag is usually pushed once, but re-pushing it — moving the
+        # tag to fold a fix into an existing release — must not fail the job.
+        # A bare `gh release create` returns HTTP 422 "tag_name already exists"
+        # on the second push. So: create the release the first time; on a
+        # re-push, refresh its target commit and regenerate its notes instead
+        # (`gh release edit` has no --generate-notes, so the notes come from the
+        # generate-notes API and are passed with --notes).
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refreshing target and notes."
+            notes="$(gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" --jq .body)"
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
