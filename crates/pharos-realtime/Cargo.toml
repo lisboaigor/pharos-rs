@@ -25,7 +25,7 @@ tower = { workspace = true }
 # WebSocket test client for the real-socket integration test in
 # `tests/hub_flow.rs` — not needed anywhere in production code, only to drive
 # a real client against a real `axum::serve` server in-process.
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true
