@@ -63,6 +63,26 @@ impl HandlerError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
     }
 
+    /// Rejects an attempt to invoke an internal-only command over HTTP.
+    ///
+    /// A command marked `#[command(internal)]` (a saga-issued payout, refund,
+    /// or `StartGame`) has no public HTTP identity. If one is wired to a route
+    /// by mistake, [`run_command`] returns this instead of executing it: the
+    /// response is `404 Not Found` — to any caller the endpoint simply does not
+    /// exist — while the wiring bug is logged at error level so it surfaces in
+    /// operations. This is the framework backstop behind the primary rule of
+    /// never registering the route in the first place.
+    pub fn internal_command(name: &str) -> Self {
+        tracing::error!(
+            command = name,
+            "refused to run an internal-only command over HTTP; its route must be removed"
+        );
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "command is internal-only and cannot be invoked over HTTP",
+        )
+    }
+
     /// Maps a [`DomainError`] to the conventional HTTP status.
     ///
     /// `NotFound` → `404`, `Conflict`/`BusinessRule` → `409`, `Validation` →
@@ -239,6 +259,11 @@ where
 /// itself enforces it, no HTTP-specific step required. Validation failures map
 /// to `422 Unprocessable Entity` with the per-field violations; handler
 /// failures map to a generic `500` (the detail is logged, not returned).
+///
+/// A command marked `#[command(internal)]` ([`Command::INTERNAL_ONLY`]) is
+/// refused here before the handler runs, mapping to `404 Not Found` — see
+/// [`HandlerError::internal_command`]. `run_command_from_state` delegates to
+/// this function, so the guard covers both HTTP entry points.
 pub async fn run_command<C, H>(
     handler: CommandHandlerState<C, H>,
     Json(command): Json<C>,
@@ -248,6 +273,9 @@ where
     H: CommandHandler<C>,
     H::Output: Serialize,
 {
+    if C::INTERNAL_ONLY {
+        return Err(HandlerError::internal_command(C::NAME));
+    }
     pharos_app::dispatch(&*handler.handler, command)
         .await
         .map(Json)
@@ -460,6 +488,76 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let payload: Doubled = serde_json::from_slice(&body)?;
         assert_eq!(payload.value, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_command_refuses_internal_only_commands() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug, Deserialize)]
+        struct ReleasePayout {
+            #[allow(dead_code)]
+            amount: u64,
+        }
+
+        impl Command for ReleasePayout {
+            const NAME: &'static str = "ReleasePayout";
+            // The whole point under test: an internal-only command.
+            const INTERNAL_ONLY: bool = true;
+        }
+
+        struct PayoutHandler {
+            ran: Arc<AtomicBool>,
+        }
+
+        impl CommandHandler<ReleasePayout> for PayoutHandler {
+            type Output = Greeting;
+            type Error = std::convert::Infallible;
+
+            async fn handle(&self, _command: ReleasePayout) -> Result<Self::Output, Self::Error> {
+                self.ran.store(true, Ordering::SeqCst);
+                Ok(Greeting {
+                    message: "paid".into(),
+                })
+            }
+        }
+
+        async fn payout_route(
+            handler: CommandHandlerState<ReleasePayout, PayoutHandler>,
+            payload: Json<ReleasePayout>,
+        ) -> Result<Json<Greeting>, HandlerError> {
+            run_command(handler, payload).await
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(PayoutHandler {
+            ran: Arc::clone(&ran),
+        });
+        // State is the bare `Arc<H>`; axum's blanket `FromRef<T> for T` lets the
+        // `CommandHandlerState` extractor pull it straight out.
+        let app = Router::new()
+            .route("/commands/payout", post(payout_route))
+            .with_state(handler);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/commands/payout")
+                    .header("content-type", "application/json")
+                    // A well-formed body, so only the internal-only guard can
+                    // be responsible for the rejection.
+                    .body(Body::from(r#"{"amount":100}"#))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the internal-only command handler must never run over HTTP"
+        );
         Ok(())
     }
 }

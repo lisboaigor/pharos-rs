@@ -87,6 +87,21 @@ pub trait Command: Send + Sync + 'static {
     /// the way a hand-written string literal in each handler could.
     const NAME: &'static str;
 
+    /// Whether this command may only be dispatched internally — by a saga, a
+    /// worker, or an event handler — and must never be reachable over HTTP.
+    ///
+    /// Defaults to `false`. `#[derive(Command)]` sets it to `true` for a
+    /// command annotated `#[command(internal)]`. The HTTP entry points in
+    /// `pharos-axum` (`run_command` / `run_command_from_state`) refuse to
+    /// execute a command whose `INTERNAL_ONLY` is `true`, so a privileged
+    /// command (a payout, a refund, a saga-only `StartGame`) that is
+    /// accidentally wired to a route is rejected by the framework instead of
+    /// silently exposed. It is defense in depth layered on top of simply not
+    /// registering the route: the in-process dispatch paths a saga uses
+    /// ([`dispatch`], [`CommandHandler::handle`]) are unaffected — those are
+    /// exactly how an internal command is *meant* to run.
+    const INTERNAL_ONLY: bool = false;
+
     /// Builds the tracing span under which this command is handled.
     ///
     /// This bare trait default carries only `command = Self::NAME`.
@@ -279,6 +294,25 @@ mod tests {
     fn validate_input_is_a_noop_by_default() {
         // Commands that don't override validate_input always return Ok(()).
         assert!(Increment(0).validate_input().is_ok());
+    }
+
+    #[test]
+    fn commands_are_http_reachable_by_default() {
+        // Only commands that explicitly opt into `INTERNAL_ONLY` are refused
+        // by the HTTP entry points; the default keeps every command routable.
+        const { assert!(!Increment::INTERNAL_ONLY) };
+    }
+
+    struct Payout;
+
+    impl Command for Payout {
+        const NAME: &'static str = "Payout";
+        const INTERNAL_ONLY: bool = true;
+    }
+
+    #[test]
+    fn a_command_can_be_marked_internal_only() {
+        const { assert!(Payout::INTERNAL_ONLY) };
     }
 
     // The span name ("command.handle") and its field contents are asserted

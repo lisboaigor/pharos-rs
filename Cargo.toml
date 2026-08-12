@@ -27,7 +27,7 @@ members = [
 
 [workspace.package]
 # Minimum supported Rust version; checked by the `msrv` CI job.
-rust-version = "1.96"
+rust-version = "1.97.1"
 
 [workspace.dependencies]
 thiserror = "2.0.18"

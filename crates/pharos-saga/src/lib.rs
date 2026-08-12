@@ -84,8 +84,17 @@ pub enum SagaTransition<S, C> {
     },
     /// Complete the saga. Clears any pending deadline.
     Complete { state: S, commands: Vec<C> },
-    /// Fail the saga with a reason. Clears any pending deadline.
-    Fail { reason: String },
+    /// Fail the saga with a reason, optionally emitting compensating commands.
+    /// Clears any pending deadline.
+    ///
+    /// Unlike a plain workflow abort, a failure here often still has real work
+    /// to undo — refund an escrow, release a held reservation, cancel a
+    /// booking. Those compensating `commands` ride along and are dispatched by
+    /// [`SagaRunner`] exactly as a [`Complete`](Self::Complete)'s are, *before*
+    /// the terminal [`SagaRunnerError::Failed`] is surfaced. Pass an empty
+    /// `Vec` when failing needs no compensation (an immediate rejection with
+    /// nothing to undo, e.g. leaving a matchmaking queue).
+    Fail { reason: String, commands: Vec<C> },
 }
 
 /// Pure saga state machine.
@@ -128,6 +137,7 @@ pub trait Saga: Send + Sync + 'static {
         async {
             Ok(SagaTransition::Fail {
                 reason: "saga deadline elapsed".to_string(),
+                commands: Vec::new(),
             })
         }
     }
@@ -262,6 +272,35 @@ where
         self.apply_transition(id, current, transition).await
     }
 
+    /// Handles an event that isn't the saga's own [`Saga::Event`] but converts
+    /// into it, so one saga instance can react to events from several bounded
+    /// contexts.
+    ///
+    /// A cross-context saga — an escrow that must react to both a wagering
+    /// `StakeConfirmed` and a game's `GameEnded`, correlated by a shared id —
+    /// defines a single unifying event enum with a `From` impl per source, then
+    /// registers one `EventBus` handler per source event type, each forwarding
+    /// through `handle_any`. Conversion happens here and the event flows through
+    /// the same [`handle`](Self::handle) path; the [`Saga`] trait itself stays
+    /// single-event, and the fan-in lives in the wiring rather than in the state
+    /// machine.
+    ///
+    /// ```ignore
+    /// // EscrowEvent: From<WagerEvent> + From<GameEvent>
+    /// wager_bus.register::<WagerEvent, _>(move |e: &WagerEvent| runner.handle_any(e.clone()));
+    /// game_bus.register::<GameEvent, _>(move |e: &GameEvent| runner.handle_any(e.clone()));
+    /// ```
+    pub async fn handle_any<E>(
+        &self,
+        event: E,
+    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>>
+    where
+        E: Into<SG::Event>,
+    {
+        let event = event.into();
+        self.handle(&event).await
+    }
+
     async fn apply_transition(
         &self,
         id: SG::Id,
@@ -315,7 +354,7 @@ where
                     .map_err(SagaRunnerError::Store)?;
                 self.dispatch_all(commands).await
             }
-            SagaTransition::Fail { reason } => {
+            SagaTransition::Fail { reason, commands } => {
                 // A saga that fails before any instance was persisted has no
                 // state to mark; the error itself is the only record.
                 if let Some(mut instance) = current {
@@ -327,6 +366,13 @@ where
                         .await
                         .map_err(SagaRunnerError::Store)?;
                 }
+                // Compensating commands are dispatched the same way a
+                // `Complete`'s are: the saga is terminally failed, but the
+                // money (or reservation) it was guarding still has to be moved.
+                // Dispatched after persisting the failed state so a crash
+                // between the two never leaves a live saga believing it can
+                // still act.
+                self.dispatch_all(commands).await?;
                 Err(SagaRunnerError::Failed { reason })
             }
         }
@@ -574,6 +620,7 @@ mod tests {
         ) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error> {
             Ok(SagaTransition::Fail {
                 reason: "funds could not be reserved".to_string(),
+                commands: Vec::new(),
             })
         }
     }
@@ -627,6 +674,211 @@ mod tests {
             .cloned()
             .ok_or("instance must exist")?;
         assert_eq!(stored.status, SagaStatus::Failed);
+        Ok(())
+    }
+
+    /// Saga that fails but emits a compensating command on the way out — the
+    /// shape an escrow uses to refund stakes on an abandoned wager.
+    struct RefundingSaga;
+
+    impl Saga for RefundingSaga {
+        type Id = String;
+        type State = BillingState;
+        type Event = OrderPlaced;
+        type Command = BillingCommand;
+        type Error = Infallible;
+
+        fn id_for(&self, event: &Self::Event) -> Option<Self::Id> {
+            Some(event.order_id.clone())
+        }
+
+        async fn react(
+            &self,
+            _state: Option<&SagaInstance<Self::Id, Self::State>>,
+            event: &Self::Event,
+        ) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error> {
+            Ok(SagaTransition::Fail {
+                reason: "wager abandoned".to_string(),
+                commands: vec![BillingCommand::FinalizeOrder {
+                    order_id: event.order_id.clone(),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_transition_dispatches_compensating_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = InMemorySagaStore::default();
+        store
+            .save(SagaInstance::running(
+                "order-42".to_string(),
+                BillingState::AwaitingReservation { amount_cents: 500 },
+            ))
+            .await?;
+        let dispatcher = VecDispatcher::default();
+        let runner = SagaRunner::new(RefundingSaga, store, dispatcher.clone());
+        let event = OrderPlaced {
+            order_id: "order-42".into(),
+            amount_cents: 500,
+        };
+
+        // The saga still reports terminal failure to the caller...
+        assert!(matches!(
+            runner.handle(&event).await,
+            Err(SagaRunnerError::Failed { .. })
+        ));
+        // ...the instance is persisted as failed...
+        let stored = runner
+            .store
+            .load(&"order-42".to_string())
+            .await?
+            .ok_or("instance must exist")?;
+        assert_eq!(stored.status, SagaStatus::Failed);
+        // ...and the compensating command was dispatched despite the failure.
+        let commands = dispatcher
+            .commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            commands,
+            vec![BillingCommand::FinalizeOrder {
+                order_id: "order-42".into(),
+            }]
+        );
+        Ok(())
+    }
+
+    /// Saga that refunds on timeout — an escrow whose funded game is abandoned
+    /// past its deadline. Exercises `Fail { commands }` on the sweep path.
+    struct RefundOnTimeoutSaga;
+
+    impl Saga for RefundOnTimeoutSaga {
+        type Id = String;
+        type State = BillingState;
+        type Event = OrderPlaced;
+        type Command = BillingCommand;
+        type Error = Infallible;
+
+        fn id_for(&self, event: &Self::Event) -> Option<Self::Id> {
+            Some(event.order_id.clone())
+        }
+
+        async fn react(
+            &self,
+            _state: Option<&SagaInstance<Self::Id, Self::State>>,
+            _event: &Self::Event,
+        ) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error> {
+            Ok(SagaTransition::Ignore)
+        }
+
+        async fn on_timeout(
+            &self,
+            instance: &SagaInstance<Self::Id, Self::State>,
+        ) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error> {
+            Ok(SagaTransition::Fail {
+                reason: "game abandoned".to_string(),
+                commands: vec![BillingCommand::FinalizeOrder {
+                    order_id: instance.id.clone(),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_fail_dispatches_compensation_and_continues_sweep()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = InMemorySagaStore::default();
+        store.save(expired_instance("order-77")).await?;
+        let dispatcher = VecDispatcher::default();
+        let runner = SagaRunner::new(RefundOnTimeoutSaga, store, dispatcher.clone());
+
+        // A timeout `Fail` is a normal business outcome on the sweep path: the
+        // instance is counted as processed, not propagated as an error.
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            1
+        );
+
+        let stored = runner
+            .store
+            .load(&"order-77".to_string())
+            .await?
+            .ok_or("instance must exist")?;
+        assert_eq!(stored.status, SagaStatus::Failed);
+        assert_eq!(stored.deadline, None);
+
+        // The refund command fired even though the transition failed the saga.
+        let commands = dispatcher
+            .commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            commands,
+            vec![BillingCommand::FinalizeOrder {
+                order_id: "order-77".into(),
+            }]
+        );
+
+        // Terminal: nothing is due on a second sweep.
+        assert_eq!(
+            runner
+                .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    /// A foreign event from another bounded context that folds into the saga's
+    /// own event type via `From` — the cross-context fan-in `handle_any` serves.
+    struct DepositConfirmed {
+        order_id: String,
+        amount_cents: u32,
+    }
+
+    impl From<DepositConfirmed> for OrderPlaced {
+        fn from(value: DepositConfirmed) -> Self {
+            OrderPlaced {
+                order_id: value.order_id,
+                amount_cents: value.amount_cents,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_any_converts_foreign_events_into_the_saga_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = InMemorySagaStore::default();
+        let dispatcher = VecDispatcher::default();
+        let runner = SagaRunner::new(BillingSaga, store, dispatcher.clone());
+
+        // The saga's own Event is `OrderPlaced`; `handle_any` accepts anything
+        // that converts into it, so a handler registered for a different
+        // context's event type drives the same instance.
+        runner
+            .handle_any(DepositConfirmed {
+                order_id: "order-7".into(),
+                amount_cents: 900,
+            })
+            .await?;
+
+        let commands = dispatcher
+            .commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            commands,
+            vec![BillingCommand::ReserveFunds {
+                order_id: "order-7".into(),
+                amount_cents: 900,
+            }]
+        );
         Ok(())
     }
 

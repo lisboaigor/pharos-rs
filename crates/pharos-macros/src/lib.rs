@@ -249,6 +249,24 @@ pub fn derive_domain_event(input: TokenStream) -> TokenStream {
 /// The command's `NAME` defaults to the type name; override it with
 /// `#[command(name = "...")]`.
 ///
+/// ## Internal-only commands
+///
+/// Mark a command `#[command(internal)]` to set `Command::INTERNAL_ONLY` to
+/// `true`. The HTTP entry points in `pharos-axum` (`run_command` /
+/// `run_command_from_state`) then refuse to execute it, so a privileged
+/// command that should only ever be issued by a saga or worker (a payout, a
+/// refund, a saga-only `StartGame`) cannot be invoked over HTTP even if its
+/// route is wired up by mistake. In-process dispatch (`pharos_app::dispatch`,
+/// the path a saga's `CommandDispatcher` uses) is unaffected.
+///
+/// ```ignore
+/// #[derive(Command, Deserialize)]
+/// #[command(internal)]
+/// pub struct ReleasePayout {
+///     pub wager_id: Uuid,
+/// }
+/// ```
+///
 /// ## Tracing
 ///
 /// The generated `trace_span` records **every field** — so an error in the logs
@@ -437,10 +455,12 @@ fn expand_dispatchable(
     let (ig, tg, wc) = ast.generics.split_for_impl();
     let app = pharos_paths()?.app;
 
-    // Struct-level options: `name` (both), `result` (Query only), `validate` (Command only).
+    // Struct-level options: `name` (both), `result` (Query only), `validate`
+    // and `internal` (Command only).
     let mut name_override: Option<LitStr> = None;
     let mut result_ty: Option<Type> = None;
     let mut has_validate = false;
+    let mut is_internal = false;
     for attr in &ast.attrs {
         if !attr.path().is_ident(kind.attr()) {
             continue;
@@ -455,9 +475,13 @@ fn expand_dispatchable(
             } else if matches!(kind, Dispatchable::Command) && meta.path.is_ident("validate") {
                 has_validate = true;
                 Ok(())
+            } else if matches!(kind, Dispatchable::Command) && meta.path.is_ident("internal") {
+                is_internal = true;
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported option; expected `name`, `validate` (or `result` for queries)",
+                    "unsupported option; expected `name`, `validate`, `internal` \
+                     (or `result` for queries)",
                 ))
             }
         })?;
@@ -519,9 +543,17 @@ fn expand_dispatchable(
         } else {
             quote!()
         };
+    // Emitted only when `#[command(internal)]` is present; otherwise the trait
+    // default (`false`) stands, keeping the command HTTP-reachable.
+    let internal_const = if is_internal {
+        quote!(const INTERNAL_ONLY: bool = true;)
+    } else {
+        quote!()
+    };
     let body = match kind {
         Dispatchable::Command => quote! {
             const NAME: &'static str = #name_lit;
+            #internal_const
             #trace_span_fn
             #validate_input_fn
         },

@@ -42,7 +42,7 @@ jobs:
         run: cargo test --workspace --all-features -- --test-threads=1
 
   msrv:
-    name: MSRV (1.96)
+    name: MSRV (1.97.1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96"
+          toolchain: "1.97.1"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

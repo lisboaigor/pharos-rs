@@ -75,6 +75,39 @@ async fn command_name_can_be_overridden() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+// ── Command: `#[command(internal)]` sets INTERNAL_ONLY ───────────────────────
+
+// A command with no `internal` marker inherits the trait default (`false`) and
+// stays HTTP-reachable — asserted against `CreateThing`/`ArchiveThing` above.
+const _: () = assert!(!CreateThing::INTERNAL_ONLY);
+const _: () = assert!(!ArchiveThing::INTERNAL_ONLY);
+
+#[derive(Command)]
+#[command(internal)]
+struct ReleasePayout {
+    #[expect(dead_code, reason = "the derive only needs the field to exist")]
+    wager_id: u64,
+}
+
+// The marker flips the generated const, which is what the `pharos-axum` HTTP
+// entry points check to refuse the command. Combining it with `name` proves the
+// two struct-level options coexist.
+#[derive(Command)]
+#[command(internal, name = "wager.refunded")]
+struct RefundStakes {
+    #[expect(dead_code, reason = "the derive only needs the field to exist")]
+    wager_id: u64,
+}
+
+#[test]
+fn command_internal_marker_sets_internal_only() {
+    const { assert!(ReleasePayout::INTERNAL_ONLY) };
+    assert_eq!(ReleasePayout::NAME, "ReleasePayout");
+
+    const { assert!(RefundStakes::INTERNAL_ONLY) };
+    assert_eq!(RefundStakes::NAME, "wager.refunded");
+}
+
 // ── Query: result type + NAME + `#[trace]` field ─────────────────────────────
 
 #[derive(Query)]
