@@ -437,7 +437,17 @@ mod tests {
             });
 
             let mut stream = hub.subscribe(&room).await?;
-            let received = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+            // The racing publisher above may have drained all 50 of its
+            // messages before `subscribe` even returned — in which case a
+            // correctly-attached subscriber legitimately has nothing waiting,
+            // and the old "wait for any message" assertion timed out spuriously
+            // (the flake). Publish one probe *after* we hold the subscription:
+            // it must reach us unless the concurrent publish collected the room
+            // out from under the arriving subscriber, which is the actual
+            // regression under test.
+            hub.publish(RealtimeMessage::new(room.clone(), "probe", vec![255]))
+                .await?;
+            let received = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
             assert!(
                 matches!(received, Ok(Some(_))),
                 "attempt {attempt}: the subscriber was cut off by a concurrent publish"
