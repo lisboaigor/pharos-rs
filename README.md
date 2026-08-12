@@ -12,6 +12,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Validated value objects via `value_object!`; strongly typed UUID v7 IDs via `id_type!`
 - `Money`/`Currency` in `i128` minor units — checked arithmetic, lossless allocation, crypto magnitudes (wei) included
 - Command/query handlers with validation + tracing applied by the `dispatch` seam
+- Internal-only commands (`#[command(internal)]`): the HTTP entry points refuse to route them, keeping saga-issued payouts/refunds off the wire while in-process dispatch still works
 - Repository abstraction with optimistic concurrency control
 - Atomic aggregate save + outbox in one transaction (`TransactionalRepository` / `save_and_enqueue_in`)
 - In-process domain event bus with configurable error policy, retry, and dead-letter decorators
@@ -21,6 +22,8 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Idempotent consumers in one call (`process_idempotent`)
 - Durable event sourcing and sagas on PostgreSQL (`PgEventStore`, `PgSnapshotStore`, `PgSagaStore`)
 - Saga deadlines: schedule timeouts on `Start`/`Advance` and sweep them with `SagaRunner::run_due_timeouts`
+- Saga compensation on failure: `SagaTransition::Fail` carries follow-up `commands`, dispatched like a `Complete`'s — refund an escrow or release a reservation atomically with the terminal transition
+- Cross-context sagas: `SagaRunner::handle_any` folds events from several bounded contexts into one saga instance without changing the `Saga` trait
 - Tower as the cross-cutting pipeline seam (timeouts, limits, authorization)
 - Observability with `tracing` spans and `metrics` counters throughout
 
