@@ -598,6 +598,82 @@ async fn pg_event_store_appends_loads_and_enforces_occ() -> TestResult {
 }
 
 #[tokio::test]
+async fn pg_event_store_append_and_enqueue_is_atomic() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool.clone(), &tenant, "ledger");
+    store.migrate().await?;
+    migrate_postgres_eventing_schema(&pool).await?;
+    let outbox = PostgresOutboxRepository::new(pool.clone());
+
+    let id = "ledger-atomic".to_string();
+    let to_messages = |events: &[LedgerEntryPosted]| {
+        events
+            .iter()
+            .map(|event| {
+                OutboxMessage::new(Message::new(
+                    "ledger.posted",
+                    event.amount_minor.to_le_bytes().to_vec(),
+                    "application/octet-stream",
+                ))
+            })
+            .collect()
+    };
+
+    store
+        .append_and_enqueue(
+            &id,
+            0,
+            vec![posted(&id, 1_000), posted(&id, -250)],
+            to_messages,
+        )
+        .await?;
+
+    assert_eq!(store.load(&id).await?.len(), 2);
+    assert_eq!(
+        outbox.pending(10).await?.len(),
+        2,
+        "every appended event must have left a durable message behind"
+    );
+
+    // A conflicting append must leave neither the stream nor the outbox
+    // changed: this is the whole point of doing both in one transaction.
+    let conflict = store
+        .append_and_enqueue(&id, 0, vec![posted(&id, 7)], to_messages)
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(RepositoryError::ConcurrencyConflict { .. })
+    ));
+    assert_eq!(
+        store.load(&id).await?.len(),
+        2,
+        "the stream must be untouched"
+    );
+
+    // `pending` leases what it hands out, so re-read after the lease window
+    // would be flaky; count the rows directly instead.
+    let enqueued: i64 = sqlx::query_scalar("SELECT count(*) FROM pharos_outbox")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        enqueued, 2,
+        "the rolled-back append must not have enqueued a third message"
+    );
+
+    // An empty append enqueues nothing.
+    store
+        .append_and_enqueue(&id, 2, vec![], to_messages)
+        .await?;
+    let enqueued: i64 = sqlx::query_scalar("SELECT count(*) FROM pharos_outbox")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(enqueued, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn pg_snapshot_store_upserts_and_delete_stream_removes_both() -> TestResult {
     let (_container, pool) = start_postgres().await?;
     let tenant = TenantContext::new(Uuid::now_v7());

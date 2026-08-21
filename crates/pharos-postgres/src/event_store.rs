@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use pharos_app::TenantContext;
+use pharos_app::{OutboxMessage, TenantContext};
 use pharos_core::RepositoryError;
 use pharos_es::{EventStore, Snapshot, SnapshotStore, StoredEvent};
 use serde::{Serialize, de::DeserializeOwned};
@@ -12,6 +12,7 @@ use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
 use crate::pool::{PgPoolError, Pool};
+use crate::transaction::insert_outbox_in_tx;
 
 /// Sentinel tenant used by the deprecated, non-tenant-scoped constructors
 /// ([`PgEventStore::with_stream_type`], [`PgSnapshotStore::with_stream_type`]).
@@ -118,6 +119,9 @@ pub enum PostgresEventStoreError {
     Storage(#[from] sqlx::Error),
     #[error("event serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Enqueuing an outbox message alongside the append failed.
+    #[error("outbox enqueue failed: {0}")]
+    Outbox(String),
     /// A single `load`/`load_after` call would have returned more than
     /// [`PgEventStore::max_events_per_load`] events.
     ///
@@ -336,10 +340,119 @@ where
         expected_version: u64,
         events: Vec<E>,
     ) -> Result<(), RepositoryError<Self::Error>> {
+        self.append_with_outbox(id, expected_version, events, |_| Vec::new())
+            .await
+    }
+
+    async fn delete_stream(&self, id: &I) -> Result<(), Self::Error> {
+        async move {
+            let stream_id = id.to_string();
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "DELETE FROM pharos_event_streams
+                 WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3",
+            )
+            .bind(self.tenant_id)
+            .bind(&self.stream_type)
+            .bind(&stream_id)
+            .execute(&mut *tx)
+            .await?;
+            // A snapshot without its stream would resurrect deleted state.
+            sqlx::query(
+                "DELETE FROM pharos_snapshots
+                 WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3",
+            )
+            .bind(self.tenant_id)
+            .bind(&self.stream_type)
+            .bind(&stream_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            metrics::counter!(
+                "pharos.postgres.event_store.stream_deleted",
+                "stream_type" => self.stream_type.clone()
+            )
+            .increment(1);
+            Ok(())
+        }
+        .instrument(info_span!(
+            "postgres.event_store.delete_stream",
+            stream_type = self.stream_type,
+        ))
+        .await
+    }
+}
+
+/// PostgreSQL snapshot store with JSONB payloads.
+///
+/// Pairs with [`PgEventStore`] under the same `tenant_id` and `stream_type`
+/// so `PgEventStore::delete_stream` removes both the events and the
+/// snapshot, and so a snapshot never gets read back for the wrong tenant's
+/// aggregate. Construct both from the same [`TenantContext`] and
+/// `stream_type`.
+pub struct PgSnapshotStore<I, S> {
+    pool: Pool,
+    tenant_id: Uuid,
+    stream_type: String,
+    _marker: std::marker::PhantomData<fn() -> (I, S)>,
+}
+
+impl<I, S> std::fmt::Debug for PgSnapshotStore<I, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgSnapshotStore")
+            .field("tenant_id", &self.tenant_id)
+            .field("stream_type", &self.stream_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I, E> PgEventStore<I, E>
+where
+    I: Display + Send + Sync + 'static,
+    E: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// Appends events and enqueues outbox messages in the **same** transaction.
+    ///
+    /// This is the event-sourced counterpart of
+    /// [`save_aggregate_and_enqueue`](crate::save_aggregate_and_enqueue). Use
+    /// it whenever an event crossing a context boundary must not be lost if the
+    /// process dies right after the append: with a plain
+    /// [`EventStore::append`] the events are durable but the in-process
+    /// delivery that follows is not, so a crash in between leaves the event
+    /// persisted and never delivered.
+    ///
+    /// `map_events` receives the events about to be appended and returns the
+    /// messages to enqueue. Returning an empty vector makes this exactly
+    /// equivalent to `append`.
+    pub async fn append_and_enqueue<F>(
+        &self,
+        id: &I,
+        expected_version: u64,
+        events: Vec<E>,
+        map_events: F,
+    ) -> Result<(), RepositoryError<PostgresEventStoreError>>
+    where
+        F: Fn(&[E]) -> Vec<OutboxMessage> + Send,
+    {
+        self.append_with_outbox(id, expected_version, events, map_events)
+            .await
+    }
+
+    async fn append_with_outbox<F>(
+        &self,
+        id: &I,
+        expected_version: u64,
+        events: Vec<E>,
+        map_events: F,
+    ) -> Result<(), RepositoryError<PostgresEventStoreError>>
+    where
+        F: Fn(&[E]) -> Vec<OutboxMessage> + Send,
+    {
         async move {
             if events.is_empty() {
                 return Ok(());
             }
+            let outbox = map_events(&events);
             let stream_id = id.to_string();
 
             // Serialize before touching the database so a bad payload never
@@ -412,6 +525,12 @@ where
                 }
             }
 
+            for message in &outbox {
+                insert_outbox_in_tx(&mut tx, message).await.map_err(|e| {
+                    RepositoryError::Storage(PostgresEventStoreError::Outbox(e.to_string()))
+                })?;
+            }
+
             tx.commit()
                 .await
                 .map_err(|e| RepositoryError::Storage(PostgresEventStoreError::Storage(e)))?;
@@ -420,6 +539,13 @@ where
                 "stream_type" => self.stream_type.clone()
             )
             .increment(payloads.len() as u64);
+            if !outbox.is_empty() {
+                metrics::counter!(
+                    "pharos.postgres.event_store.enqueued",
+                    "stream_type" => self.stream_type.clone()
+                )
+                .increment(outbox.len() as u64);
+            }
             Ok(())
         }
         .instrument(info_span!(
@@ -427,67 +553,6 @@ where
             stream_type = self.stream_type,
         ))
         .await
-    }
-
-    async fn delete_stream(&self, id: &I) -> Result<(), Self::Error> {
-        async move {
-            let stream_id = id.to_string();
-            let mut tx = self.pool.begin().await?;
-            sqlx::query(
-                "DELETE FROM pharos_event_streams
-                 WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3",
-            )
-            .bind(self.tenant_id)
-            .bind(&self.stream_type)
-            .bind(&stream_id)
-            .execute(&mut *tx)
-            .await?;
-            // A snapshot without its stream would resurrect deleted state.
-            sqlx::query(
-                "DELETE FROM pharos_snapshots
-                 WHERE tenant_id = $1 AND stream_type = $2 AND stream_id = $3",
-            )
-            .bind(self.tenant_id)
-            .bind(&self.stream_type)
-            .bind(&stream_id)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            metrics::counter!(
-                "pharos.postgres.event_store.stream_deleted",
-                "stream_type" => self.stream_type.clone()
-            )
-            .increment(1);
-            Ok(())
-        }
-        .instrument(info_span!(
-            "postgres.event_store.delete_stream",
-            stream_type = self.stream_type,
-        ))
-        .await
-    }
-}
-
-/// PostgreSQL snapshot store with JSONB payloads.
-///
-/// Pairs with [`PgEventStore`] under the same `tenant_id` and `stream_type`
-/// so `PgEventStore::delete_stream` removes both the events and the
-/// snapshot, and so a snapshot never gets read back for the wrong tenant's
-/// aggregate. Construct both from the same [`TenantContext`] and
-/// `stream_type`.
-pub struct PgSnapshotStore<I, S> {
-    pool: Pool,
-    tenant_id: Uuid,
-    stream_type: String,
-    _marker: std::marker::PhantomData<fn() -> (I, S)>,
-}
-
-impl<I, S> std::fmt::Debug for PgSnapshotStore<I, S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgSnapshotStore")
-            .field("tenant_id", &self.tenant_id)
-            .field("stream_type", &self.stream_type)
-            .finish_non_exhaustive()
     }
 }
 
