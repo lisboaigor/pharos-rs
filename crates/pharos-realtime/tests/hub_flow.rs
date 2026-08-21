@@ -22,8 +22,8 @@ use axum::routing::get;
 use futures::StreamExt;
 use pharos_realtime::{
     Access, ConnectionAuthenticator, Identity, InMemoryHub, OnMessage, Realtime, RealtimeConfig,
-    RealtimeError, RealtimeMessage, RealtimePublisher, RealtimeSubscriber, RoomAuthorizer, RoomId,
-    forbidden,
+    RealtimeError, RealtimeMessage, RealtimePublisher, RealtimeSubscriber, Reply, RoomAuthorizer,
+    RoomId, forbidden,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -147,13 +147,17 @@ impl OnMessage for RecordInbound {
         identity: &Identity,
         room: &RoomId,
         payload: Bytes,
-    ) -> Result<(), RealtimeError> {
+    ) -> Result<Option<Reply>, RealtimeError> {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        seen.push((
-            format!("{identity}@{room}"),
-            String::from_utf8_lossy(&payload).into_owned(),
-        ));
-        Ok(())
+        let body = String::from_utf8_lossy(&payload).into_owned();
+        seen.push((format!("{identity}@{room}"), body.clone()));
+
+        // A business rejection answers the sender instead of failing the
+        // frame, which is exactly what `Reply` exists for.
+        if body.starts_with("reject:") {
+            return Ok(Some(Reply::new("rejected", b"nope".to_vec())));
+        }
+        Ok(None)
     }
 }
 
@@ -174,7 +178,16 @@ async fn ws_handler(
         Ok(room) => room,
         Err(error) => return RealtimeError::from(error).into_response(),
     };
-    match state.realtime.upgrade(ws, &parts, room).await {
+    // The app decides where `since` travels; this harness reads a query
+    // parameter, which is the shape most clients will use.
+    let since = parts.uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "since").then(|| value.parse::<u64>().ok())?
+        })
+    });
+
+    match state.realtime.upgrade_since(ws, &parts, room, since).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -479,6 +492,111 @@ async fn an_inbound_frame_reaches_the_app_with_its_identity_and_room() -> TestRe
         "identity and room both arrive"
     );
     assert_eq!(delivered.1, "e2:e4");
+
+    client.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reconnecting_client_is_handed_what_it_missed_before_anything_live() -> TestResult {
+    let harness = spawn_test_server(RealtimeConfig::default()).await?;
+    let room = room("game:alice");
+    let url = format!("{}/ws/game:alice", harness.base_url);
+
+    // Two connections, as a two-player room really has: the second keeps the
+    // room — and therefore its backlog — alive while the first is away.
+    let (mut first, _) = tokio_tungstenite::connect_async(request_as(&url, "alice")?).await?;
+    let (mut opponent, _) = tokio_tungstenite::connect_async(request_as(&url, "alice")?).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for payload in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+        harness
+            .hub
+            .publish(RealtimeMessage::new(room.clone(), "test", payload))
+            .await?;
+    }
+
+    // It read the first message and then its socket died.
+    let _ = tokio::time::timeout(Duration::from_secs(2), first.next()).await?;
+    first.close(None).await?;
+
+    // It comes back saying "I processed version 1".
+    let (mut resumed, _) =
+        tokio_tungstenite::connect_async(request_as(&format!("{url}?since=1"), "alice")?).await?;
+
+    let mut replayed = Vec::new();
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), resumed.next())
+            .await?
+            .ok_or("connection closed before the backlog arrived")??;
+        match frame {
+            ClientMessage::Binary(bytes) => replayed.push(bytes.to_vec()),
+            other => panic!("expected a binary frame, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        replayed,
+        vec![b"two".to_vec(), b"three".to_vec()],
+        "the client must receive exactly the gap, in order, and nothing it already saw"
+    );
+
+    // And the live stream continues on top of the replay.
+    harness
+        .hub
+        .publish(RealtimeMessage::new(room, "test", b"four".to_vec()))
+        .await?;
+    let frame = tokio::time::timeout(Duration::from_secs(2), resumed.next())
+        .await?
+        .ok_or("connection closed before the live message arrived")??;
+    match frame {
+        ClientMessage::Binary(bytes) => assert_eq!(bytes.as_ref(), b"four"),
+        other => panic!("expected a binary frame, got {other:?}"),
+    }
+
+    resumed.close(None).await?;
+    opponent.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_business_rejection_answers_the_sender_instead_of_vanishing() -> TestResult {
+    use futures::SinkExt as _;
+
+    let harness = spawn_test_server(RealtimeConfig::default()).await?;
+    let url = format!("{}/ws/game:alice", harness.base_url);
+
+    let (mut client, _) = tokio_tungstenite::connect_async(request_as(&url, "alice")?).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    client
+        .send(ClientMessage::Binary(b"reject:bad-move".to_vec().into()))
+        .await?;
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
+        .await?
+        .ok_or("the rejection must come back on the same socket")??;
+    match frame {
+        ClientMessage::Binary(bytes) => assert_eq!(bytes.as_ref(), b"nope"),
+        other => panic!("expected the rejection frame, got {other:?}"),
+    }
+
+    // The connection stays usable: a refused command is not a broken socket.
+    harness
+        .hub
+        .publish(RealtimeMessage::new(
+            room("game:alice"),
+            "test",
+            b"still-here".to_vec(),
+        ))
+        .await?;
+    let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
+        .await?
+        .ok_or("connection closed after a business rejection")??;
+    match frame {
+        ClientMessage::Binary(bytes) => assert_eq!(bytes.as_ref(), b"still-here"),
+        other => panic!("expected a binary frame, got {other:?}"),
+    }
 
     client.close(None).await?;
     Ok(())

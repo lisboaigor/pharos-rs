@@ -68,8 +68,8 @@ pub mod ws;
 
 pub use auth::{Access, ConnectionAuthenticator, Identity, RoomAuthorizer, forbidden};
 pub use hub::{
-    InvalidRoomId, RealtimeError, RealtimeHub, RealtimeMessage, RealtimePublisher,
+    Backlog, InvalidRoomId, RealtimeError, RealtimeHub, RealtimeMessage, RealtimePublisher,
     RealtimeSubscriber, RoomId,
 };
 pub use memory::{InMemoryHub, RoomStream};
-pub use ws::{OnMessage, Realtime, RealtimeConfig};
+pub use ws::{OnMessage, Realtime, RealtimeConfig, Reply};

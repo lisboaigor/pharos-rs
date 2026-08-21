@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use pharos_app::{OutboxMessage, TenantContext};
@@ -163,7 +164,44 @@ pub struct PgEventStore<I, E> {
     tenant_id: Uuid,
     stream_type: String,
     max_events_per_load: usize,
+    upcaster: Option<Arc<dyn EventUpcaster>>,
     _marker: std::marker::PhantomData<fn() -> (I, E)>,
+}
+
+/// Rewrites a persisted event payload into the shape the current event type
+/// deserializes from.
+///
+/// An append-only stream outlives the code that wrote it. Adding an optional
+/// field is handled by `#[serde(default)]`, but renaming one, splitting a
+/// variant, or changing a type is not: the old payload simply stops
+/// deserializing, and an event that cannot be read is an aggregate that cannot
+/// be rebuilt. For anything the history is used to *settle* — a balance, a
+/// match result — that is unrecoverable rather than inconvenient.
+///
+/// An upcaster runs once per loaded event, before deserialization, and gets
+/// the raw JSON to rewrite. Implementations should be pure and cheap: they run
+/// on every replay of every stream.
+///
+/// ```
+/// # use serde_json::Value;
+/// # use pharos_postgres::EventUpcaster;
+/// struct RenameMoverToPlayer;
+///
+/// impl EventUpcaster for RenameMoverToPlayer {
+///     fn upcast(&self, payload: &mut Value) {
+///         let Some(object) = payload.get_mut("MoveMade").and_then(Value::as_object_mut) else {
+///             return;
+///         };
+///         if let Some(mover) = object.remove("mover") {
+///             object.insert("player_id".to_string(), mover);
+///         }
+///     }
+/// }
+/// ```
+pub trait EventUpcaster: Send + Sync + 'static {
+    /// Rewrites one raw payload in place. A payload already in the current
+    /// shape must be left untouched.
+    fn upcast(&self, payload: &mut Value);
 }
 
 /// Default ceiling on events returned by a single `load`/`load_after` call.
@@ -196,6 +234,7 @@ impl<I, E> PgEventStore<I, E> {
             tenant_id: tenant.tenant_id().as_uuid(),
             stream_type: stream_type.into(),
             max_events_per_load: DEFAULT_MAX_EVENTS_PER_LOAD,
+            upcaster: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -206,6 +245,13 @@ impl<I, E> PgEventStore<I, E> {
     /// the default — prefer adding a [`SnapshottingEventSourcedRepository`](
     /// pharos_es::SnapshottingEventSourcedRepository) first, since that
     /// bounds ordinary read cost regardless of how long the stream grows.
+    /// Installs an [`EventUpcaster`] applied to every payload before it is
+    /// deserialized.
+    pub fn with_upcaster(mut self, upcaster: Arc<dyn EventUpcaster>) -> Self {
+        self.upcaster = Some(upcaster);
+        self
+    }
+
     pub fn with_max_events_per_load(mut self, max_events_per_load: usize) -> Self {
         self.max_events_per_load = max_events_per_load;
         self
@@ -230,6 +276,7 @@ impl<I, E> PgEventStore<I, E> {
             tenant_id: NO_TENANT,
             stream_type: stream_type.into(),
             max_events_per_load: DEFAULT_MAX_EVENTS_PER_LOAD,
+            upcaster: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -321,7 +368,13 @@ where
                     let recorded_at: DateTime<Utc> = row.try_get("recorded_at")?;
                     Ok(StoredEvent {
                         sequence: sequence as u64,
-                        event: serde_json::from_value(payload)?,
+                        event: {
+                            let mut payload = payload;
+                            if let Some(upcaster) = &self.upcaster {
+                                upcaster.upcast(&mut payload);
+                            }
+                            serde_json::from_value(payload)?
+                        },
                         recorded_at,
                     })
                 })

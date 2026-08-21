@@ -65,15 +65,47 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::{Instrument, info_span};
 
 use crate::auth::{Access, ConnectionAuthenticator, Identity, RoomAuthorizer};
-use crate::hub::{RealtimeError, RealtimeHub, RealtimeSubscriber, RoomId};
+use crate::hub::{Backlog, RealtimeError, RealtimeHub, RealtimeSubscriber, RoomId};
+
+/// A payload sent back to the one connection that produced the frame.
+///
+/// This exists so an app can answer "that move was illegal" on the same
+/// socket. Without it, the only way to signal a rejection is an `Err`, which
+/// the pump treats as a transport problem and the client never sees — so a
+/// business outcome would be indistinguishable from a broken connection.
+///
+/// The bytes go to the sender alone, never to the room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    /// Server-side discriminator, used for telemetry only — like
+    /// [`RealtimeMessage::kind`](crate::RealtimeMessage::kind), it never
+    /// reaches the client.
+    pub kind: &'static str,
+    /// Serialized payload. The framework never decodes this.
+    pub payload: Vec<u8>,
+}
+
+impl Reply {
+    /// Creates a reply for the sending connection.
+    pub fn new(kind: &'static str, payload: Vec<u8>) -> Self {
+        Self { kind, payload }
+    }
+}
 
 /// Reacts to one inbound WebSocket frame's payload bytes.
 ///
 /// The embedding app implements this to decode frames into its own commands —
 /// deserializing into a command and dispatching it through the same
-/// `pharos_app::dispatch` path its REST route uses, for instance. An `Err` is
-/// logged and the frame is dropped; it does not close the connection — one
-/// malformed frame should not tear down an otherwise-healthy socket.
+/// `pharos_app::dispatch` path its REST route uses, for instance.
+///
+/// Returning `Ok(Some(reply))` writes `reply` back to this connection alone.
+/// That is the channel for **business** outcomes — a rejected move, a stale
+/// command — which must reach the client rather than vanish into a log.
+/// Reserve `Err` for genuine transport or infrastructure failures: it is
+/// logged and the frame dropped, and the client is told nothing.
+///
+/// Neither outcome closes the connection — one bad frame should not tear down
+/// an otherwise-healthy socket.
 ///
 /// `room` is supplied so the handler can scope what it does to the room the
 /// frame arrived on. It is not a substitute for authorization: the
@@ -89,7 +121,7 @@ pub trait OnMessage: Send + Sync + 'static {
         identity: &Identity,
         room: &RoomId,
         payload: Bytes,
-    ) -> impl Future<Output = Result<(), RealtimeError>> + Send;
+    ) -> impl Future<Output = Result<Option<Reply>, RealtimeError>> + Send;
 }
 
 impl<M: OnMessage> OnMessage for Arc<M> {
@@ -98,7 +130,7 @@ impl<M: OnMessage> OnMessage for Arc<M> {
         identity: &Identity,
         room: &RoomId,
         payload: Bytes,
-    ) -> impl Future<Output = Result<(), RealtimeError>> + Send {
+    ) -> impl Future<Output = Result<Option<Reply>, RealtimeError>> + Send {
         (**self).on_message(identity, room, payload)
     }
 }
@@ -230,6 +262,29 @@ where
         parts: &Parts,
         room: RoomId,
     ) -> Result<Response, RealtimeError> {
+        self.upgrade_since(ws, parts, room, None).await
+    }
+
+    /// Upgrades a reconnecting client, replaying what it missed after
+    /// `since` before any live message.
+    ///
+    /// `since` is the last version the client successfully processed. Where
+    /// that number travels — a query parameter, a subprotocol, the first
+    /// frame — is the app's decision, not the framework's, which is why it is
+    /// an argument rather than something parsed out of `parts` here.
+    ///
+    /// When the gap is wider than the hub still retains, the replay is
+    /// skipped and a [`Backlog::Gap`] is logged: the client is *not* silently
+    /// handed a partial history that looks continuous. Apps that must not
+    /// miss anything should treat a reconnect as a resync against their own
+    /// read model regardless, and use this only to shorten the common case.
+    pub async fn upgrade_since(
+        &self,
+        ws: WebSocketUpgrade,
+        parts: &Parts,
+        room: RoomId,
+        since: Option<u64>,
+    ) -> Result<Response, RealtimeError> {
         let identity = self.authenticator.authenticate(parts).await?;
         self.authorizer
             .authorize(&identity, &room, Access::Subscribe)
@@ -249,6 +304,7 @@ where
             parts: parts.clone(),
             identity,
             room,
+            since,
         };
 
         let ws = ws
@@ -319,6 +375,7 @@ struct Connection<H, A, Z, M> {
     parts: Parts,
     identity: Identity,
     room: RoomId,
+    since: Option<u64>,
 }
 
 impl<H, A, Z, M> Connection<H, A, Z, M>
@@ -333,8 +390,8 @@ where
     async fn run(mut self, socket: WebSocket) -> CloseReason {
         let (mut sink, mut stream) = socket.split();
 
-        let subscription = match self.hub.subscribe(&self.room).await {
-            Ok(subscription) => subscription,
+        let (backlog, subscription) = match self.hub.subscribe_since(&self.room, self.since).await {
+            Ok(subscribed) => subscribed,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to subscribe realtime connection to its room");
                 let _ = sink.send(WsMessage::Close(None)).await;
@@ -342,6 +399,32 @@ where
             }
         };
         tokio::pin!(subscription);
+
+        match backlog {
+            Backlog::Replayed(missed) => {
+                metrics::counter!("pharos.realtime.backlog.replayed")
+                    .increment(missed.len() as u64);
+                for message in missed {
+                    if sink
+                        .send(WsMessage::Binary(message.payload.into()))
+                        .await
+                        .is_err()
+                    {
+                        return CloseReason::ClientGone;
+                    }
+                }
+            }
+            Backlog::Gap { oldest_retained } => {
+                metrics::counter!("pharos.realtime.backlog.gap").increment(1);
+                tracing::info!(
+                    oldest_retained,
+                    since = self.since,
+                    "a reconnecting client fell further behind than the retained backlog; \
+                     it must resync from the app's own read model"
+                );
+            }
+            Backlog::Unavailable => {}
+        }
 
         let mut revalidate = interval(self.config.revalidate_every);
         let mut heartbeat = interval(self.config.heartbeat_every);
@@ -405,10 +488,24 @@ where
                         continue;
                     }
 
-                    if let Err(error) =
-                        self.on_message.on_message(&self.identity, &self.room, payload).await
-                    {
-                        tracing::warn!(error = %error, "on_message rejected an inbound realtime frame");
+                    match self.on_message.on_message(&self.identity, &self.room, payload).await {
+                        Ok(None) => {}
+                        Ok(Some(reply)) => {
+                            metrics::counter!(
+                                "pharos.realtime.replies.sent",
+                                "kind" => reply.kind
+                            )
+                            .increment(1);
+                            if sink.send(WsMessage::Binary(reply.payload.into())).await.is_err() {
+                                break CloseReason::ClientGone;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "on_message failed on an inbound realtime frame"
+                            );
+                        }
                     }
                 }
 

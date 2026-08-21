@@ -8,7 +8,7 @@ use pharos_core::{
 };
 use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, SnapshotStore};
 use pharos_postgres::{
-    PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue,
+    EventUpcaster, PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue,
     PostgresEventStoreError, PostgresInboxStore, PostgresJsonRepository, PostgresOutboxRepository,
     PostgresTransactionError, PostgresUnitOfWork, SaveAndEnqueueError, TenantJsonRepository,
     connect_pool, migrate_postgres_aggregate_schema, migrate_postgres_dead_letter_schema,
@@ -594,6 +594,61 @@ async fn pg_event_store_appends_loads_and_enforces_occ() -> TestResult {
     // Unknown streams load empty; empty appends are no-ops.
     assert!(store.load(&"missing".to_string()).await?.is_empty());
     store.append(&id, 2, vec![]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pg_event_store_upcasts_payloads_written_under_an_older_schema() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+
+    struct RenameLegacyField;
+    impl EventUpcaster for RenameLegacyField {
+        fn upcast(&self, payload: &mut serde_json::Value) {
+            let Some(object) = payload.as_object_mut() else {
+                return;
+            };
+            if let Some(legacy) = object.remove("amount") {
+                object.insert("amount_minor".to_string(), legacy);
+            }
+        }
+    }
+
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool.clone(), &tenant, "ledger")
+            .with_upcaster(std::sync::Arc::new(RenameLegacyField));
+    store.migrate().await?;
+
+    // A row written by an older version of the code: the field it stored is
+    // no longer the one the current event type deserializes from. Without an
+    // upcaster this stream is simply unreadable — and an unreadable stream is
+    // an aggregate that can never be rebuilt.
+    let id = "ledger-legacy".to_string();
+    sqlx::query(
+        "INSERT INTO pharos_event_streams
+            (tenant_id, stream_type, stream_id, sequence, payload, recorded_at)
+         VALUES ($1, 'ledger', $2, 1, $3::jsonb, now())",
+    )
+    .bind(tenant.tenant_id().as_uuid())
+    .bind(&id)
+    .bind(format!(
+        r#"{{"ledger_id":"{id}","amount":4200,"occurred_at":"2026-08-01T12:00:00Z"}}"#
+    ))
+    .execute(&pool)
+    .await?;
+
+    let events = store.load(&id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].event.amount_minor, 4200,
+        "the legacy payload must be migrated on the way in"
+    );
+
+    // A payload already in the current shape passes through untouched.
+    store.append(&id, 1, vec![posted(&id, -100)]).await?;
+    let events = store.load(&id).await?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].event.amount_minor, -100);
     Ok(())
 }
 

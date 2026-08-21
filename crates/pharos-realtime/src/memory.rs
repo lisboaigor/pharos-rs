@@ -23,6 +23,7 @@
 //! Horizontal scale-out (a NATS-backed hub sharing state across nodes) is
 //! explicitly Fase 7+ in the plan — this backend does not attempt it.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -32,7 +33,9 @@ use futures::Stream;
 use futures::stream::BoxStream;
 use tokio::sync::broadcast;
 
-use crate::hub::{RealtimeError, RealtimeMessage, RealtimePublisher, RealtimeSubscriber, RoomId};
+use crate::hub::{
+    Backlog, RealtimeError, RealtimeMessage, RealtimePublisher, RealtimeSubscriber, RoomId,
+};
 
 /// Per-room channel capacity: how many not-yet-delivered messages a lagging
 /// subscriber can fall behind by before it starts missing messages.
@@ -45,6 +48,13 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 /// than a product limit — raise it deliberately with
 /// [`InMemoryHub::with_limits`] if an app genuinely needs more.
 const DEFAULT_MAX_ROOMS: usize = 10_000;
+
+/// Messages retained per room for reconnecting subscribers.
+///
+/// Deliberately small: this is a recovery window for a dropped socket, not a
+/// message store. A client that falls further behind resyncs from the app's
+/// own read model, which is authoritative anyway.
+const DEFAULT_BACKLOG: usize = 64;
 
 type Rooms = DashMap<RoomId, RoomEntry>;
 
@@ -60,6 +70,11 @@ type Rooms = DashMap<RoomId, RoomEntry>;
 struct RoomEntry {
     sender: broadcast::Sender<RealtimeMessage>,
     subscribers: usize,
+    /// Next version to hand out. Starts at 1, so `since = 0` means "I have
+    /// seen nothing" and replays the whole retained backlog.
+    next_version: u64,
+    /// Newest-last ring of retained messages, capped at `backlog`.
+    backlog: VecDeque<RealtimeMessage>,
 }
 
 /// Single-node, in-process fan-out hub backed by one `broadcast` channel per
@@ -69,6 +84,7 @@ pub struct InMemoryHub {
     rooms: Arc<Rooms>,
     capacity: usize,
     max_rooms: usize,
+    backlog: usize,
 }
 
 impl Default for InMemoryHub {
@@ -97,7 +113,25 @@ impl InMemoryHub {
             rooms: Arc::default(),
             capacity: capacity.max(1),
             max_rooms: max_rooms.max(1),
+            backlog: DEFAULT_BACKLOG,
         }
+    }
+
+    /// Sets how many recent messages each room retains for reconnecting
+    /// subscribers.
+    ///
+    /// This is the ceiling on what [`RealtimeSubscriber::subscribe_since`] can
+    /// replay: a client that fell further behind than this gets
+    /// [`Backlog::Gap`] and has to resync from the app's own read model. Zero
+    /// disables retention.
+    pub fn with_backlog(mut self, backlog: usize) -> Self {
+        self.backlog = backlog;
+        self
+    }
+
+    /// How many messages per room are retained for reconnection.
+    pub fn backlog(&self) -> usize {
+        self.backlog
     }
 
     /// The number of rooms currently tracked.
@@ -109,8 +143,27 @@ impl InMemoryHub {
     /// subscriber. Returns `None` when the room has no subscribers, which for
     /// fire-and-forget fan-out is success with nobody listening — creating a
     /// channel here would let publishes to unread rooms fill the map.
-    fn sender_for_publish(&self, room: &RoomId) -> Option<broadcast::Sender<RealtimeMessage>> {
-        self.rooms.get(room).map(|entry| entry.sender.clone())
+    /// Stamps `msg` with the room's next version, retains it for reconnection,
+    /// and returns the sender when anyone is listening.
+    ///
+    /// Versioning happens under the room's shard lock so two concurrent
+    /// publishes to the same room can never be handed the same number — the
+    /// ordering guarantee a resuming subscriber depends on.
+    fn stamp_and_retain(
+        &self,
+        msg: &mut RealtimeMessage,
+    ) -> Option<broadcast::Sender<RealtimeMessage>> {
+        let mut entry = self.rooms.get_mut(&msg.room)?;
+        msg.version = entry.next_version;
+        entry.next_version += 1;
+
+        if self.backlog > 0 {
+            entry.backlog.push_back(msg.clone());
+            while entry.backlog.len() > self.backlog {
+                entry.backlog.pop_front();
+            }
+        }
+        Some(entry.sender.clone())
     }
 
     /// Registers a subscriber on `room`, creating the channel if needed, and
@@ -154,6 +207,8 @@ impl InMemoryHub {
                 vacant.insert(RoomEntry {
                     sender,
                     subscribers: 1,
+                    next_version: 1,
+                    backlog: VecDeque::new(),
                 });
                 receiver
             }
@@ -255,12 +310,13 @@ impl Stream for RoomStream {
 
 impl RealtimePublisher for InMemoryHub {
     async fn publish(&self, msg: RealtimeMessage) -> Result<(), RealtimeError> {
+        let mut msg = msg;
         // `kind` is a `&'static str`, so it is bounded and safe as a label.
         // The room is not: it comes from the request and would give the
         // metrics backend one time series per room an attacker can invent.
         metrics::counter!("pharos.realtime.messages.published", "kind" => msg.kind).increment(1);
 
-        if let Some(sender) = self.sender_for_publish(&msg.room) {
+        if let Some(sender) = self.stamp_and_retain(&mut msg) {
             // `send` errors only when every receiver dropped between the
             // lookup and here — fire-and-forget fan-out treats that as
             // success, not a failure to report upward.
@@ -277,6 +333,61 @@ impl RealtimeSubscriber for InMemoryHub {
         let (receiver, guard) = self.register_subscriber(room)?;
         Ok(RoomStream::new(receiver, guard))
     }
+
+    async fn subscribe_since(
+        &self,
+        room: &RoomId,
+        since: Option<u64>,
+    ) -> Result<(Backlog, Self::Stream), RealtimeError> {
+        // Whether the room already existed has to be observed *before*
+        // registering, because registering creates it. A room recreated by
+        // this very call is indistinguishable from one that was never used,
+        // and treating the two the same is how a client that lost everything
+        // gets told it is up to date.
+        let existed = self.rooms.contains_key(room);
+
+        // Register before reading the backlog: that is what makes the
+        // handover lossless. A message published in between lands in the
+        // receiver, and its version tells the caller it is a duplicate of one
+        // already replayed.
+        let (receiver, guard) = self.register_subscriber(room)?;
+
+        let backlog = match since {
+            None => Backlog::Unavailable,
+            Some(_) if self.backlog == 0 => Backlog::Unavailable,
+            // The room was collected when its last subscriber left, and its
+            // backlog went with it. Answering "nothing to replay" here would
+            // be a lie indistinguishable from being up to date, so say
+            // plainly that continuity cannot be proven.
+            Some(_) if !existed => Backlog::Unavailable,
+            Some(since) => match self.rooms.get(room) {
+                None => Backlog::Unavailable,
+                Some(entry) => {
+                    let oldest = entry.backlog.front().map(|msg| msg.version);
+                    match oldest {
+                        // Nothing has ever been published to this room, so
+                        // there is genuinely nothing to have missed.
+                        None if entry.next_version == 1 => Backlog::Replayed(Vec::new()),
+                        // Something was published but nothing is retained.
+                        None => Backlog::Unavailable,
+                        Some(oldest) if oldest > since + 1 => Backlog::Gap {
+                            oldest_retained: oldest,
+                        },
+                        Some(_) => Backlog::Replayed(
+                            entry
+                                .backlog
+                                .iter()
+                                .filter(|msg| msg.version > since)
+                                .cloned()
+                                .collect(),
+                        ),
+                    }
+                }
+            },
+        };
+
+        Ok((backlog, RoomStream::new(receiver, guard)))
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +401,142 @@ mod tests {
             panic!("`{id}` should be a valid room id");
         };
         room
+    }
+
+    #[tokio::test]
+    async fn every_message_gets_a_monotonic_room_version() {
+        let hub = InMemoryHub::new();
+        let room = room("game:1");
+        let Ok(mut stream) = hub.subscribe(&room).await else {
+            panic!("subscribing to a fresh room should succeed");
+        };
+
+        for payload in ["a", "b", "c"] {
+            let Ok(()) = hub.publish(msg(&room, payload)).await else {
+                panic!("publishing to a subscribed room should succeed");
+            };
+        }
+
+        let mut versions = Vec::new();
+        for _ in 0..3 {
+            let Some(received) = stream.next().await else {
+                panic!("the subscriber should see every published message");
+            };
+            versions.push(received.version);
+        }
+        assert_eq!(versions, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_subscriber_gets_exactly_what_it_missed() {
+        let hub = InMemoryHub::new();
+        let room = room("game:1");
+        let Ok(_keepalive) = hub.subscribe(&room).await else {
+            panic!("subscribing to a fresh room should succeed");
+        };
+
+        for payload in ["a", "b", "c", "d"] {
+            let _ = hub.publish(msg(&room, payload)).await;
+        }
+
+        // The client saw through version 2 and dropped its socket.
+        let Ok((backlog, _stream)) = hub.subscribe_since(&room, Some(2)).await else {
+            panic!("resubscribing should succeed");
+        };
+        let Backlog::Replayed(missed) = backlog else {
+            panic!("the whole gap is still retained, so this must be a replay");
+        };
+        assert_eq!(
+            missed.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![3, 4],
+            "only what came after version 2, and nothing already seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn falling_further_behind_than_the_backlog_is_reported_as_a_gap() {
+        let hub = InMemoryHub::new().with_backlog(2);
+        let room = room("game:1");
+        let Ok(_keepalive) = hub.subscribe(&room).await else {
+            panic!("subscribing to a fresh room should succeed");
+        };
+
+        for payload in ["a", "b", "c", "d"] {
+            let _ = hub.publish(msg(&room, payload)).await;
+        }
+
+        // Versions 1 and 2 have been evicted, so a client resuming from 0
+        // cannot be told it is up to date — silently replaying only 3 and 4
+        // would look like continuity while hiding a hole.
+        let Ok((backlog, _stream)) = hub.subscribe_since(&room, Some(0)).await else {
+            panic!("resubscribing should succeed");
+        };
+        assert_eq!(backlog, Backlog::Gap { oldest_retained: 3 });
+    }
+
+    #[tokio::test]
+    async fn a_collected_room_never_claims_the_client_is_up_to_date() {
+        let hub = InMemoryHub::new();
+        let room = room("game:1");
+
+        {
+            let Ok(_only_subscriber) = hub.subscribe(&room).await else {
+                panic!("subscribing to a fresh room should succeed");
+            };
+            let _ = hub.publish(msg(&room, "a")).await;
+            let _ = hub.publish(msg(&room, "b")).await;
+        }
+        assert_eq!(
+            hub.room_count(),
+            0,
+            "the room is collected with its backlog"
+        );
+
+        let Ok((backlog, _stream)) = hub.subscribe_since(&room, Some(1)).await else {
+            panic!("resubscribing should succeed");
+        };
+        assert_eq!(
+            backlog,
+            Backlog::Unavailable,
+            "an empty replay here would be indistinguishable from being current"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_at_the_head_replays_nothing() {
+        let hub = InMemoryHub::new();
+        let room = room("game:1");
+        let Ok(_keepalive) = hub.subscribe(&room).await else {
+            panic!("subscribing to a fresh room should succeed");
+        };
+        let _ = hub.publish(msg(&room, "a")).await;
+
+        let Ok((backlog, _stream)) = hub.subscribe_since(&room, Some(1)).await else {
+            panic!("resubscribing should succeed");
+        };
+        assert_eq!(backlog, Backlog::Replayed(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn retention_is_bounded_per_room() {
+        let hub = InMemoryHub::new().with_backlog(3);
+        let room = room("game:1");
+        let Ok(_keepalive) = hub.subscribe(&room).await else {
+            panic!("subscribing to a fresh room should succeed");
+        };
+
+        for index in 0..500 {
+            let _ = hub.publish(msg(&room, &format!("m{index}"))).await;
+        }
+
+        let Some(entry) = hub.rooms.get(&room) else {
+            panic!("the room should still exist");
+        };
+        assert_eq!(
+            entry.backlog.len(),
+            3,
+            "a long-lived room must not grow its backlog without bound"
+        );
     }
 
     fn msg(room: &RoomId, payload: &str) -> RealtimeMessage {

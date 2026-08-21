@@ -56,8 +56,8 @@ pub use dead_letter::{
     POSTGRES_DEAD_LETTER_SCHEMA, PostgresDeadLetterQueue, migrate_postgres_dead_letter_schema,
 };
 pub use event_store::{
-    POSTGRES_EVENT_STORE_SCHEMA, PgEventStore, PgSnapshotStore, PostgresEventStoreError,
-    migrate_postgres_event_store_schema,
+    EventUpcaster, POSTGRES_EVENT_STORE_SCHEMA, PgEventStore, PgSnapshotStore,
+    PostgresEventStoreError, migrate_postgres_event_store_schema,
 };
 pub use eventing::{
     POSTGRES_EVENTING_SCHEMA, PostgresInboxStore, PostgresOutboxRepository,

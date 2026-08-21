@@ -118,15 +118,24 @@ pub struct RealtimeMessage {
     /// Serialized payload. `pharos-realtime` never inspects or decodes this —
     /// the embedding app owns the wire format.
     pub payload: Vec<u8>,
+    /// Monotonic position of this message within its room, assigned by the
+    /// hub at publish time.
+    ///
+    /// A publisher leaves this at `0`; the hub overwrites it. It is what lets
+    /// a client that dropped its socket say "resume after N" instead of
+    /// silently missing whatever was published while it was away — see
+    /// [`RealtimeSubscriber::subscribe_since`].
+    pub version: u64,
 }
 
 impl RealtimeMessage {
-    /// Creates a new fan-out message.
+    /// Creates a new fan-out message. The hub assigns [`Self::version`].
     pub fn new(room: RoomId, kind: &'static str, payload: Vec<u8>) -> Self {
         Self {
             room,
             kind,
             payload,
+            version: 0,
         }
     }
 }
@@ -192,9 +201,10 @@ impl RealtimeError {
 /// Publishes fan-out messages into a room.
 ///
 /// No ack/nack: a publish that reaches zero subscribers still returns `Ok`.
-/// Delivery is best-effort to whoever is subscribed *right now* — there is no
-/// replay buffer for a subscriber that joins later (out of scope for the MVP,
-/// see the plan's "Fora de escopo").
+/// Delivery is best-effort to whoever is subscribed *right now*. A subscriber
+/// that reconnects can ask for what it missed via
+/// [`RealtimeSubscriber::subscribe_since`], bounded by whatever backlog the
+/// implementation retains.
 pub trait RealtimePublisher: Send + Sync + 'static {
     /// Publishes one message to `msg.room`.
     fn publish(
@@ -214,6 +224,44 @@ pub trait RealtimeSubscriber: Send + Sync + 'static {
         &self,
         room: &RoomId,
     ) -> impl Future<Output = Result<Self::Stream, RealtimeError>> + Send;
+
+    /// Joins `room` and replays whatever the implementation still retains
+    /// after `since`, ahead of the live stream.
+    ///
+    /// This is the reconnection path: a client that saw up to version `N`
+    /// passes `Some(N)` and receives `N+1..` before anything new. The default
+    /// implementation ignores `since` and behaves like [`Self::subscribe`],
+    /// which is correct for a backend with no backlog — the caller must treat
+    /// [`Backlog::Gap`] and a plain live stream the same way, by resyncing
+    /// through its own read model.
+    fn subscribe_since(
+        &self,
+        room: &RoomId,
+        since: Option<u64>,
+    ) -> impl Future<Output = Result<(Backlog, Self::Stream), RealtimeError>> + Send {
+        async move {
+            let _ = since;
+            let stream = self.subscribe(room).await?;
+            Ok((Backlog::Unavailable, stream))
+        }
+    }
+}
+
+/// What a [`RealtimeSubscriber::subscribe_since`] call could recover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backlog {
+    /// Every message after the requested version was still retained, and is
+    /// delivered ahead of the live stream.
+    Replayed(Vec<RealtimeMessage>),
+    /// The requested version is older than what the implementation retains,
+    /// so the gap cannot be filled. The subscriber must resync from its own
+    /// source of truth rather than assume continuity.
+    Gap {
+        /// Oldest version the implementation can still serve.
+        oldest_retained: u64,
+    },
+    /// The backend keeps no backlog at all.
+    Unavailable,
 }
 
 /// Convenience bound for anything that is both a publisher and a subscriber —
@@ -243,6 +291,18 @@ impl<S: RealtimeSubscriber> RealtimeSubscriber for Arc<S> {
         room: &RoomId,
     ) -> impl Future<Output = Result<Self::Stream, RealtimeError>> + Send {
         (**self).subscribe(room)
+    }
+
+    // Delegating this is load-bearing: without it an `Arc<H>` silently falls
+    // back to the default, which ignores `since` and reports no backlog — so
+    // every reconnection through a shared handle (which is every one, in
+    // practice) would lose its replay.
+    fn subscribe_since(
+        &self,
+        room: &RoomId,
+        since: Option<u64>,
+    ) -> impl Future<Output = Result<(Backlog, Self::Stream), RealtimeError>> + Send {
+        (**self).subscribe_since(room, since)
     }
 }
 
