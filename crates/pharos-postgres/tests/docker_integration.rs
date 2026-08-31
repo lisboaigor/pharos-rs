@@ -1,19 +1,19 @@
 use chrono::{DateTime, Utc};
 use pharos_app::{
     DeadLetterMessage, DeadLetterQueue, IdempotencyDecision, InboxStore, Message, OutboxMessage,
-    OutboxRepository, TenantContext,
+    OutboxRepository, SaveAndEnqueueError, TenantContext, save_and_enqueue_in,
 };
 use pharos_core::{
     AggregateEvents, AggregateRoot, DomainEvent, Entity, Repository, RepositoryError,
 };
 use pharos_es::{EventSourced, EventSourcedRepository, EventStore, Snapshot, SnapshotStore};
 use pharos_postgres::{
-    EventUpcaster, PgEventStore, PgSagaStore, PgSnapshotStore, Pool, PostgresDeadLetterQueue,
-    PostgresEventStoreError, PostgresInboxStore, PostgresJsonRepository, PostgresOutboxRepository,
-    PostgresTransactionError, PostgresUnitOfWork, SaveAndEnqueueError, TenantJsonRepository,
-    connect_pool, migrate_postgres_aggregate_schema, migrate_postgres_dead_letter_schema,
-    migrate_postgres_eventing_schema, migrate_postgres_tenant_aggregate_schema,
-    save_aggregate_and_enqueue, save_and_enqueue_in,
+    EventUpcasterRegistry, PgEventStore, PgSagaStore, PgSnapshotStore, Pool,
+    PostgresDeadLetterQueue, PostgresEventStoreError, PostgresInboxStore, PostgresJsonRepository,
+    PostgresOutboxRepository, PostgresTransactionError, PostgresUnitOfWork, SnapshotUpcaster,
+    TenantJsonRepository, connect_pool, migrate_postgres_aggregate_schema,
+    migrate_postgres_dead_letter_schema, migrate_postgres_eventing_schema,
+    migrate_postgres_tenant_aggregate_schema, save_aggregate_and_enqueue,
 };
 use pharos_saga::{SagaInstance, SagaStatus, SagaStore, SagaTimeoutStore};
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,103 @@ async fn postgres_outbox_repository_works_against_real_database() -> TestResult 
     repo.record_attempt(outbox_id).await?;
     repo.mark_published(outbox_id).await?;
     assert!(repo.pending(10).await?.is_empty());
+    Ok(())
+}
+
+/// The scenario `seq` exists to fix: `created_at` says one thing (here,
+/// forced via a direct `UPDATE` to simulate a value skewed by however it
+/// got there — `insert` itself always stamps it from Postgres's own `now()`
+/// precisely so a producer's clock cannot do this), but insertion order —
+/// and the database's own record of it — says another. `pending` must
+/// follow `seq`, the database-assigned insertion sequence, not `created_at`.
+#[tokio::test]
+async fn pending_orders_by_insertion_sequence_not_created_at() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let repo = PostgresOutboxRepository::new(pool.clone());
+    repo.migrate().await?;
+
+    let first = OutboxMessage::new(Message::new(
+        "orders",
+        b"first".to_vec(),
+        "application/json",
+    ));
+    let first_id = first.id;
+    repo.insert(first).await?;
+
+    let second = OutboxMessage::new(Message::new(
+        "orders",
+        b"second".to_vec(),
+        "application/json",
+    ));
+    repo.insert(second).await?;
+
+    // Simulate `created_at` disagreeing with insertion order — the only way
+    // this can happen now that `insert` no longer trusts a caller-supplied
+    // timestamp for it.
+    sqlx::query("UPDATE pharos_outbox SET created_at = now() + interval '1 hour' WHERE id = $1")
+        .bind(first_id)
+        .execute(&pool)
+        .await?;
+
+    let pending = repo.pending(10).await?;
+    let payloads: Vec<&[u8]> = pending
+        .iter()
+        .map(|m| m.message.payload.as_slice())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![b"first".as_slice(), b"second".as_slice()],
+        "insertion order (seq) must win over a skewed created_at"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_outbox_insert_many_persists_every_message_in_one_statement() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let repo = PostgresOutboxRepository::new(pool);
+    repo.migrate().await?;
+
+    let messages: Vec<OutboxMessage> = (0..5)
+        .map(|i| {
+            OutboxMessage::new(
+                Message::new(
+                    "orders",
+                    format!(r#"{{"i":{i}}}"#).into_bytes(),
+                    "application/json",
+                )
+                .with_key(format!("order-{i}"))
+                .with_header("correlation_id", format!("corr-{i}")),
+            )
+        })
+        .collect();
+    let ids: Vec<uuid::Uuid> = messages.iter().map(|m| m.id).collect();
+
+    repo.insert_many(messages).await?;
+
+    let pending = repo.pending(10).await?;
+    assert_eq!(pending.len(), 5);
+    let pending_ids: std::collections::HashSet<_> = pending.iter().map(|m| m.id).collect();
+    for id in &ids {
+        assert!(pending_ids.contains(id), "message {id} was not persisted");
+    }
+    // Headers and key survive the batched path exactly like the singular one.
+    let first = pending
+        .iter()
+        .find(|m| m.id == ids[0])
+        .ok_or("first message not found")?;
+    assert_eq!(first.message.key.as_deref(), Some("order-0"));
+    assert_eq!(
+        first
+            .message
+            .headers
+            .get("correlation_id")
+            .map(String::as_str),
+        Some("corr-0")
+    );
+
+    // An empty batch is a no-op, not an error (and not an empty SQL statement).
+    repo.insert_many(Vec::new()).await?;
     Ok(())
 }
 
@@ -359,6 +456,7 @@ async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() ->
 
     let tenant = TenantContext::new(Uuid::now_v7());
     let repo = TenantJsonRepository::<TestAggregate>::new(pool.clone(), &tenant, "test_aggregate");
+    let store = PostgresUnitOfWork::new(pool.clone());
 
     let agg_id = Uuid::now_v7().to_string();
     let mut aggregate = TestAggregate {
@@ -378,7 +476,7 @@ async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() ->
     };
 
     // Atomic: the tenant-scoped snapshot and both outbox rows commit together.
-    save_and_enqueue_in(&pool, &repo, &mut aggregate, map_to_message).await?;
+    save_and_enqueue_in(&store, &repo, &mut aggregate, map_to_message).await?;
     assert_eq!(aggregate.version(), 1);
 
     let found = repo.find_by_id(&agg_id).await?;
@@ -397,7 +495,7 @@ async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() ->
             occurred_at: Utc::now(),
         }],
     };
-    let result = save_and_enqueue_in(&pool, &repo, &mut stale, map_to_message).await;
+    let result = save_and_enqueue_in(&store, &repo, &mut stale, map_to_message).await;
     assert!(matches!(
         result,
         Err(SaveAndEnqueueError::Repository(
@@ -484,6 +582,12 @@ impl DomainEvent for LedgerEntryPosted {
     }
     fn aggregate_id(&self) -> &str {
         &self.ledger_id
+    }
+    // Version 1: the `amount` field was renamed to `amount_minor`. Rows
+    // written under version 0 (the pre-rename shape) need an
+    // `EventUpcasterRegistry` entry from 0 to reach this.
+    fn schema_version(&self) -> u32 {
+        1
     }
 }
 
@@ -602,32 +706,34 @@ async fn pg_event_store_upcasts_payloads_written_under_an_older_schema() -> Test
     let (_container, pool) = start_postgres().await?;
     let tenant = TenantContext::new(Uuid::now_v7());
 
-    struct RenameLegacyField;
-    impl EventUpcaster for RenameLegacyField {
-        fn upcast(&self, payload: &mut serde_json::Value) {
+    let registry = EventUpcasterRegistry::new().with_upcaster(
+        "LedgerEntryPosted",
+        0,
+        |mut payload: serde_json::Value| {
             let Some(object) = payload.as_object_mut() else {
-                return;
+                return Err("payload must be an object");
             };
             if let Some(legacy) = object.remove("amount") {
                 object.insert("amount_minor".to_string(), legacy);
             }
-        }
-    }
-
+            Ok(payload)
+        },
+    );
     let store: PgEventStore<String, LedgerEntryPosted> =
-        PgEventStore::new(pool.clone(), &tenant, "ledger")
-            .with_upcaster(std::sync::Arc::new(RenameLegacyField));
+        PgEventStore::new(pool.clone(), &tenant, "ledger").with_upcaster(registry);
     store.migrate().await?;
 
-    // A row written by an older version of the code: the field it stored is
-    // no longer the one the current event type deserializes from. Without an
+    // A row written by an older version of the code: both the field it
+    // stored and the schema_version it claims (0, the pre-rename shape) are
+    // no longer what the current event type deserializes from. Without an
     // upcaster this stream is simply unreadable — and an unreadable stream is
     // an aggregate that can never be rebuilt.
     let id = "ledger-legacy".to_string();
     sqlx::query(
         "INSERT INTO pharos_event_streams
-            (tenant_id, stream_type, stream_id, sequence, payload, recorded_at)
-         VALUES ($1, 'ledger', $2, 1, $3::jsonb, now())",
+            (tenant_id, stream_type, stream_id, sequence, payload, recorded_at,
+             event_type, schema_version)
+         VALUES ($1, 'ledger', $2, 1, $3::jsonb, now(), 'LedgerEntryPosted', 0)",
     )
     .bind(tenant.tenant_id().as_uuid())
     .bind(&id)
@@ -644,11 +750,62 @@ async fn pg_event_store_upcasts_payloads_written_under_an_older_schema() -> Test
         "the legacy payload must be migrated on the way in"
     );
 
-    // A payload already in the current shape passes through untouched.
+    // A payload already at the current schema_version (1) passes through
+    // untouched — the chain never even starts for it.
     store.append(&id, 1, vec![posted(&id, -100)]).await?;
     let events = store.load(&id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[1].event.amount_minor, -100);
+    Ok(())
+}
+
+/// A registry missing an upcaster partway through the chain must not pass
+/// the stalled payload through as current — see the identical regression
+/// test for `JsonUpcasterRegistry` in `pharos-app`. `LedgerEntryPosted`
+/// claims `schema_version() == 1`; registering only a 1→2 step (never a
+/// 0→1) leaves a version-0 row's chain stalled at 0, short of the
+/// registry's known top (2).
+#[tokio::test]
+async fn pg_event_store_rejects_a_gap_in_the_upcaster_chain() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+
+    let registry = EventUpcasterRegistry::new().with_upcaster(
+        "LedgerEntryPosted",
+        1,
+        |payload: serde_json::Value| Ok::<_, &str>(payload),
+    );
+    let store: PgEventStore<String, LedgerEntryPosted> =
+        PgEventStore::new(pool.clone(), &tenant, "ledger").with_upcaster(registry);
+    store.migrate().await?;
+
+    let id = "ledger-gap".to_string();
+    sqlx::query(
+        "INSERT INTO pharos_event_streams
+            (tenant_id, stream_type, stream_id, sequence, payload, recorded_at,
+             event_type, schema_version)
+         VALUES ($1, 'ledger', $2, 1, $3::jsonb, now(), 'LedgerEntryPosted', 0)",
+    )
+    .bind(tenant.tenant_id().as_uuid())
+    .bind(&id)
+    .bind(format!(
+        r#"{{"ledger_id":"{id}","amount_minor":100,"occurred_at":"2026-08-01T12:00:00Z"}}"#
+    ))
+    .execute(&pool)
+    .await?;
+
+    let result = store.load(&id).await;
+    assert!(
+        matches!(
+            result,
+            Err(PostgresEventStoreError::EventUpcastGap {
+                stopped_at: 0,
+                known_up_to: 2,
+                ..
+            })
+        ),
+        "expected EventUpcastGap, got {result:?}"
+    );
     Ok(())
 }
 
@@ -803,6 +960,60 @@ async fn pg_snapshot_store_upsert_refuses_to_regress_the_version() -> TestResult
     let loaded = snapshots.load(&id).await?.ok_or("snapshot must exist")?;
     assert_eq!(loaded.version, 7);
     assert_eq!(loaded.state.balance_minor, 700);
+    Ok(())
+}
+
+/// Renames the pre-v1 `balance` field to the current `balance_minor` shape.
+/// Without a `SnapshotUpcaster` on this path at all, a row written under the
+/// old field name would either fail to deserialize (a hard field rename) or —
+/// worse, for a serde-compatible-but-semantically-different change — succeed
+/// silently into the wrong meaning. This proves the upcaster runs and the
+/// stored `schema_version` reaches it.
+struct RenameBalanceToBalanceMinor;
+
+impl SnapshotUpcaster for RenameBalanceToBalanceMinor {
+    fn upcast(&self, payload: &mut serde_json::Value, schema_version: u32) {
+        if schema_version < 1
+            && let Some(object) = payload.as_object_mut()
+            && let Some(balance) = object.remove("balance")
+        {
+            object.insert("balance_minor".to_string(), balance);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pg_snapshot_store_upcasts_a_payload_written_under_an_older_schema() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let snapshots: PgSnapshotStore<String, Ledger> =
+        PgSnapshotStore::new(pool.clone(), &tenant, "ledger")
+            .with_upcaster(std::sync::Arc::new(RenameBalanceToBalanceMinor));
+    snapshots.migrate().await?;
+
+    let id = "ledger-old-schema".to_string();
+    // Row written directly, bypassing `save`, under the pre-v1 field name
+    // and schema_version 0 — simulating a snapshot persisted before the
+    // `balance_minor` rename shipped.
+    let old_payload = serde_json::json!({ "id": id, "balance": 900, "version": 3 });
+    sqlx::query(
+        "INSERT INTO pharos_snapshots
+            (tenant_id, stream_type, stream_id, payload, version, taken_at, schema_version)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)",
+    )
+    .bind(tenant.tenant_id().as_uuid())
+    .bind("ledger")
+    .bind(&id)
+    .bind(old_payload)
+    .bind(3_i64)
+    .bind(Utc::now())
+    .bind(0_i32)
+    .execute(&pool)
+    .await?;
+
+    let loaded = snapshots.load(&id).await?.ok_or("snapshot must exist")?;
+    assert_eq!(loaded.state.balance_minor, 900);
+    assert_eq!(loaded.schema_version, 0);
     Ok(())
 }
 
@@ -1100,8 +1311,14 @@ async fn pg_saga_store_roundtrips_instances_and_claims_due_deadlines() -> TestRe
         vec!["pay-due", "pay-due-later"]
     );
 
-    // Upsert: completing an instance takes it out of the sweep for good.
-    let mut confirmed = loaded;
+    // Completing an instance takes it out of the sweep for good. `loaded` is
+    // stale by now — two claims bumped "pay-due"'s version since it was
+    // fetched — so this reloads first, the same as an application reacting
+    // to a fresh event would.
+    let mut confirmed = store
+        .load(&"pay-due".to_string())
+        .await?
+        .ok_or("instance must exist")?;
     confirmed.state = PaymentSagaState::Confirmed;
     confirmed.status = SagaStatus::Completed;
     confirmed.deadline = None;
@@ -1191,6 +1408,115 @@ async fn inbox_cleanup_deletes_terminal_rows_and_reopens_idempotency() -> TestRe
         store.begin_processing(completed_id, "billing").await?,
         IdempotencyDecision::StartProcessing
     );
+    Ok(())
+}
+
+/// The `migrations/*.sql` file chain, in the numeric order
+/// `migrations/README.md` documents. Embedded at compile time so an
+/// out-of-order or missing file fails the build, not just this test.
+const MIGRATION_FILES: &[&str] = &[
+    include_str!("../migrations/0001_eventing.sql"),
+    include_str!("../migrations/0002_aggregates.sql"),
+    include_str!("../migrations/0003_tenant_aggregates.sql"),
+    include_str!("../migrations/0004_dead_letter.sql"),
+    include_str!("../migrations/0005_event_store.sql"),
+    include_str!("../migrations/0006_sagas.sql"),
+    include_str!("../migrations/0007_event_store_tenant_id.sql"),
+    include_str!("../migrations/0008_outbox_dead_lettered_and_next_attempt_at.sql"),
+    include_str!("../migrations/0009_tenant_aggregates_uuid.sql"),
+    include_str!("../migrations/0010_sagas_version.sql"),
+    include_str!("../migrations/0011_snapshots_schema_version.sql"),
+    include_str!("../migrations/0012_outbox_seq.sql"),
+    include_str!("../migrations/0013_event_streams_event_type_and_schema_version.sql"),
+];
+
+/// Regression test for the drift `migrations/README.md` warns about: these
+/// files are meant to mirror the schema constants in `src/`, but nothing
+/// enforced that, and they silently fell behind (missing the outbox
+/// `dead_lettered` status and `next_attempt_at` column, a `TEXT` instead of
+/// `UUID` tenant_id on tenant aggregates, and the sagas `version` column —
+/// see `migrations/README.md` for the detail).
+///
+/// This provisions a database using **only** `MIGRATION_FILES` — never
+/// `migrate_postgres_*_schema`, the path every other test in this file uses —
+/// and then exercises the exact operations the drift used to break: an
+/// outbox message reaching `dead_lettered`, a tenant-scoped aggregate
+/// save/find, and a saga save/load (which reads and writes `version`). A
+/// future drift between these files and the schema constants fails this
+/// test with a runtime SQL error, not a production incident.
+#[tokio::test]
+async fn migrations_directory_matches_the_schema_constants_used_at_runtime() -> TestResult {
+    let (_container, pool) = start_postgres().await?;
+    for migration in MIGRATION_FILES {
+        sqlx::raw_sql(*migration).execute(&pool).await?;
+    }
+
+    // Outbox: insert, claim via `pending` (reads next_attempt_at), then
+    // drive a message all the way to `dead_lettered` (the status the
+    // pre-0008 CHECK constraint rejected).
+    let outbox = PostgresOutboxRepository::new(pool.clone());
+    let message = OutboxMessage::new(Message::new("orders", b"{}".to_vec(), "application/json"));
+    let message_id = message.id;
+    outbox.insert(message).await?;
+    let pending = outbox.pending(10).await?;
+    assert_eq!(pending.len(), 1);
+    outbox.record_attempt(message_id).await?;
+    outbox
+        .mark_failed(message_id, "simulated failure".to_string())
+        .await?;
+    outbox.mark_dead_lettered(message_id).await?;
+
+    // Tenant aggregates: the TEXT-vs-UUID drift broke every bind here.
+    let tenant = TenantContext::new(Uuid::now_v7());
+    let tenant_repo =
+        TenantJsonRepository::<TestAggregate>::new(pool.clone(), &tenant, "test_aggregate");
+    let mut aggregate = TestAggregate {
+        id: Uuid::now_v7().to_string(),
+        name: "drift check".to_string(),
+        version: 0,
+        events: vec![],
+    };
+    tenant_repo.save(&mut aggregate).await?;
+    let found = tenant_repo.find_by_id(&aggregate.id).await?;
+    assert_eq!(found.map(|a| a.name), Some("drift check".to_string()));
+
+    // Sagas: every PgSagaStore query reads or writes `version`.
+    let saga_store: PgSagaStore<String, PaymentSagaState> =
+        PgSagaStore::with_saga_type(pool.clone(), "payment");
+    saga_store
+        .save(SagaInstance::running(
+            "drift-check".to_string(),
+            PaymentSagaState::AwaitingConfirmation { amount_minor: 100 },
+        ))
+        .await?;
+    let loaded = saga_store
+        .load(&"drift-check".to_string())
+        .await?
+        .ok_or("saga instance must exist")?;
+    assert_eq!(
+        loaded.state,
+        PaymentSagaState::AwaitingConfirmation { amount_minor: 100 }
+    );
+
+    // Snapshots: schema_version must round-trip.
+    let snapshot_store: PgSnapshotStore<String, Ledger> =
+        PgSnapshotStore::new(pool, &tenant, "ledger");
+    let ledger = Ledger {
+        id: "ledger-drift-check".to_string(),
+        balance_minor: 100,
+        version: 1,
+        events: AggregateEvents::default(),
+    };
+    snapshot_store
+        .save(&ledger.id.clone(), Snapshot::new(ledger, 1))
+        .await?;
+    let loaded_snapshot = snapshot_store
+        .load(&"ledger-drift-check".to_string())
+        .await?
+        .ok_or("snapshot must exist")?;
+    assert_eq!(loaded_snapshot.schema_version, 0);
+    assert_eq!(loaded_snapshot.state.balance_minor, 100);
+
     Ok(())
 }
 

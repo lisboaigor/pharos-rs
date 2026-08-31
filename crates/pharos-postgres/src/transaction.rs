@@ -4,128 +4,13 @@ use std::pin::Pin;
 
 use chrono::Utc;
 use pharos_app::{Message, OutboxMessage, UnitOfWorkError};
-use pharos_core::{AggregateRoot, Entity, RepositoryError};
+use pharos_core::{AggregateRoot, Entity};
 use serde::Serialize;
 use sqlx::{PgConnection, Row};
 use thiserror::Error;
 use tracing::{Instrument, info_span};
 
 use crate::pool::Pool;
-
-/// A repository whose `save` can run inside a caller-provided transaction.
-///
-/// This is the PostgreSQL transactional-composition contract: implement it in
-/// addition to `Repository<A>` and [`save_and_enqueue_in`] gives your aggregate
-/// the atomic save+outbox guarantee — whether it persists as JSONB
-/// ([`PostgresJsonRepository`](crate::PostgresJsonRepository) implements this)
-/// or as explicit normalized tables (implement `save_in_tx` with your own SQL).
-///
-/// # Contract
-///
-/// `save_in_tx` must enforce optimistic concurrency exactly like
-/// `Repository::save`: check the expected version, advance the aggregate's
-/// in-memory version on success, and return
-/// [`RepositoryError::ConcurrencyConflict`] on a stale write **without**
-/// mutating rows. It must not begin, commit, or roll back the transaction —
-/// the composing caller owns the boundary (and reverts the in-memory version
-/// if the surrounding transaction later fails).
-pub trait TransactionalRepository<A: AggregateRoot>: Send + Sync {
-    /// The repository-specific storage error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Persists the aggregate using the caller's live transaction connection.
-    fn save_in_tx<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        aggregate: &'c mut A,
-    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send + 'c;
-}
-
-/// Error returned by [`save_and_enqueue_in`].
-#[derive(Debug, Error)]
-pub enum SaveAndEnqueueError<E: std::error::Error> {
-    /// The repository failed to persist the aggregate (including
-    /// optimistic-concurrency conflicts).
-    #[error(transparent)]
-    Repository(RepositoryError<E>),
-    /// Opening/committing the transaction or writing the outbox failed.
-    #[error(transparent)]
-    Transaction(PostgresTransactionError),
-}
-
-/// Persists an aggregate through any [`TransactionalRepository`] and enqueues
-/// its pending events as outbox messages, atomically.
-///
-/// This is the production write path: one `BEGIN … COMMIT` covers the
-/// aggregate rows *and* the outbox inserts, so either both become visible or
-/// neither does. Works identically for the JSONB repository and for explicit
-/// relational repositories.
-///
-/// On any failure the aggregate's in-memory state is left intact: the version
-/// is reverted and the pending events are kept, so a retry starts clean.
-/// Events are drained only after the commit succeeds.
-pub async fn save_and_enqueue_in<A, R, F>(
-    pool: &Pool,
-    repo: &R,
-    aggregate: &mut A,
-    map_event: F,
-) -> Result<(), SaveAndEnqueueError<R::Error>>
-where
-    A: AggregateRoot,
-    R: TransactionalRepository<A>,
-    F: Fn(&A::Event) -> Message + Send + Sync,
-{
-    let aggregate_type = std::any::type_name::<A>();
-    let expected = aggregate.version();
-
-    // Build the outbox messages from the still-pending events; they are only
-    // drained after the transaction commits.
-    let messages: Vec<OutboxMessage> = aggregate
-        .pending_events()
-        .iter()
-        .map(|e| OutboxMessage::new(map_event(e)))
-        .collect();
-
-    let result = async {
-        let mut tx = pool.begin().await.map_err(|e| {
-            SaveAndEnqueueError::Transaction(PostgresTransactionError::Transaction(e))
-        })?;
-
-        repo.save_in_tx(&mut tx, aggregate)
-            .await
-            .map_err(SaveAndEnqueueError::Repository)?;
-
-        for message in &messages {
-            insert_outbox_in_tx(&mut tx, message)
-                .await
-                .map_err(SaveAndEnqueueError::Transaction)?;
-        }
-
-        tx.commit().await.map_err(|e| {
-            SaveAndEnqueueError::Transaction(PostgresTransactionError::Transaction(e))
-        })?;
-
-        metrics::counter!(
-            "pharos.postgres.save_and_enqueue.committed",
-            "aggregate_type" => aggregate_type.to_string()
-        )
-        .increment(messages.len() as u64 + 1);
-        Ok(())
-    }
-    .instrument(info_span!("postgres.save_and_enqueue_in", aggregate_type))
-    .await;
-
-    match result {
-        Ok(()) => {
-            aggregate.drain_events();
-            Ok(())
-        }
-        Err(error) => {
-            aggregate.set_version(expected);
-            Err(error)
-        }
-    }
-}
 
 /// A connection-pooled unit of work backed by a real PostgreSQL transaction.
 ///
@@ -194,6 +79,39 @@ impl PostgresUnitOfWork {
         }
         .instrument(info_span!("postgres.uow.transaction"))
         .await
+    }
+}
+
+impl pharos_app::TransactionalStore for PostgresUnitOfWork {
+    // `Pool::begin` returns an owned, `'static` transaction — it does not
+    // actually borrow `&self` — so the GAT parameter is unused in this
+    // instantiation. `pharos_app::TransactionalStore::Tx` still declares one
+    // per backend that *does* need to borrow its store.
+    type Tx<'a> = sqlx::Transaction<'static, sqlx::Postgres>;
+    type Error = PostgresTransactionError;
+
+    async fn begin(&self) -> Result<Self::Tx<'_>, Self::Error> {
+        self.pool
+            .begin()
+            .await
+            .map_err(PostgresTransactionError::Transaction)
+    }
+
+    async fn commit<'a>(&'a self, tx: Self::Tx<'a>) -> Result<(), Self::Error> {
+        tx.commit()
+            .await
+            .map_err(PostgresTransactionError::Transaction)
+    }
+
+    async fn insert_outbox_in_tx<'a, 'g>(
+        &'a self,
+        tx: &'a mut Self::Tx<'g>,
+        message: &'a OutboxMessage,
+    ) -> Result<(), Self::Error>
+    where
+        'g: 'a,
+    {
+        insert_outbox_in_tx(tx, message).await
     }
 }
 
@@ -390,6 +308,15 @@ pub async fn save_aggregate_in_tx(
 }
 
 /// Inserts a pending outbox message inside an existing transaction.
+///
+/// `created_at`/`updated_at`/`next_attempt_at` all come from Postgres's own
+/// `now()`, not `message`'s client-set values — see
+/// [`PostgresOutboxRepository`](crate::PostgresOutboxRepository)'s `insert`
+/// for why: a producer's clock racing ahead of the database's would
+/// otherwise make a just-inserted row's `next_attempt_at` appear not yet
+/// due to `pending`'s `next_attempt_at <= now()` (also database-clock-
+/// sourced) until real time caught up to what the producer's clock claimed
+/// "now" was.
 pub async fn insert_outbox_in_tx(
     conn: &mut PgConnection,
     message: &OutboxMessage,
@@ -400,7 +327,7 @@ pub async fn insert_outbox_in_tx(
         "INSERT INTO pharos_outbox (
             id, message_id, topic, message_key, headers, payload, content_type,
             status, attempts, created_at, updated_at, next_attempt_at, last_error
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,NULL)",
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,now(),now(),now(),NULL)",
     )
     .bind(message.id)
     .bind(message.message.message_id)
@@ -410,9 +337,6 @@ pub async fn insert_outbox_in_tx(
     .bind(&message.message.payload)
     .bind(&message.message.content_type)
     .bind(message.attempts as i32)
-    .bind(message.created_at)
-    .bind(message.updated_at)
-    .bind(message.next_attempt_at)
     .execute(&mut *conn)
     .await
     .map_err(PostgresTransactionError::Storage)?;

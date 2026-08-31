@@ -44,10 +44,12 @@
 //! migration tool for production usage.
 
 mod dead_letter;
+#[cfg(feature = "es")]
 mod event_store;
 mod eventing;
 mod json_repository;
 mod pool;
+#[cfg(feature = "saga")]
 mod saga_store;
 mod tenant_repository;
 mod transaction;
@@ -55,9 +57,10 @@ mod transaction;
 pub use dead_letter::{
     POSTGRES_DEAD_LETTER_SCHEMA, PostgresDeadLetterQueue, migrate_postgres_dead_letter_schema,
 };
+#[cfg(feature = "es")]
 pub use event_store::{
-    EventUpcaster, POSTGRES_EVENT_STORE_SCHEMA, PgEventStore, PgSnapshotStore,
-    PostgresEventStoreError, migrate_postgres_event_store_schema,
+    EventUpcasterRegistry, POSTGRES_EVENT_STORE_SCHEMA, PgEventStore, PgSnapshotStore,
+    PostgresEventStoreError, SnapshotUpcaster, migrate_postgres_event_store_schema,
 };
 pub use eventing::{
     POSTGRES_EVENTING_SCHEMA, PostgresInboxStore, PostgresOutboxRepository,
@@ -68,6 +71,7 @@ pub use json_repository::{
     migrate_postgres_aggregate_schema,
 };
 pub use pool::{PgPoolError, Pool, TENANT_SETTING, connect_pool, tenant_pool};
+#[cfg(feature = "saga")]
 pub use saga_store::{
     POSTGRES_SAGA_SCHEMA, PgSagaStore, PostgresSagaStoreError, migrate_postgres_saga_schema,
 };
@@ -76,6 +80,6 @@ pub use tenant_repository::{
     migrate_postgres_tenant_aggregate_schema,
 };
 pub use transaction::{
-    PostgresTransactionError, PostgresUnitOfWork, SaveAndEnqueueError, TransactionalRepository,
-    insert_outbox_in_tx, save_aggregate_and_enqueue, save_aggregate_in_tx, save_and_enqueue_in,
+    PostgresTransactionError, PostgresUnitOfWork, insert_outbox_in_tx, save_aggregate_and_enqueue,
+    save_aggregate_in_tx,
 };

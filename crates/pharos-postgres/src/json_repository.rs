@@ -119,7 +119,8 @@ where
     }
 }
 
-impl<A> crate::TransactionalRepository<A> for PostgresJsonRepository<A>
+impl<A> pharos_app::TransactionalRepository<A, crate::PostgresUnitOfWork>
+    for PostgresJsonRepository<A>
 where
     A: AggregateRoot + Serialize + DeserializeOwned + Send + Sync + 'static,
     <A as Entity>::Id: Display + FromStr + Send + Sync + 'static,
@@ -127,11 +128,14 @@ where
 {
     type Error = PostgresRepositoryError;
 
-    async fn save_in_tx(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        aggregate: &mut A,
-    ) -> Result<(), RepositoryError<Self::Error>> {
+    async fn save_in_tx<'c, 'g>(
+        &'c self,
+        tx: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        aggregate: &'c mut A,
+    ) -> Result<(), RepositoryError<Self::Error>>
+    where
+        'g: 'c,
+    {
         let aggregate_id = aggregate.id().to_string();
         let expected = aggregate.version();
         let new_version = expected + 1;
@@ -145,7 +149,7 @@ where
         })?;
 
         crate::transaction::save_aggregate_in_tx(
-            conn,
+            tx,
             &self.aggregate_type,
             &aggregate_id,
             &payload,

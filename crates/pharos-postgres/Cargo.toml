@@ -8,11 +8,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Pooled PostgreSQL adapters (outbox, inbox, JSON aggregate repository) for Pharos RS."
 
+[features]
+# Both on by default so existing `pharos-postgres = { ... }` dependents keep
+# building unchanged. Disable the one you don't use (`default-features =
+# false, features = ["es"]` or `["saga"]`) to drop that adapter and its
+# `pharos-es`/`pharos-saga` dependency entirely — CQRS without event sourcing
+# (or without sagas) is then expressible against this adapter, not just
+# against the domain layer.
+default = ["es", "saga"]
+es = ["dep:pharos-es"]
+saga = ["dep:pharos-saga"]
+
 [dependencies]
 pharos-core = { path = "../pharos-core", version = "0.4.0" }
 pharos-app  = { path = "../pharos-app", version = "0.4.0" }
-pharos-es   = { path = "../pharos-es", version = "0.4.0" }
-pharos-saga = { path = "../pharos-saga", version = "0.4.0" }
+pharos-es   = { path = "../pharos-es", version = "0.4.0", optional = true }
+pharos-saga = { path = "../pharos-saga", version = "0.4.0", optional = true }
 
 chrono     = { workspace = true }
 metrics    = { workspace = true }
@@ -26,6 +37,7 @@ uuid       = { workspace = true }
 [dev-dependencies]
 tokio          = { workspace = true }
 testcontainers = { workspace = true }
+dashmap        = { workspace = true }
 
 [lints]
 workspace = true

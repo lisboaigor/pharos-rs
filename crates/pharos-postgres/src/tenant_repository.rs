@@ -296,7 +296,8 @@ where
 ///
 /// The OCC mirrors [`Repository::save`] exactly — only the connection differs:
 /// writes go through the caller's live transaction instead of the pool.
-impl<A> crate::TransactionalRepository<A> for TenantJsonRepository<A>
+impl<A> pharos_app::TransactionalRepository<A, crate::PostgresUnitOfWork>
+    for TenantJsonRepository<A>
 where
     A: AggregateRoot + Serialize + DeserializeOwned + Send + Sync + 'static,
     <A as Entity>::Id: Display + FromStr + Send + Sync + 'static,
@@ -304,11 +305,14 @@ where
 {
     type Error = PostgresRepositoryError;
 
-    async fn save_in_tx(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        aggregate: &mut A,
-    ) -> Result<(), RepositoryError<Self::Error>> {
+    async fn save_in_tx<'c, 'g>(
+        &'c self,
+        conn: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        aggregate: &'c mut A,
+    ) -> Result<(), RepositoryError<Self::Error>>
+    where
+        'g: 'c,
+    {
         let aggregate_id =
             parse_aggregate_id(&aggregate.id().to_string()).map_err(RepositoryError::Storage)?;
         let expected = aggregate.version();
@@ -337,7 +341,7 @@ where
             .bind(&payload)
             .bind(new_version as i64)
             .bind(now)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
         } else {
             sqlx::query(
@@ -353,7 +357,7 @@ where
             .bind(new_version as i64)
             .bind(now)
             .bind(expected as i64)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
         }
         .map_err(|e| {
@@ -371,7 +375,7 @@ where
             .bind(self.tenant_id)
             .bind(&self.aggregate_type)
             .bind(aggregate_id)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut **conn)
             .await
             .map_err(|e| RepositoryError::Storage(PostgresRepositoryError::Storage(e)))?
             .map(|r| r.try_get::<i64, _>("version").map(|v| v as u64))

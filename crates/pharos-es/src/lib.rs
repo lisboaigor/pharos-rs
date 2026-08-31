@@ -99,16 +99,38 @@ pub struct Snapshot<S> {
     pub version: u64,
     /// Snapshot timestamp.
     pub taken_at: DateTime<Utc>,
+    /// Version of `S`'s on-disk shape, distinct from [`Self::version`] (the
+    /// aggregate's event count).
+    ///
+    /// Defaults to `0` — a store that never evolved `S`'s shape can ignore
+    /// this entirely. A store whose `S` *does* evolve should bump it with
+    /// [`Self::with_schema_version`] whenever a field is added, renamed, or
+    /// reinterpreted, and pair it with a store-side upcaster (e.g. a
+    /// PostgreSQL adapter's `SnapshotUpcaster`) keyed on this value. Without
+    /// it, a serde-compatible-but-semantically-different change (a new field
+    /// with `#[serde(default)]`, say) deserializes successfully under the
+    /// *old* shape's meaning, and the aggregate rehydrates from silently
+    /// wrong state — the same class of corruption
+    /// [`EventUpcasterRegistry`](https://docs.rs/pharos-postgres/latest/pharos_postgres/struct.EventUpcasterRegistry.html)
+    /// exists to prevent on the event side.
+    pub schema_version: u32,
 }
 
 impl<S> Snapshot<S> {
-    /// Creates a snapshot.
+    /// Creates a snapshot at schema version `0`.
     pub fn new(state: S, version: u64) -> Self {
         Self {
             state,
             version,
             taken_at: Utc::now(),
+            schema_version: 0,
         }
+    }
+
+    /// Sets the schema version — see [`Self::schema_version`].
+    pub fn with_schema_version(mut self, schema_version: u32) -> Self {
+        self.schema_version = schema_version;
+        self
     }
 }
 
