@@ -4,16 +4,19 @@
 //! expose command and query handlers through Axum routes.
 //!
 //! See [`observability`] for the request span that correlates everything one
-//! HTTP call sets off, and [`metrics`] for RED metrics whose exemplars link a
-//! latency observation back to that trace.
+//! HTTP call sets off, [`metrics`] for RED metrics whose exemplars link a
+//! latency observation back to that trace, and [`profile`] for a router
+//! builder that makes "this binary never writes" a compile-time property.
 
 pub mod metrics;
 pub mod observability;
+pub mod profile;
 
 pub use observability::{
     TRACEPARENT_HEADER, Traceparent, record_tenant, record_trace_id, record_user, request_span,
     traceparent_value,
 };
+pub use profile::{ProcessProfile, ReadOnly, ReadWrite};
 
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
@@ -177,7 +180,28 @@ where
     /// so validation behaves identically no matter which port the command
     /// entered through. Match on [`DispatchError`] to map validation failures
     /// and handler failures to different HTTP responses.
+    ///
+    /// Refuses to run a command marked `#[command(internal)]`
+    /// ([`Command::INTERNAL_ONLY`]), returning [`DispatchError::Validation`]
+    /// instead — the handler never executes. This is the same guard
+    /// [`run_command`] applies (there it maps to `404`; here, since this
+    /// method's error type carries no HTTP status of its own, it surfaces as
+    /// the `422` a caller's `DispatchError::Validation` arm already handles).
+    /// Route handlers built directly on `CommandHandlerState::dispatch`
+    /// (rather than through [`run_command`]) previously bypassed
+    /// `INTERNAL_ONLY` entirely; this closes that gap at the shared seam
+    /// instead of relying on every caller to route through `run_command`.
     pub async fn dispatch(&self, command: C) -> Result<H::Output, DispatchError<H::Error>> {
+        if C::INTERNAL_ONLY {
+            tracing::error!(
+                command = C::NAME,
+                "refused to run an internal-only command through CommandHandlerState::dispatch"
+            );
+            return Err(DispatchError::Validation(ValidationError::violation(
+                "",
+                "command is internal-only and cannot be invoked over this seam",
+            )));
+        }
         pharos_app::dispatch(&*self.handler, command).await
     }
 }
@@ -559,5 +583,52 @@ mod tests {
             "the internal-only command handler must never run over HTTP"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_handler_state_dispatch_also_refuses_internal_only_commands() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug, Deserialize)]
+        struct ReleasePayout;
+
+        impl Command for ReleasePayout {
+            const NAME: &'static str = "ReleasePayout";
+            const INTERNAL_ONLY: bool = true;
+        }
+
+        struct PayoutHandler {
+            ran: Arc<AtomicBool>,
+        }
+
+        impl CommandHandler<ReleasePayout> for PayoutHandler {
+            type Output = Greeting;
+            type Error = std::convert::Infallible;
+
+            async fn handle(&self, _command: ReleasePayout) -> Result<Self::Output, Self::Error> {
+                self.ran.store(true, Ordering::SeqCst);
+                Ok(Greeting {
+                    message: "paid".into(),
+                })
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(PayoutHandler {
+            ran: Arc::clone(&ran),
+        });
+
+        // Exercises `CommandHandlerState::dispatch` directly — the seam the
+        // framework's own examples call with `handler.dispatch(command).await?`,
+        // bypassing `run_command` entirely. Before this guard, an internal-only
+        // command wired to a route this way ran unprotected.
+        let state = CommandHandlerState::<ReleasePayout, PayoutHandler>::from_arc(handler);
+        let result = state.dispatch(ReleasePayout).await;
+
+        assert!(matches!(result, Err(DispatchError::Validation(_))));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the internal-only command handler must never run through this seam either"
+        );
     }
 }
