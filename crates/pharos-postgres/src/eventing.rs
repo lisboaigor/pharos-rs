@@ -89,10 +89,10 @@ pub async fn migrate_postgres_eventing_schema(pool: &Pool) -> Result<(), PgPoolE
 /// with skewed system clocks still agree on what the database calls "now",
 /// so neither can see the other's still-live lease as expired, and neither
 /// depends on its own clock being right for the outbox to keep draining.
-/// FIFO order is still driven by `created_at`, the producer's wall clock at
-/// insert time (not a database sequence), tie-broken by `id`: two rows
-/// written in the same instant by producers with skewed clocks can still
-/// land in a different order than they were produced.
+/// FIFO order is driven by `seq`, a monotonic `IDENTITY` column assigned at
+/// insert time — not `created_at` (a producer's wall clock) or `id` (UUID v7,
+/// itself clock-derived), so two rows written by producers with skewed
+/// clocks still claim and publish in the order they were actually inserted.
 #[derive(Debug, Clone)]
 pub struct PostgresOutboxRepository {
     pool: Pool,
