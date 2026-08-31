@@ -31,9 +31,18 @@ use crate::messaging::{Delivery, MessageAcknowledger, MessagingError, RetryDecis
 pub enum ProcessOutcome {
     /// The message was processed and acknowledged.
     Processed,
-    /// The message was a duplicate (already completed or currently being
-    /// processed elsewhere) and was acknowledged without running the handler.
+    /// The message was a duplicate of one the inbox already recorded as
+    /// [`IdempotencyDecision::AlreadyCompleted`], and was acknowledged
+    /// without running the handler.
     SkippedDuplicate,
+    /// Another consumer holds this message's `processing` lease and has not
+    /// yet completed or failed it ([`IdempotencyDecision::AlreadyProcessing`]).
+    /// The delivery was **not** acknowledged — it was returned to the broker
+    /// with `nack(delivery, true)` so it can be redelivered once that other
+    /// consumer's lease resolves one way or the other. Acking it here would
+    /// tell the broker its only remaining copy is done while nobody has
+    /// actually finished the work.
+    StillProcessing,
     /// The handler failed and the retry budget was spent: the message was
     /// dead-lettered and acknowledged so the broker stops redelivering it.
     /// Only returned by [`process_idempotent_with_retry`].
@@ -76,13 +85,25 @@ pub enum ProcessError<E: std::error::Error> {
 ///
 /// The flow:
 ///
-/// 1. [`InboxStore::begin_processing`] — duplicates (`AlreadyCompleted`,
-///    `AlreadyProcessing`) are **acked and skipped** without running `handle`.
+/// 1. [`InboxStore::begin_processing`] — a message already recorded as
+///    `AlreadyCompleted` is **acked and skipped** without running `handle`.
+///    A message another consumer is currently working (`AlreadyProcessing`)
+///    is **nacked with `requeue: true`** and skipped instead: nobody has
+///    finished it yet, so acking it here would drop the broker's only
+///    remaining copy of work that is still in flight elsewhere.
 /// 2. `handle(&delivery)` — your business logic.
 /// 3. Success → [`mark_completed`](InboxStore::mark_completed) + `ack`.
 ///    Failure → [`mark_failed`](InboxStore::mark_failed) +
 ///    **`nack(delivery, true)` unconditionally** — every failure is requeued,
 ///    with no bound.
+///
+/// If `handle` succeeds but the `mark_completed` call itself then fails (a
+/// dropped connection, say), this function returns an error without acking:
+/// the record is left `AlreadyProcessing`, and the message only makes
+/// progress again once the store's stale-processing lease elapses (default
+/// 300s for `PostgresInboxStore`) and another consumer takes over and reruns
+/// `handle`. At-least-once still holds, but expect up to that lease duration
+/// of apparent non-progress on the message.
 ///
 /// # This has no retry ceiling — prefer [`process_idempotent_with_retry`]
 ///
@@ -120,13 +141,30 @@ where
 
     async move {
         match inbox.begin_processing(message_id, consumer).await? {
-            IdempotencyDecision::AlreadyCompleted | IdempotencyDecision::AlreadyProcessing => {
-                // Duplicate delivery: acknowledge so the broker stops
-                // redelivering, and never run the handler again.
+            IdempotencyDecision::AlreadyCompleted => {
+                // The inbox already recorded this message as done: acking
+                // stops the broker redelivering it, and the handler must
+                // never run twice for the same completed message.
                 acknowledger.ack(delivery).await?;
                 metrics::counter!("pharos.consumer.duplicates", "consumer" => consumer.to_string())
                     .increment(1);
                 Ok(ProcessOutcome::SkippedDuplicate)
+            }
+            IdempotencyDecision::AlreadyProcessing => {
+                // Another consumer holds this message's lease and has not
+                // yet completed or failed it. Acking here would tell the
+                // broker its only remaining copy is done while nobody has
+                // actually finished the work, permanently losing the message
+                // if that other consumer then crashes. Nack it back onto the
+                // queue instead, so it is redelivered once that consumer's
+                // lease resolves one way or the other.
+                acknowledger.nack(delivery, true).await?;
+                metrics::counter!(
+                    "pharos.consumer.still_processing",
+                    "consumer" => consumer.to_string()
+                )
+                .increment(1);
+                Ok(ProcessOutcome::StillProcessing)
             }
             IdempotencyDecision::StartProcessing | IdempotencyDecision::RetryPreviousFailure => {
                 match handle(delivery).await {
@@ -213,11 +251,25 @@ where
 
     async move {
         match inbox.begin_processing(message_id, consumer).await? {
-            IdempotencyDecision::AlreadyCompleted | IdempotencyDecision::AlreadyProcessing => {
+            IdempotencyDecision::AlreadyCompleted => {
                 acknowledger.ack(delivery).await?;
                 metrics::counter!("pharos.consumer.duplicates", "consumer" => consumer.to_string())
                     .increment(1);
                 Ok(ProcessOutcome::SkippedDuplicate)
+            }
+            IdempotencyDecision::AlreadyProcessing => {
+                // See `process_idempotent`'s identical arm: acking a message
+                // another consumer is still working would drop it while the
+                // work is still in flight. This is contention, not a handler
+                // failure, so it does not consult `retry` or count against
+                // its attempt budget.
+                acknowledger.nack(delivery, true).await?;
+                metrics::counter!(
+                    "pharos.consumer.still_processing",
+                    "consumer" => consumer.to_string()
+                )
+                .increment(1);
+                Ok(ProcessOutcome::StillProcessing)
             }
             IdempotencyDecision::StartProcessing | IdempotencyDecision::RetryPreviousFailure => {
                 match handle(delivery).await {

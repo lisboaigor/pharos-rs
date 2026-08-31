@@ -33,8 +33,8 @@ pub use consumer_group::{ConsumerGroupCoordinator, ConsumerGroupError, Partition
 pub use dead_letter::{DeadLetterError, DeadLetterMessage, DeadLetterQueue};
 pub use inbox::{IdempotencyDecision, InboxError, InboxMessage, InboxStatus, InboxStore};
 pub use messaging::{
-    BackoffStrategy, Delivery, Message, MessageAcknowledger, MessageConsumer, MessagePublisher,
-    MessagingError, RetryDecision, RetryPolicy,
+    BackoffStrategy, Delivery, FailureKind, Message, MessageAcknowledger, MessageConsumer,
+    MessagePublisher, MessagingError, RetryDecision, RetryPolicy,
 };
 pub use outbox::{
     OutboxError, OutboxMessage, OutboxRepository, OutboxStatus, SweepError,

@@ -87,6 +87,12 @@ pub enum MessagingError {
     /// Negative acknowledgement failed; the source carries the original broker error.
     #[error("nack failed: {0}")]
     Nack(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Publishing failed because the broker rejected the message itself —
+    /// too large, malformed, an invalid key — rather than because the
+    /// broker was unreachable. Unlike [`Self::Publish`], no number of
+    /// retries makes this succeed; see [`Self::failure_kind`].
+    #[error("publish rejected (poisoned message): {0}")]
+    PublishPoisoned(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 impl MessagingError {
@@ -106,12 +112,79 @@ impl MessagingError {
     pub fn nack(e: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Nack(Box::new(e))
     }
+    /// Wraps any `Error + Send + Sync + 'static` as a publish failure the
+    /// broker attributes to the message itself, not to reachability. Use
+    /// this from an adapter that can tell the two apart (the broker's own
+    /// "too large"/"malformed" response, as opposed to a connection error);
+    /// [`RetryPolicy::decide_for`] dead-letters it immediately instead of
+    /// spending the normal retry budget on a message that will never
+    /// succeed.
+    pub fn publish_poisoned(e: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::PublishPoisoned(Box::new(e))
+    }
+
+    /// Classifies this error for [`RetryPolicy::decide_for`].
+    ///
+    /// Every variant here defaults to [`FailureKind::Transient`] except
+    /// [`Self::PublishPoisoned`] — most adapters currently have no way to
+    /// distinguish a broker outage from a rejected payload, so treating an
+    /// unclassified failure as transient (retry, then eventually
+    /// dead-letter on attempt-count alone) preserves prior behavior exactly.
+    /// Adapters that *can* tell the difference should use
+    /// [`Self::publish_poisoned`] to opt into immediate dead-lettering.
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            Self::PublishPoisoned(_) => FailureKind::Poison,
+            _ => FailureKind::Transient,
+        }
+    }
+}
+
+/// Classification of a delivery failure, used by [`RetryPolicy::decide_for`]
+/// to tell a broker outage from a message that can never be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A transport/infrastructure problem — connection refused, timeout,
+    /// broker unavailable — likely to succeed on retry.
+    Transient,
+    /// The message itself cannot be delivered no matter how many times it
+    /// is retried: a payload the broker rejects as too large or malformed,
+    /// a routing key it refuses. Retrying wastes the attempt budget (and,
+    /// with [`OutboxDispatcher`] lane ordering, blocks every other message
+    /// sharing its key) on something that will never succeed.
+    ///
+    /// [`OutboxDispatcher`]: crate::outbox_dispatcher::OutboxDispatcher
+    Poison,
 }
 
 /// Publishes messages to an external broker or broker-like adapter.
 pub trait MessagePublisher: Send + Sync + 'static {
     /// Publishes one message.
     fn publish(&self, message: Message) -> impl Future<Output = Result<(), MessagingError>> + Send;
+    /// Publishes several messages.
+    ///
+    /// The default implementation calls [`Self::publish`] once per message,
+    /// in order, stopping at the first error — it exists so every publisher
+    /// gets a working `publish_batch` for free, not because a loop over
+    /// `publish` is fast. A broker client with a real batch/pipeline API
+    /// (a Kafka producer's batching, a Redis pipeline) should override this
+    /// to actually use it; [`OutboxDispatcher`] currently calls `publish`
+    /// once per outbox message regardless, so overriding this alone does
+    /// not yet change outbox throughput — see the dispatcher's own
+    /// documentation for that gap.
+    ///
+    /// [`OutboxDispatcher`]: crate::outbox_dispatcher::OutboxDispatcher
+    fn publish_batch(
+        &self,
+        messages: Vec<Message>,
+    ) -> impl Future<Output = Result<(), MessagingError>> + Send {
+        async move {
+            for message in messages {
+                self.publish(message).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Consumes messages from an external broker or broker-like adapter.
@@ -140,6 +213,16 @@ pub trait MessageAcknowledger: Send + Sync + 'static {
 impl<P: MessagePublisher> MessagePublisher for std::sync::Arc<P> {
     fn publish(&self, message: Message) -> impl Future<Output = Result<(), MessagingError>> + Send {
         (**self).publish(message)
+    }
+    // Forwarded explicitly (rather than relying on the trait's default) so
+    // an inner `P` that overrides `publish_batch` for real batching is
+    // actually used through the `Arc` wrapper, instead of silently falling
+    // back to a per-message loop.
+    fn publish_batch(
+        &self,
+        messages: Vec<Message>,
+    ) -> impl Future<Output = Result<(), MessagingError>> + Send {
+        (**self).publish_batch(messages)
     }
 }
 
@@ -266,11 +349,31 @@ impl RetryPolicy {
     }
 
     /// Returns whether the next attempt should be retried or dead-lettered.
+    ///
+    /// Looks only at the attempt count — every failure is treated as
+    /// possibly transient. Prefer [`Self::decide_for`] when a
+    /// [`FailureKind`] is available, so a poisoned message dead-letters
+    /// immediately instead of consuming the full retry budget.
     pub fn decide(&self, attempt: u32) -> RetryDecision {
         if attempt < self.max_attempts {
             RetryDecision::RetryAfter(self.backoff.delay_for(attempt))
         } else {
             RetryDecision::DeadLetter
+        }
+    }
+
+    /// Like [`Self::decide`], but dead-letters immediately on
+    /// [`FailureKind::Poison`] regardless of attempts remaining — no delay
+    /// makes a poisoned message deliverable, so there is nothing to gain by
+    /// spending the retry budget on it (and, in [`OutboxDispatcher`] lanes
+    /// with head-of-line blocking, every retry it does spend holds up the
+    /// rest of its key).
+    ///
+    /// [`OutboxDispatcher`]: crate::outbox_dispatcher::OutboxDispatcher
+    pub fn decide_for(&self, attempt: u32, failure: FailureKind) -> RetryDecision {
+        match failure {
+            FailureKind::Poison => RetryDecision::DeadLetter,
+            FailureKind::Transient => self.decide(attempt),
         }
     }
 }
@@ -307,6 +410,47 @@ mod tests {
             RetryDecision::RetryAfter(Duration::from_secs(2))
         );
         assert_eq!(policy.decide(3), RetryDecision::DeadLetter);
+    }
+
+    #[test]
+    fn decide_for_dead_letters_a_poisoned_message_on_the_first_attempt() {
+        let policy = RetryPolicy::new(5, Duration::from_secs(2));
+
+        // Plenty of retry budget left (attempt 1 of 5) — a transient failure
+        // would still retry here (as `decide` alone does).
+        assert_eq!(
+            policy.decide(1),
+            RetryDecision::RetryAfter(Duration::from_secs(2))
+        );
+        // But classified as poison, no delay ever makes it deliverable:
+        // dead-letter immediately instead of spending the retry budget.
+        assert_eq!(
+            policy.decide_for(1, FailureKind::Poison),
+            RetryDecision::DeadLetter
+        );
+    }
+
+    #[test]
+    fn decide_for_treats_transient_failures_like_decide() {
+        let policy = RetryPolicy::new(3, Duration::from_secs(2));
+
+        assert_eq!(
+            policy.decide_for(1, FailureKind::Transient),
+            RetryDecision::RetryAfter(Duration::from_secs(2))
+        );
+        assert_eq!(
+            policy.decide_for(3, FailureKind::Transient),
+            RetryDecision::DeadLetter
+        );
+    }
+
+    #[test]
+    fn messaging_error_classifies_publish_poisoned_and_defaults_others_to_transient() {
+        let poisoned = MessagingError::publish_poisoned(std::io::Error::other("payload too large"));
+        assert_eq!(poisoned.failure_kind(), FailureKind::Poison);
+
+        let transient = MessagingError::publish(std::io::Error::other("connection refused"));
+        assert_eq!(transient.failure_kind(), FailureKind::Transient);
     }
 
     #[test]

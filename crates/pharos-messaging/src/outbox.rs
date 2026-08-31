@@ -109,6 +109,27 @@ pub trait OutboxRepository: Send + Sync + 'static {
         &self,
         message: OutboxMessage,
     ) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    /// Inserts several pending outbox messages.
+    ///
+    /// The default implementation calls [`Self::insert`] once per message,
+    /// stopping at the first error — it exists so every implementation gets
+    /// a working `insert_many` for free, not because looping over `insert`
+    /// is fast. A store that can batch the underlying writes (a single
+    /// multi-row `INSERT`, a pipelined command) should override this: the
+    /// framework's own outbox path issues one `insert` per event with no
+    /// batching anywhere, which is the dominant cost in the outbox
+    /// throughput numbers in `docs/guide/benchmarks.md`.
+    fn insert_many(
+        &self,
+        messages: Vec<OutboxMessage>,
+    ) -> impl Future<Output = Result<(), OutboxError>> + Send {
+        async move {
+            for message in messages {
+                self.insert(message).await?;
+            }
+            Ok(())
+        }
+    }
     /// Claims up to `limit` due pending messages, ordered by creation time
     /// where supported.
     ///

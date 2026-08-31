@@ -26,7 +26,18 @@ pub struct DispatchConfig {
     /// With higher values the batch is partitioned by [`Message::key`]:
     /// messages sharing a key stay in one lane and publish **in claim order**,
     /// while different keys (and key-less messages) publish in parallel — the
-    /// same per-key ordering contract brokers like Kafka give consumers.
+    /// same per-key ordering contract brokers like Kafka give consumers. A
+    /// lane stops at the first message it fails to deliver rather than
+    /// skipping ahead to the next same-key message (head-of-line blocking),
+    /// so a transient failure cannot reorder a key's messages on the broker.
+    ///
+    /// This ordering contract is **per dispatcher instance only**. Two
+    /// `OutboxDispatcher`s running concurrently against the same table claim
+    /// disjoint batches (via `FOR UPDATE SKIP LOCKED`), so two messages
+    /// sharing a key can still land in different dispatchers' lanes and
+    /// publish out of order relative to each other. Run at most one
+    /// dispatcher instance at a time if per-key ordering across the whole
+    /// outbox must hold.
     ///
     /// [`Message::key`]: crate::messaging::Message::key
     pub concurrency: usize,
@@ -224,9 +235,21 @@ where
                     let mut published = 0;
                     let mut errors = Vec::new();
                     for message in lane {
-                        let (p, e) = self.dispatch_one(message).await;
+                        let (p, e, delivered) = self.dispatch_one(message).await;
                         published += p;
                         errors.extend(e);
+                        // Head-of-line blocking: a message this lane failed to
+                        // *deliver* (as opposed to one that delivered but hit
+                        // a bookkeeping error afterward) stops the lane here.
+                        // Publishing the next same-key message now would put
+                        // it on the broker ahead of one still pending retry,
+                        // breaking the per-key ordering `DispatchConfig::concurrency`
+                        // documents. The undelivered message stays `pending`
+                        // (or moves to `failed`/backoff inside `dispatch_one`)
+                        // and the rest of the lane is picked up on a later run.
+                        if !delivered {
+                            break;
+                        }
                     }
                     (published, errors)
                 }))
@@ -245,11 +268,18 @@ where
         .await
     }
 
-    /// Attempts one claimed message end-to-end and reports `(published, errors)`.
+    /// Attempts one claimed message end-to-end and reports
+    /// `(published, errors, delivered)`.
+    ///
+    /// `delivered` is `true` only once [`MessagePublisher::publish`] itself
+    /// succeeded — a subsequent `mark_published` bookkeeping failure does not
+    /// clear it, since the message already left in the correct order. The
+    /// caller uses `delivered` to decide whether the rest of a same-key lane
+    /// may keep going (see head-of-line blocking in [`Self::dispatch_pending`]).
     async fn dispatch_one(
         &self,
         outbox_message: crate::outbox::OutboxMessage,
-    ) -> (usize, Vec<OutboxDispatchError>) {
+    ) -> (usize, Vec<OutboxDispatchError>, bool) {
         let mut errors = Vec::new();
 
         // `attempts` reflects prior tries; the attempt we are about to make is
@@ -259,24 +289,25 @@ where
         let attempt = outbox_message.attempts + 1;
         if let Err(error) = self.repo.record_attempt(outbox_message.id).await {
             errors.push(error.into());
-            return (0, errors);
+            return (0, errors, false);
         }
 
         match self.publisher.publish(outbox_message.message).await {
             Ok(()) => match self.repo.mark_published(outbox_message.id).await {
                 Ok(()) => {
                     metrics::counter!("pharos.outbox.published").increment(1);
-                    (1, errors)
+                    (1, errors, true)
                 }
                 // The message was published; failing to mark it only risks a
-                // future duplicate, which consumers dedupe.
+                // future duplicate, which consumers dedupe. Delivery order
+                // was preserved, so the lane may continue.
                 Err(error) => {
                     errors.push(error.into());
-                    (0, errors)
+                    (0, errors, true)
                 }
             },
             Err(error) => {
-                match self.config.retry.decide(attempt) {
+                match self.config.retry.decide_for(attempt, error.failure_kind()) {
                     // Out of retry budget: move to the terminal `failed` state
                     // so a dead-letter sweep can pick it up.
                     RetryDecision::DeadLetter => {
@@ -304,7 +335,7 @@ where
                 }
                 metrics::counter!("pharos.outbox.failed").increment(1);
                 errors.push(OutboxDispatchError::Messaging(error));
-                (0, errors)
+                (0, errors, false)
             }
         }
     }
