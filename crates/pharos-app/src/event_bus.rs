@@ -131,10 +131,14 @@ where
 /// In-process event bus that dispatches domain events to typed handlers.
 ///
 /// `EventBus` is a concrete, cheaply cloneable type. All clones share the same
-/// registered handlers through an internal `Arc`. Dispatch is fully typed: the
-/// publishing call site keeps the concrete event type, so there is no trait
-/// object, no `Any` leakage into the domain, and no per-event allocation beyond
-/// the handler futures themselves.
+/// registered handlers through an internal `Arc`. The public API is fully
+/// typed — callers publish and handle concrete event types, never `dyn Any` —
+/// but internally, dispatch erases each handler to `Arc<dyn ErasedHandler>`
+/// keyed by `TypeId`, downcasts the event through `&dyn Any` to find the
+/// concrete type again, clones the matched handler `Vec` on every publish,
+/// and boxes each handler invocation as a pinned future. None of that is
+/// visible to domain code, but it is real `Any` use and real per-publish
+/// allocation, not zero-cost dispatch.
 ///
 /// For cross-process delivery, publish through the outbox seam instead.
 #[derive(Clone, Default)]
@@ -321,11 +325,17 @@ impl EventBus {
     ///
     /// - Unknown `topic` (no decoder) returns `Ok` without dispatching, so
     ///   publishing stays decoupled from consumption — matching how `publish`
-    ///   drops events with no registered handler. It also increments
-    ///   `pharos.event_bus.unknown_topic` (in addition to a debug log), so a
-    ///   misrouted or unexpected topic is visible in metrics rather than
-    ///   silently invisible — an unknown topic is not necessarily hostile,
-    ///   but it is always worth being able to see.
+    ///   drops events with no registered handler. It also increments the
+    ///   unlabeled `pharos.event_bus.unknown_topic` counter and logs `topic`
+    ///   at debug level, so a misrouted or unexpected topic is visible
+    ///   without being silently invisible — an unknown topic is not
+    ///   necessarily hostile, but it is always worth being able to see.
+    ///   The metric carries no `topic` label deliberately: this is precisely
+    ///   the path a network-facing subject or attacker-chosen string can
+    ///   reach (see the warning above), and a label built from it would
+    ///   hand the metrics backend one time series per string an attacker
+    ///   cares to invent. The topic itself is still visible in the debug
+    ///   log, which is not similarly cardinality-limited.
     /// - A payload that fails to decode returns
     ///   [`EventBusError::DecodeError`] so the relay can retry or dead-letter.
     pub async fn publish_trusted_bytes(
@@ -340,9 +350,15 @@ impl EventBus {
                 let decoders = self.decoders.read().unwrap_or_else(|p| p.into_inner());
                 decoders.get(topic).cloned()
             }) else {
-                debug!("no decoder registered for topic");
-                metrics::counter!("pharos.event_bus.unknown_topic", "topic" => topic.to_owned())
-                    .increment(1);
+                debug!(topic, "no decoder registered for topic");
+                // No `topic` label: this counter is reachable from a
+                // network-facing broker subject an attacker chooses (see the
+                // safety warning above), and a label built from that string
+                // would give the metrics backend one time series per value
+                // an attacker cares to invent. The topic itself is still
+                // visible in the debug log above, which carries no such
+                // cardinality cost.
+                metrics::counter!("pharos.event_bus.unknown_topic").increment(1);
                 return Ok(());
             };
 

@@ -5,7 +5,9 @@ use tracing::{Instrument, info_span};
 
 use crate::error::ApplicationError;
 use crate::event_bus::EventBus;
+#[cfg(feature = "messaging")]
 use pharos_messaging::messaging::Message;
+#[cfg(feature = "messaging")]
 use pharos_messaging::outbox::{OutboxMessage, OutboxRepository};
 
 /// Maps a repository error into the application-level error type.
@@ -147,9 +149,14 @@ where
 /// Persists an aggregate and enqueues its pending domain events as outbox messages.
 ///
 /// This function keeps the existing domain model intact while providing an
-/// explicit outbox seam for distributed event-driven systems. A production
-/// adapter can make the repository save and outbox insert participate in the
-/// same database transaction.
+/// explicit outbox seam for distributed event-driven systems.
+///
+/// **Not atomic.** `repo.save` and `outbox.insert` are two separate calls, not
+/// one transaction: if the process dies between them, the event is lost for
+/// good. For a guarantee that survives that crash window, use
+/// `pharos::postgres::save_aggregate_and_enqueue`, which wraps both writes in
+/// a single database transaction (PostgreSQL only).
+#[cfg(feature = "messaging")]
 pub async fn save_and_enqueue<A, R, O, F>(
     repo: &R,
     outbox: &O,
@@ -218,10 +225,12 @@ mod tests {
     use chrono::{DateTime, Utc};
     use pharos_core::{AggregateEvents, Entity};
     use tokio::sync::Mutex;
+    #[cfg(feature = "messaging")]
     use uuid::Uuid;
 
     use super::*;
     use crate::event_handler::EventHandler;
+    #[cfg(feature = "messaging")]
     use pharos_messaging::outbox::{OutboxError, OutboxStatus};
 
     #[derive(Debug, Clone)]
@@ -331,11 +340,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "messaging")]
     #[derive(Default)]
     struct TestOutbox {
         messages: Arc<Mutex<Vec<OutboxMessage>>>,
     }
 
+    #[cfg(feature = "messaging")]
     impl OutboxRepository for TestOutbox {
         async fn insert(&self, message: OutboxMessage) -> Result<(), OutboxError> {
             self.messages.lock().await.push(message);
@@ -616,6 +627,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "messaging")]
     #[tokio::test]
     async fn save_and_enqueue_persists_aggregate_and_creates_outbox_message()
     -> Result<(), Box<dyn std::error::Error>> {

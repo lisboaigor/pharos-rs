@@ -111,6 +111,30 @@ pub enum UpcastError {
         #[source]
         source: Box<dyn Error + Send + Sync + 'static>,
     },
+    /// The upcaster chain for `event_type` stopped short of the registry's
+    /// known top version, with no upcaster registered for the version it
+    /// stopped at.
+    ///
+    /// This is a hole in the chain (an upcaster registration missing between
+    /// `stopped_at` and `known_up_to`), not a message on an unsupported
+    /// future schema — that case is [`Self::UnsupportedVersion`]. Passing a
+    /// stalled, partially-upcast payload through to deserialize as `P` risks
+    /// silently misinterpreting fields under the wrong shape, which is
+    /// exactly what a gap this far into the chain would otherwise do
+    /// unnoticed.
+    #[error(
+        "'{event_type}' upcast chain stopped at version {stopped_at}, short of the registry's \
+         known top version {known_up_to} — an upcaster registration is missing for version \
+         {stopped_at}"
+    )]
+    GapInChain {
+        /// Logical event type.
+        event_type: String,
+        /// The version the chain stalled at (no upcaster registered from here).
+        stopped_at: u32,
+        /// The highest version this registry's chain for `event_type` reaches.
+        known_up_to: u32,
+    },
 }
 
 type UpcastFn =
@@ -124,6 +148,13 @@ type UpcastFn =
 #[derive(Default)]
 pub struct JsonUpcasterRegistry {
     upcasters: HashMap<(String, u32), UpcastFn>,
+    // Memoized per-type `max_known_version`, kept up to date by
+    // `with_upcaster` as entries are registered. `decode` calls this once
+    // per message on the hot path, and the registry itself is built once
+    // and rarely holds more than a handful of entries per type — but
+    // scanning every key in the whole registry on every single message
+    // decode is wasted work a `HashMap` lookup avoids entirely.
+    max_known_version: HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for JsonUpcasterRegistry {
@@ -156,8 +187,14 @@ impl JsonUpcasterRegistry {
         F: Fn(Value) -> Result<Value, E> + Send + Sync + 'static,
         E: Into<Box<dyn Error + Send + Sync + 'static>>,
     {
+        let event_type = event_type.into();
+        let reaches = from_version + 1;
+        self.max_known_version
+            .entry(event_type.clone())
+            .and_modify(|max| *max = (*max).max(reaches))
+            .or_insert(reaches);
         self.upcasters.insert(
-            (event_type.into(), from_version),
+            (event_type, from_version),
             Box::new(move |payload| upcast(payload).map_err(Into::into)),
         );
         self
@@ -186,11 +223,7 @@ impl JsonUpcasterRegistry {
     /// example does); a registry with a gap can still under-detect an
     /// out-of-range version on the far side of the gap.
     fn max_known_version(&self, event_type: &str) -> Option<u32> {
-        self.upcasters
-            .keys()
-            .filter(|(et, _)| et == event_type)
-            .map(|(_, from_version)| from_version + 1)
-            .max()
+        self.max_known_version.get(event_type).copied()
     }
 }
 
@@ -269,21 +302,35 @@ where
             obj.insert("schema_version".to_string(), Value::from(version));
         }
 
-        // A version beyond anything this registry's chain reaches, for a
-        // type it does have opinions about, is not "already current" — it is
-        // a schema this consumer was never upgraded to understand. Passing
-        // it through and deserializing into `P` (which models the version
-        // the registry's chain tops out at) risks silently misinterpreting
-        // fields, exactly the schema-evolution corruption this codec exists
-        // to prevent.
-        if let Some(known_up_to) = self.registry.max_known_version(&event_type)
-            && version > known_up_to
-        {
-            return Err(UpcastError::UnsupportedVersion {
-                event_type,
-                version,
-                known_up_to,
-            });
+        // The loop above stops as soon as no upcaster is registered for the
+        // current `version` — which happens for two very different reasons,
+        // and conflating them is exactly how a gap passes silently:
+        //
+        // 1. `version` reached the top of a complete chain (the ordinary,
+        //    successful case: `version == known_up_to`).
+        // 2. `version` is stuck strictly below `known_up_to` because a
+        //    registration is missing partway through the chain — the loop
+        //    has no way to tell "fully upcast" from "stalled early", so
+        //    without this check a gapped payload deserializes as if it were
+        //    current, under the wrong shape, with no error anywhere.
+        //
+        // A version *above* `known_up_to` is the third, already-handled
+        // case: not a gap, but a schema newer than this registry knows.
+        if let Some(known_up_to) = self.registry.max_known_version(&event_type) {
+            if version > known_up_to {
+                return Err(UpcastError::UnsupportedVersion {
+                    event_type,
+                    version,
+                    known_up_to,
+                });
+            }
+            if version < known_up_to {
+                return Err(UpcastError::GapInChain {
+                    event_type,
+                    stopped_at: version,
+                    known_up_to,
+                });
+            }
         }
 
         Ok(serde_json::from_value(envelope)?)
@@ -408,6 +455,43 @@ mod tests {
         };
         assert_eq!(event_type, "OrderPlaced");
         assert_eq!(version, 99);
+        assert_eq!(known_up_to, 3);
+        Ok(())
+    }
+
+    /// A registry missing an upcaster partway through the chain (v2 → v3
+    /// registered, but v1 → v2 is not) must not pass the stalled payload
+    /// through as if it were current — that would deserialize a v1 shape
+    /// into `P`'s v3 shape under the wrong field layout with no error at
+    /// all, exactly the corruption upcasting exists to prevent.
+    #[test]
+    fn a_gap_in_the_middle_of_the_chain_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = JsonUpcasterRegistry::new()
+            // v1 → v2 is deliberately missing.
+            .with_upcaster("OrderPlaced", 2, |mut payload| {
+                let Some(obj) = payload.as_object_mut() else {
+                    return Err("payload must be an object");
+                };
+                obj.entry("currency")
+                    .or_insert_with(|| Value::String("BRL".to_string()));
+                Ok(payload)
+            });
+        let codec = VersionedJsonCodec::new(registry);
+
+        let v1 = IntegrationEvent::new("OrderPlaced", 1, "orders", json!({ "qty": 3 }));
+        let wire = MessageCodec::<Value>::encode(&codec, &v1)?;
+
+        let result: Result<IntegrationEvent<V3>, _> = codec.decode(&wire);
+        let Err(UpcastError::GapInChain {
+            event_type,
+            stopped_at,
+            known_up_to,
+        }) = result
+        else {
+            panic!("expected GapInChain, got {result:?}");
+        };
+        assert_eq!(event_type, "OrderPlaced");
+        assert_eq!(stopped_at, 1);
         assert_eq!(known_up_to, 3);
         Ok(())
     }

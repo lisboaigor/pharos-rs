@@ -2,6 +2,7 @@ use pharos_core::DomainError;
 use thiserror::Error;
 
 use crate::event_bus::EventBusError;
+#[cfg(feature = "messaging")]
 use pharos_messaging::outbox::OutboxError;
 
 /// Concrete error returned by the application-layer orchestration helpers.
@@ -38,6 +39,7 @@ pub enum ApplicationError {
     EventBus(#[from] EventBusError),
 
     /// Writing to the outbox failed.
+    #[cfg(feature = "messaging")]
     #[error(transparent)]
     Outbox(#[from] OutboxError),
 }

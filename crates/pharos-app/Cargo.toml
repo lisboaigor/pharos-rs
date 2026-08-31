@@ -10,7 +10,7 @@ description = "Application contracts for Pharos RS: command/query handlers, even
 
 [dependencies]
 pharos-core      = { path = "../pharos-core", version = "0.4.0" }
-pharos-messaging = { path = "../pharos-messaging", version = "0.4.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.4.0", optional = true }
 chrono      = { workspace = true }
 serde       = { workspace = true }
 metrics     = { workspace = true }
@@ -22,13 +22,24 @@ tracing     = { workspace = true }
 uuid        = { workspace = true }
 
 [features]
+default = ["messaging"]
+# The broker-facing outbox/inbox/DLQ/retry surface (`save_and_enqueue`, the
+# `resilience` decorators, `ApplicationError::Outbox`) and its
+# `pharos-messaging` dependency. On by default so existing
+# `pharos-app = { ... }` dependents keep building unchanged; disable it
+# (`default-features = false`) for a pure CQRS/domain crate that only needs
+# `Command`/`Query`/`EventBus` and never pulls in outbox, inbox, DLQ or
+# consumer-group types.
+messaging = ["dep:pharos-messaging"]
 # Adapters exposing command/query handlers as `tower::Service`s.
 tower = ["dep:tower"]
 # Task-local tenant propagation (`CURRENT_TENANT`). Requires the Tokio runtime;
 # the canonical, runtime-agnostic path is threading `TenantContext` explicitly.
 tenant-task-local = ["dep:tokio"]
 # `Retrying` event-handler decorator (backoff sleeps need Tokio's timer).
-retry = ["dep:tokio", "tokio/time"]
+# Implies `messaging`: the decorator wraps message redelivery, which only
+# exists when the outbox/inbox surface is present.
+retry = ["dep:tokio", "tokio/time", "messaging"]
 
 [dev-dependencies]
 tokio = { workspace = true }

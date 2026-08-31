@@ -83,6 +83,7 @@ pub mod event_bus;
 pub mod event_handler;
 pub mod integration_event;
 pub mod query;
+#[cfg(feature = "messaging")]
 pub mod resilience;
 pub mod serialization;
 pub mod service;
@@ -104,6 +105,10 @@ pub mod __private {
 // The broker-facing messaging contracts live in `pharos-messaging` so they can
 // evolve independently of the CQRS surface; everything is re-exported here (as
 // both modules and names) so downstream `pharos_app::...` paths keep working.
+// Gated behind the `messaging` feature (default on) — a pure CQRS/domain
+// crate that never touches outbox/inbox/DLQ can disable it and drop the
+// `pharos-messaging` dependency entirely.
+#[cfg(feature = "messaging")]
 pub use pharos_messaging::{
     consume, consumer_group, dead_letter, inbox, messaging, outbox, outbox_dispatcher,
     schema_registry,
@@ -116,10 +121,11 @@ pub use error::ApplicationError;
 pub use event_bus::{EventBus, EventBusError, PublishErrorPolicy};
 pub use event_handler::EventHandler;
 pub use integration_event::{CausationId, CorrelationId, IntegrationEvent};
+#[cfg(feature = "messaging")]
 pub use pharos_messaging::{
     BackoffStrategy, ConsumerGroupCoordinator, ConsumerGroupError, DeadLetterError,
     DeadLetterMessage, DeadLetterQueue, Delivery, DispatchConfig, DispatchResult, EventSchema,
-    IdempotencyDecision, InboxError, InboxMessage, InboxStatus, InboxStore, Message,
+    FailureKind, IdempotencyDecision, InboxError, InboxMessage, InboxStatus, InboxStore, Message,
     MessageAcknowledger, MessageConsumer, MessagePublisher, MessagingError, OutboxDispatchError,
     OutboxDispatcher, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     PartitionAssignment, ProcessError, ProcessOutcome, RetryDecision, RetryPolicy, SchemaRegistry,
@@ -129,15 +135,22 @@ pub use pharos_messaging::{
 pub use query::{Query, QueryHandler, dispatch as query_dispatch};
 #[cfg(feature = "retry")]
 pub use resilience::Retrying;
+#[cfg(feature = "messaging")]
 pub use resilience::{DeadLettering, DeadLetteringError};
 pub use serialization::{
     EventSerializationError, EventSerializer, JsonEventSerializer, MessageCodec, SerializedEvent,
 };
-pub use service::{republish_pending, save_and_enqueue, save_and_publish};
+#[cfg(feature = "messaging")]
+pub use service::save_and_enqueue;
+pub use service::{republish_pending, save_and_publish};
 pub use tenant::{InvalidTenantId, TenantContext, TenantId};
 #[cfg(feature = "tenant-task-local")]
 pub use tenant_local::CURRENT_TENANT;
 #[cfg(feature = "tower")]
 pub use tower_service::{CommandHandlerService, QueryHandlerService};
 pub use unit_of_work::UnitOfWorkError;
+#[cfg(feature = "messaging")]
+pub use unit_of_work::{
+    SaveAndEnqueueError, TransactionalRepository, TransactionalStore, save_and_enqueue_in,
+};
 pub use upcast::{JsonUpcasterRegistry, UpcastError, VersionedJsonCodec};
