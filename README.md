@@ -1,6 +1,10 @@
+<div align="center">
+
 # Pharos RS
 
-![Pharos RS](assets/pharos-cover.png)
+<img src="assets/pharos-cover.png" alt="Pharos RS — a lightweight Rust framework for domain-driven, CQRS-friendly, event-driven applications" width="100%" />
+
+</div>
 
 Pharos RS is a lightweight Rust framework for building domain-driven, CQRS-friendly, event-driven applications.
 
