@@ -22,7 +22,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Idempotent consumers in one call (`process_idempotent`)
 - Durable event sourcing and sagas on PostgreSQL (`PgEventStore`, `PgSnapshotStore`, `PgSagaStore`)
 - Saga deadlines: schedule timeouts on `Start`/`Advance` and sweep them with `SagaRunner::run_due_timeouts`
-- Saga compensation on failure: `SagaTransition::Fail` carries follow-up `commands`, dispatched right after the terminal transition is saved — the save and the dispatch are two separate steps, not one transaction, so a crash between them leaves the saga `Failed` with its compensating commands undispatched
+- Saga commands go through a durable outbox, not a direct dispatcher call (`SagaRunner` + `DurableCommandPublisher` + `pharos_messaging::OutboxDispatcher`): `SagaTransition::Fail` carries follow-up `commands`, enqueued right after the terminal transition is saved — the save and the enqueue are still two separate steps, not one transaction, so a crash between them still drops the compensation, but once enqueued a command is durable and retried on delivery failure instead of being lost on the first failed dispatch
 - Cross-context sagas: `SagaRunner::handle_any` folds events from several bounded contexts into one saga instance without changing the `Saga` trait
 - Tower as the cross-cutting pipeline seam (timeouts, limits, authorization)
 - Observability with `tracing` spans and `metrics` counters throughout

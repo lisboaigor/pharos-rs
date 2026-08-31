@@ -6,10 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
-use pharos_postgres::{PgSagaStore, Pool, connect_pool, migrate_postgres_saga_schema};
+use pharos_app::{Message, OutboxDispatcher};
+use pharos_postgres::{
+    PgSagaStore, Pool, PostgresOutboxRepository, connect_pool, migrate_postgres_eventing_schema,
+    migrate_postgres_saga_schema,
+};
 use pharos_saga::{
-    CommandDispatcher, Saga, SagaInstance, SagaRunner, SagaSaveError, SagaStatus, SagaStore,
-    SagaTransition,
+    CommandDispatcher, DurableCommandPublisher, Saga, SagaInstance, SagaRunner, SagaSaveError,
+    SagaStatus, SagaStore, SagaTransition,
 };
 use serde::{Deserialize, Serialize};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -47,8 +51,38 @@ struct Credited {
     amount: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Payout(u64);
+
+fn map_payout(command: &Payout) -> Message {
+    let Ok(payload) = serde_json::to_vec(command) else {
+        panic!("Payout must always serialize");
+    };
+    Message::new("escrow-payouts", payload, "application/json")
+}
+
+fn decode_payout(payload: &[u8]) -> Result<Payout, serde_json::Error> {
+    serde_json::from_slice(payload)
+}
+
+/// Drains `outbox` through a [`DurableCommandPublisher`] wrapping
+/// `dispatcher` — the same enqueue -> dispatch_batch -> dispatch path a
+/// production deployment runs as a separate worker loop, exercised here
+/// inline so each test can assert on `dispatcher`'s count afterwards.
+/// `PostgresOutboxRepository` is a cheap `Clone` (an `sqlx::PgPool` handle
+/// underneath), so this can be handed its own copy without disturbing the
+/// caller's.
+async fn drain(outbox: PostgresOutboxRepository, dispatcher: Arc<CountingDispatcher>) {
+    let publisher = DurableCommandPublisher::new(SharedDispatcher(dispatcher), decode_payout);
+    let result = OutboxDispatcher::new(outbox, publisher)
+        .dispatch_batch()
+        .await;
+    assert!(
+        result.is_ok(),
+        "dispatch_batch must not fail in this test: {:?}",
+        result.errors
+    );
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("saga error")]
@@ -156,11 +190,13 @@ impl SagaStore<String, EscrowState> for SharedStore {
 async fn two_concurrent_events_for_one_saga_both_land_via_compare_and_swap() -> TestResult {
     let (_container, pool) = start_postgres().await?;
     migrate_postgres_saga_schema(&pool).await?;
+    migrate_postgres_eventing_schema(&pool).await?;
 
     let store = Arc::new(PgSagaStore::<String, EscrowState>::with_saga_type(
         pool.clone(),
         "escrow",
     ));
+    let outbox = PostgresOutboxRepository::new(pool.clone());
     let saga_id = "escrow-1".to_string();
 
     // Seed a running instance, the way a first event would have.
@@ -179,7 +215,8 @@ async fn two_concurrent_events_for_one_saga_both_land_via_compare_and_swap() -> 
         let runner = SagaRunner::new(
             EscrowSaga::new(Arc::clone(&gate)),
             SharedStore(Arc::clone(&store)),
-            SharedDispatcher(Arc::clone(&dispatcher)),
+            outbox.clone(),
+            map_payout,
         );
         let saga_id = saga_id.clone();
         handles.push(tokio::spawn(async move {
@@ -194,6 +231,10 @@ async fn two_concurrent_events_for_one_saga_both_land_via_compare_and_swap() -> 
             .await?
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     }
+
+    // Both events enqueued a Payout onto the same durable outbox; drain it
+    // to actually deliver them and let `dispatcher` count them.
+    drain(outbox, Arc::clone(&dispatcher)).await;
 
     let Some(final_state) = store.load(&saga_id).await? else {
         panic!("the saga instance should exist");
@@ -280,8 +321,10 @@ async fn an_event_handlers_stale_save_conflicts_with_a_timeout_sweepers_claim() 
 async fn a_late_duplicate_event_cannot_resurrect_a_completed_saga() -> TestResult {
     let (_container, pool) = start_postgres().await?;
     migrate_postgres_saga_schema(&pool).await?;
+    migrate_postgres_eventing_schema(&pool).await?;
 
     let store = PgSagaStore::<String, EscrowState>::with_saga_type(pool.clone(), "escrow");
+    let outbox = PostgresOutboxRepository::new(pool.clone());
     let saga_id = "escrow-3".to_string();
 
     let mut done = SagaInstance::running(saga_id.clone(), EscrowState { credited: 100 });
@@ -299,7 +342,8 @@ async fn a_late_duplicate_event_cannot_resurrect_a_completed_saga() -> TestResul
             pool.clone(),
             "escrow",
         ))),
-        SharedDispatcher(Arc::clone(&dispatcher)),
+        outbox.clone(),
+        map_payout,
     );
     runner
         .handle(&Credited {
@@ -308,6 +352,9 @@ async fn a_late_duplicate_event_cannot_resurrect_a_completed_saga() -> TestResul
         })
         .await
         .map_err(|e| e.to_string())?;
+    // Nothing should have been enqueued for a refused transition, so
+    // draining is a no-op — asserted below via `dispatcher`'s count.
+    drain(outbox, Arc::clone(&dispatcher)).await;
 
     let Some(after) = store.load(&saga_id).await? else {
         panic!("the saga instance should exist");

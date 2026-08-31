@@ -6,8 +6,10 @@
 
 use std::error::Error;
 use std::future::Future;
+use std::marker::PhantomData;
 
 use chrono::{DateTime, Utc};
+use pharos_messaging::{Message, MessagingError, OutboxError, OutboxMessage, OutboxRepository};
 use thiserror::Error;
 
 /// Lifecycle of a saga instance.
@@ -249,11 +251,10 @@ pub trait CommandDispatcher<C>: Send + Sync + 'static {
 
 /// Error returned by [`SagaRunner`].
 #[derive(Debug, Error)]
-pub enum SagaRunnerError<SE, StoreE, DispatchE>
+pub enum SagaRunnerError<SE, StoreE>
 where
     SE: Error + 'static,
     StoreE: Error + 'static,
-    DispatchE: Error + 'static,
 {
     /// The saga state machine failed.
     #[error("saga transition failed: {0}")]
@@ -261,9 +262,18 @@ where
     /// Loading or saving the persisted state failed.
     #[error("saga store failed: {0}")]
     Store(#[source] StoreE),
-    /// Dispatching an emitted command failed.
-    #[error("command dispatch failed: {0}")]
-    Dispatch(#[source] DispatchE),
+    /// Enqueuing an emitted command onto the durable outbox failed.
+    ///
+    /// The saga's own state transition was already persisted by the time
+    /// this can happen (see [`SagaRunner::enqueue_all`]'s doc comment for
+    /// exactly what that does and does not guarantee). Unlike the old
+    /// direct-[`CommandDispatcher`] path, a command that *did* make it into
+    /// the outbox before this error is durable and will still be delivered
+    /// by an [`OutboxDispatcher`](pharos_messaging::OutboxDispatcher) even
+    /// if the whole process crashes right after — this error means the
+    /// *insert itself* failed, not that a queued command was lost.
+    #[error("enqueuing a command failed: {0}")]
+    Enqueue(#[source] OutboxError),
     /// The saga reached [`SagaTransition::Fail`]: a terminal business failure.
     ///
     /// The instance (when one exists) has already been persisted with
@@ -289,11 +299,10 @@ where
     },
 }
 
-impl<SE, StoreE, DispatchE> SagaRunnerError<SE, StoreE, DispatchE>
+impl<SE, StoreE> SagaRunnerError<SE, StoreE>
 where
     SE: Error + 'static,
     StoreE: Error + 'static,
-    DispatchE: Error + 'static,
 {
     /// Splits a [`SagaSaveError`] into the matching [`SagaRunnerError`]
     /// variant: a lost race becomes [`Conflict`](Self::Conflict), everything
@@ -308,35 +317,52 @@ where
     }
 }
 
-/// Drives a saga end-to-end: load state, react, save, dispatch commands.
-pub struct SagaRunner<SG, Store, Dispatcher> {
+/// Drives a saga end-to-end: load state, react, save, enqueue commands onto
+/// a durable outbox.
+///
+/// Commands are never dispatched directly. `MapCommand` serializes each
+/// emitted [`Saga::Command`] into a [`pharos_messaging::Message`], which is
+/// inserted into `Outbox` — the same durable-outbox pattern
+/// [`pharos_app::save_and_enqueue_in`] uses for domain events. Run a
+/// [`pharos_messaging::OutboxDispatcher`] against that same outbox, paired
+/// with a [`DurableCommandPublisher`] wrapping your real
+/// [`CommandDispatcher`], to actually deliver the commands — which gets the
+/// dispatcher's existing retry/backoff/dead-letter machinery for free
+/// instead of a saga-specific reimplementation of it.
+pub struct SagaRunner<SG, Store, Outbox, MapCommand> {
     saga: SG,
     store: Store,
-    dispatcher: Dispatcher,
+    outbox: Outbox,
+    map_command: MapCommand,
 }
 
-impl<SG, Store, Dispatcher> SagaRunner<SG, Store, Dispatcher> {
+impl<SG, Store, Outbox, MapCommand> SagaRunner<SG, Store, Outbox, MapCommand> {
     /// Upper bound on how many times [`handle`](Self::handle) retries a
     /// transition after an optimistic-concurrency conflict before giving up
     /// and returning [`SagaRunnerError::Conflict`]. Bounded so a saga stuck
     /// under sustained contention fails loudly instead of retrying forever.
     pub const MAX_CONFLICT_RETRIES: u32 = 8;
 
-    /// Creates a runner.
-    pub fn new(saga: SG, store: Store, dispatcher: Dispatcher) -> Self {
+    /// Creates a runner. `map_command` encodes a [`Saga::Command`] into the
+    /// [`Message`] its outbox row carries — the same role
+    /// [`pharos_app::save_and_enqueue_in`]'s `map_event` plays for domain
+    /// events.
+    pub fn new(saga: SG, store: Store, outbox: Outbox, map_command: MapCommand) -> Self {
         Self {
             saga,
             store,
-            dispatcher,
+            outbox,
+            map_command,
         }
     }
 }
 
-impl<SG, Store, Dispatcher> SagaRunner<SG, Store, Dispatcher>
+impl<SG, Store, Outbox, MapCommand> SagaRunner<SG, Store, Outbox, MapCommand>
 where
     SG: Saga,
     Store: SagaStore<SG::Id, SG::State>,
-    Dispatcher: CommandDispatcher<SG::Command>,
+    Outbox: OutboxRepository,
+    MapCommand: Fn(&SG::Command) -> Message + Send + Sync,
 {
     /// Handles an event from start to finish.
     ///
@@ -353,7 +379,7 @@ where
     pub async fn handle(
         &self,
         event: &SG::Event,
-    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>> {
+    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error>> {
         let Some(id) = self.saga.id_for(event) else {
             return Ok(());
         };
@@ -423,7 +449,7 @@ where
     pub async fn handle_any<E>(
         &self,
         event: E,
-    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>>
+    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error>>
     where
         E: Into<SG::Event>,
     {
@@ -436,7 +462,7 @@ where
         id: SG::Id,
         current: Option<SagaInstance<SG::Id, SG::State>>,
         transition: SagaTransition<SG::State, SG::Command>,
-    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>> {
+    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error>> {
         match transition {
             // Ignore is resolved by the caller: a no-op for events, a
             // deadline clear on the timeout path.
@@ -452,7 +478,7 @@ where
                     .save(instance)
                     .await
                     .map_err(SagaRunnerError::from_save_error)?;
-                self.dispatch_all(commands).await
+                self.enqueue_all(commands).await
             }
             SagaTransition::Advance {
                 state,
@@ -469,7 +495,7 @@ where
                     .save(instance)
                     .await
                     .map_err(SagaRunnerError::from_save_error)?;
-                self.dispatch_all(commands).await
+                self.enqueue_all(commands).await
             }
             SagaTransition::Complete { state, commands } => {
                 let mut instance =
@@ -482,7 +508,7 @@ where
                     .save(instance)
                     .await
                     .map_err(SagaRunnerError::from_save_error)?;
-                self.dispatch_all(commands).await
+                self.enqueue_all(commands).await
             }
             SagaTransition::Fail { reason, commands } => {
                 // A saga that fails before any instance was persisted has no
@@ -496,19 +522,30 @@ where
                         .await
                         .map_err(SagaRunnerError::from_save_error)?;
                 }
-                // Compensating commands are dispatched the same way a
+                // Compensating commands are enqueued the same way a
                 // `Complete`'s are: the saga is terminally failed, but the
                 // money (or reservation) it was guarding still has to be moved.
-                // Dispatched after persisting the failed state so a crash
+                // Enqueued after persisting the failed state so a crash
                 // between the two never leaves a live saga believing it can
                 // still act.
                 //
-                // The cost of that ordering: `store.save` and `dispatch_all`
-                // are two separate awaits, not one transaction. A crash
-                // between them leaves the saga terminally `Failed` with its
-                // compensating commands never dispatched and no retry —
-                // this is NOT atomic with the terminal transition.
-                self.dispatch_all(commands).await?;
+                // `store.save` and `enqueue_all` are still two separate
+                // awaits, not one transaction: a crash between them leaves
+                // the saga terminally `Failed` with its compensating
+                // commands never enqueued, and this runner has no way to
+                // retry just the enqueue afterwards (a fresh `handle` call
+                // for the same event won't re-attempt it either — the
+                // already-`Failed` instance short-circuits before `react`
+                // runs again, by design, so a duplicate event can't revive
+                // a terminal saga). What *is* fixed relative to dispatching
+                // straight to a `CommandDispatcher`: once a command clears
+                // this `await` — even if the process dies on the very next
+                // line — it is durably queued and a pharos_messaging
+                // `OutboxDispatcher` will still deliver it, with real retry
+                // and backoff before falling to the dead-letter queue. The
+                // old direct-dispatch path had no such window at all: a
+                // `CommandDispatcher` failure here was simply lost.
+                self.enqueue_all(commands).await?;
                 Err(SagaRunnerError::Failed { reason })
             }
         }
@@ -536,7 +573,7 @@ where
         now: DateTime<Utc>,
         lease: chrono::Duration,
         limit: usize,
-    ) -> Result<usize, SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>>
+    ) -> Result<usize, SagaRunnerError<SG::Error, Store::Error>>
     where
         Store: SagaTimeoutStore<SG::Id, SG::State>,
     {
@@ -580,17 +617,92 @@ where
         Ok(processed)
     }
 
-    async fn dispatch_all(
+    /// Enqueues `commands` onto the durable outbox as a single batch (via
+    /// [`OutboxRepository::insert_many`]), skipping the call entirely when
+    /// there is nothing to enqueue.
+    ///
+    /// This is not itself atomic with the [`SagaStore::save`] that precedes
+    /// it in [`apply_transition`](Self::apply_transition) — see that
+    /// function's `Fail` arm for exactly what that costs and what it buys
+    /// relative to dispatching straight to a [`CommandDispatcher`].
+    async fn enqueue_all(
         &self,
         commands: Vec<SG::Command>,
-    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error, Dispatcher::Error>> {
-        for command in commands {
-            self.dispatcher
-                .dispatch(command)
-                .await
-                .map_err(SagaRunnerError::Dispatch)?;
+    ) -> Result<(), SagaRunnerError<SG::Error, Store::Error>> {
+        if commands.is_empty() {
+            return Ok(());
         }
+        let messages = commands
+            .iter()
+            .map(|command| OutboxMessage::new((self.map_command)(command)))
+            .collect();
+        self.outbox
+            .insert_many(messages)
+            .await
+            .map_err(SagaRunnerError::Enqueue)?;
         Ok(())
+    }
+}
+
+/// Bridges a durable saga-command outbox to [`CommandDispatcher`].
+///
+/// [`SagaRunner`] only ever enqueues commands; something has to drain that
+/// outbox and actually deliver them. This is that something's `publish`
+/// half: implementing [`pharos_messaging::MessagePublisher`] over it lets a
+/// standard [`pharos_messaging::OutboxDispatcher`] run against the same
+/// outbox [`SagaRunner`] writes to, decoding each queued
+/// [`pharos_messaging::Message`] back into a [`Saga::Command`] and handing
+/// it to a real [`CommandDispatcher`] — which is how the dispatcher's
+/// existing retry/backoff/dead-letter machinery ends up covering saga
+/// commands too, instead of `pharos-saga` reimplementing a second copy of
+/// it.
+///
+/// ```ignore
+/// let outbox = PostgresOutboxRepository::new(pool.clone());
+/// let runner = SagaRunner::new(saga, store, outbox.clone(), map_command);
+/// // ... runner.handle(&event).await? enqueues commands onto `outbox` ...
+///
+/// let publisher = DurableCommandPublisher::new(real_dispatcher, decode_command);
+/// let drainer = OutboxDispatcher::new(outbox, publisher);
+/// drainer.dispatch_batch().await; // delivers whatever the runner enqueued
+/// ```
+pub struct DurableCommandPublisher<D, C, F> {
+    dispatcher: D,
+    decode: F,
+    _command: PhantomData<fn() -> C>,
+}
+
+impl<D, C, F> DurableCommandPublisher<D, C, F> {
+    /// Creates a publisher that decodes each outbox message's payload with
+    /// `decode` and hands the result to `dispatcher`.
+    pub fn new(dispatcher: D, decode: F) -> Self {
+        Self {
+            dispatcher,
+            decode,
+            _command: PhantomData,
+        }
+    }
+}
+
+impl<D, C, F, E> pharos_messaging::MessagePublisher for DurableCommandPublisher<D, C, F>
+where
+    D: CommandDispatcher<C>,
+    C: Send + 'static,
+    F: Fn(&[u8]) -> Result<C, E> + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
+{
+    /// Decodes `message.payload` back into a [`Saga::Command`] and
+    /// dispatches it. A decode failure or a dispatch failure both become a
+    /// [`MessagingError::Publish`], so the outbox dispatcher's ordinary
+    /// retry/backoff/dead-letter handling applies to either — a command
+    /// that can never decode ends up dead-lettered the same way a command a
+    /// downstream service permanently rejects would.
+    async fn publish(&self, message: Message) -> Result<(), MessagingError> {
+        let command = (self.decode)(&message.payload).map_err(MessagingError::publish)?;
+        self.dispatcher
+            .dispatch(command)
+            .await
+            .map_err(MessagingError::publish)
     }
 }
 
@@ -608,7 +720,7 @@ mod tests {
         amount_cents: u32,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     enum BillingCommand {
         ReserveFunds { order_id: String, amount_cents: u32 },
         FinalizeOrder { order_id: String },
@@ -754,6 +866,132 @@ mod tests {
         }
     }
 
+    /// Minimal in-memory [`OutboxRepository`] — just enough of the contract
+    /// for [`SagaRunner`] to enqueue into and [`OutboxDispatcher`] to drain,
+    /// not a store meant to prove claim/lease correctness under concurrency
+    /// (see `pharos-postgres`'s `PostgresOutboxRepository` for that).
+    #[derive(Default, Clone)]
+    struct TestOutbox {
+        messages: Arc<Mutex<HashMap<uuid::Uuid, OutboxMessage>>>,
+    }
+
+    impl OutboxRepository for TestOutbox {
+        async fn insert(&self, message: OutboxMessage) -> Result<(), OutboxError> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(message.id, message);
+            Ok(())
+        }
+
+        async fn pending(&self, limit: usize) -> Result<Vec<OutboxMessage>, OutboxError> {
+            let messages = self.messages.lock().unwrap_or_else(|p| p.into_inner());
+            let mut due: Vec<_> = messages
+                .values()
+                .filter(|m| {
+                    m.status == pharos_messaging::OutboxStatus::Pending
+                        && m.next_attempt_at <= Utc::now()
+                })
+                .cloned()
+                .collect();
+            due.sort_by_key(|m| m.created_at);
+            due.truncate(limit);
+            Ok(due)
+        }
+
+        async fn record_attempt(&self, id: uuid::Uuid) -> Result<(), OutboxError> {
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&id)
+            {
+                message.record_attempt();
+            }
+            Ok(())
+        }
+
+        async fn mark_published(&self, id: uuid::Uuid) -> Result<(), OutboxError> {
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&id)
+            {
+                message.mark_published();
+            }
+            Ok(())
+        }
+
+        async fn mark_failed(&self, id: uuid::Uuid, error: String) -> Result<(), OutboxError> {
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&id)
+            {
+                message.mark_failed(error);
+            }
+            Ok(())
+        }
+
+        async fn failed(&self, limit: usize) -> Result<Vec<OutboxMessage>, OutboxError> {
+            let messages = self.messages.lock().unwrap_or_else(|p| p.into_inner());
+            let mut failed: Vec<_> = messages
+                .values()
+                .filter(|m| m.status == pharos_messaging::OutboxStatus::Failed)
+                .cloned()
+                .collect();
+            failed.truncate(limit);
+            Ok(failed)
+        }
+
+        async fn mark_dead_lettered(&self, id: uuid::Uuid) -> Result<(), OutboxError> {
+            if let Some(message) = self
+                .messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&id)
+            {
+                message.status = pharos_messaging::OutboxStatus::DeadLettered;
+            }
+            Ok(())
+        }
+    }
+
+    fn map_billing_command(command: &BillingCommand) -> Message {
+        let Ok(payload) = serde_json::to_vec(command) else {
+            panic!("BillingCommand must always serialize");
+        };
+        Message::new("billing-commands", payload, "application/json")
+    }
+
+    fn decode_billing_command(payload: &[u8]) -> Result<BillingCommand, serde_json::Error> {
+        serde_json::from_slice(payload)
+    }
+
+    /// Drains `outbox` through a [`DurableCommandPublisher`] wrapping
+    /// `dispatcher` and returns whatever `dispatcher` collected — the same
+    /// shape the pre-durable-outbox tests asserted on directly, but now
+    /// exercising the real path end to end: [`SagaRunner::enqueue_all`] ->
+    /// [`pharos_messaging::OutboxDispatcher::dispatch_batch`] ->
+    /// [`CommandDispatcher::dispatch`].
+    async fn drain(outbox: TestOutbox, dispatcher: VecDispatcher) -> Vec<BillingCommand> {
+        let publisher = DurableCommandPublisher::new(dispatcher.clone(), decode_billing_command);
+        let outbox_dispatcher = pharos_messaging::OutboxDispatcher::new(outbox, publisher);
+        let result = outbox_dispatcher.dispatch_batch().await;
+        assert!(
+            result.is_ok(),
+            "dispatch_batch must not fail in this test: {:?}",
+            result.errors
+        );
+        dispatcher
+            .commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     struct AlwaysFailingSaga;
 
     impl Saga for AlwaysFailingSaga {
@@ -785,7 +1023,8 @@ mod tests {
         let runner = SagaRunner::new(
             AlwaysFailingSaga,
             InMemorySagaStore::default(),
-            VecDispatcher::default(),
+            TestOutbox::default(),
+            map_billing_command,
         );
         let event = OrderPlaced {
             order_id: "order-9".into(),
@@ -809,7 +1048,12 @@ mod tests {
                 BillingState::AwaitingReservation { amount_cents: 100 },
             ))
             .await?;
-        let runner = SagaRunner::new(AlwaysFailingSaga, store, VecDispatcher::default());
+        let runner = SagaRunner::new(
+            AlwaysFailingSaga,
+            store,
+            TestOutbox::default(),
+            map_billing_command,
+        );
         let event = OrderPlaced {
             order_id: "order-9".into(),
             amount_cents: 100,
@@ -870,8 +1114,9 @@ mod tests {
                 BillingState::AwaitingReservation { amount_cents: 500 },
             ))
             .await?;
+        let outbox = TestOutbox::default();
         let dispatcher = VecDispatcher::default();
-        let runner = SagaRunner::new(RefundingSaga, store, dispatcher.clone());
+        let runner = SagaRunner::new(RefundingSaga, store, outbox.clone(), map_billing_command);
         let event = OrderPlaced {
             order_id: "order-42".into(),
             amount_cents: 500,
@@ -889,12 +1134,9 @@ mod tests {
             .await?
             .ok_or("instance must exist")?;
         assert_eq!(stored.status, SagaStatus::Failed);
-        // ...and the compensating command was dispatched despite the failure.
-        let commands = dispatcher
-            .commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        // ...and the compensating command was durably enqueued despite the
+        // failure, and reaches the dispatcher once drained.
+        let commands = drain(outbox, dispatcher).await;
         assert_eq!(
             commands,
             vec![BillingCommand::FinalizeOrder {
@@ -945,8 +1187,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
         store.save(expired_instance("order-77")).await?;
+        let outbox = TestOutbox::default();
         let dispatcher = VecDispatcher::default();
-        let runner = SagaRunner::new(RefundOnTimeoutSaga, store, dispatcher.clone());
+        let runner = SagaRunner::new(
+            RefundOnTimeoutSaga,
+            store,
+            outbox.clone(),
+            map_billing_command,
+        );
 
         // A timeout `Fail` is a normal business outcome on the sweep path: the
         // instance is counted as processed, not propagated as an error.
@@ -965,12 +1213,9 @@ mod tests {
         assert_eq!(stored.status, SagaStatus::Failed);
         assert_eq!(stored.deadline, None);
 
-        // The refund command fired even though the transition failed the saga.
-        let commands = dispatcher
-            .commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        // The refund command was enqueued even though the transition failed
+        // the saga, and reaches the dispatcher once drained.
+        let commands = drain(outbox, dispatcher).await;
         assert_eq!(
             commands,
             vec![BillingCommand::FinalizeOrder {
@@ -1008,8 +1253,9 @@ mod tests {
     async fn handle_any_converts_foreign_events_into_the_saga_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
+        let outbox = TestOutbox::default();
         let dispatcher = VecDispatcher::default();
-        let runner = SagaRunner::new(BillingSaga, store, dispatcher.clone());
+        let runner = SagaRunner::new(BillingSaga, store, outbox.clone(), map_billing_command);
 
         // The saga's own Event is `OrderPlaced`; `handle_any` accepts anything
         // that converts into it, so a handler registered for a different
@@ -1021,11 +1267,7 @@ mod tests {
             })
             .await?;
 
-        let commands = dispatcher
-            .commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let commands = drain(outbox, dispatcher).await;
         assert_eq!(
             commands,
             vec![BillingCommand::ReserveFunds {
@@ -1115,7 +1357,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
         store.save(expired_instance("order-1")).await?;
-        let runner = SagaRunner::new(BillingSaga, store, VecDispatcher::default());
+        let runner = SagaRunner::new(
+            BillingSaga,
+            store,
+            TestOutbox::default(),
+            map_billing_command,
+        );
 
         let processed = runner
             .run_due_timeouts(Utc::now(), chrono::Duration::minutes(1), 10)
@@ -1145,8 +1392,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
         store.save(expired_instance("order-2")).await?;
+        let outbox = TestOutbox::default();
         let dispatcher = VecDispatcher::default();
-        let runner = SagaRunner::new(ExpiringSaga, store, dispatcher.clone());
+        let runner = SagaRunner::new(ExpiringSaga, store, outbox.clone(), map_billing_command);
 
         assert_eq!(
             runner
@@ -1162,11 +1410,7 @@ mod tests {
             .ok_or("instance must exist")?;
         assert_eq!(stored.status, SagaStatus::Completed);
         assert_eq!(stored.deadline, None);
-        let commands = dispatcher
-            .commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let commands = drain(outbox, dispatcher).await;
         assert_eq!(
             commands,
             vec![BillingCommand::FinalizeOrder {
@@ -1181,7 +1425,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
         store.save(expired_instance("order-3")).await?;
-        let runner = SagaRunner::new(SnoozingSaga, store, VecDispatcher::default());
+        let runner = SagaRunner::new(
+            SnoozingSaga,
+            store,
+            TestOutbox::default(),
+            map_billing_command,
+        );
 
         assert_eq!(
             runner
@@ -1219,7 +1468,12 @@ mod tests {
                 Utc::now() + chrono::Duration::hours(1),
             ))
             .await?;
-        let runner = SagaRunner::new(BillingSaga, store, VecDispatcher::default());
+        let runner = SagaRunner::new(
+            BillingSaga,
+            store,
+            TestOutbox::default(),
+            map_billing_command,
+        );
 
         // Only one of the two due instances fits the limit.
         assert_eq!(
@@ -1249,8 +1503,9 @@ mod tests {
     #[tokio::test]
     async fn runner_starts_and_then_completes_a_saga() -> Result<(), Box<dyn std::error::Error>> {
         let store = InMemorySagaStore::default();
+        let outbox = TestOutbox::default();
         let dispatcher = VecDispatcher::default();
-        let runner = SagaRunner::new(BillingSaga, store, dispatcher.clone());
+        let runner = SagaRunner::new(BillingSaga, store, outbox.clone(), map_billing_command);
 
         let event = OrderPlaced {
             order_id: "order-1".into(),
@@ -1260,11 +1515,7 @@ mod tests {
         runner.handle(&event).await?;
         runner.handle(&event).await?;
 
-        let commands = dispatcher
-            .commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let commands = drain(outbox, dispatcher).await;
         assert_eq!(
             commands,
             vec![
@@ -1276,6 +1527,106 @@ mod tests {
                     order_id: "order-1".into(),
                 },
             ]
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("dispatch failed transiently")]
+    struct TransientDispatchFailure;
+
+    /// Dispatcher whose first `dispatch` call always fails, every later call
+    /// succeeds. Standing in for a downstream service that was briefly
+    /// unreachable — the exact case a direct `CommandDispatcher` call had no
+    /// recovery from at all: the old `SagaRunner` surfaced the error once
+    /// and moved on, the command gone.
+    #[derive(Default, Clone)]
+    struct FlakyOnceDispatcher {
+        failed_once: Arc<Mutex<bool>>,
+        commands: Arc<Mutex<Vec<BillingCommand>>>,
+    }
+
+    impl CommandDispatcher<BillingCommand> for FlakyOnceDispatcher {
+        type Error = TransientDispatchFailure;
+
+        async fn dispatch(&self, command: BillingCommand) -> Result<(), Self::Error> {
+            let mut failed_once = self.failed_once.lock().unwrap_or_else(|p| p.into_inner());
+            if !*failed_once {
+                *failed_once = true;
+                return Err(TransientDispatchFailure);
+            }
+            self.commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(command);
+            Ok(())
+        }
+    }
+
+    /// The property this whole durable-outbox design exists for: a command
+    /// whose first delivery attempt fails is retried by the
+    /// `OutboxDispatcher`'s own `RetryPolicy`, not lost. Dispatching straight
+    /// to a `CommandDispatcher` (the pre-durable-outbox shape) had no such
+    /// recovery — a failed `dispatch` call surfaced once as an error and the
+    /// command was gone.
+    #[tokio::test]
+    async fn a_transient_dispatch_failure_is_retried_instead_of_lost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let outbox = TestOutbox::default();
+        let store = InMemorySagaStore::default();
+        let runner = SagaRunner::new(BillingSaga, store, outbox.clone(), map_billing_command);
+
+        runner
+            .handle(&OrderPlaced {
+                order_id: "order-99".into(),
+                amount_cents: 250,
+            })
+            .await?;
+
+        let dispatcher = FlakyOnceDispatcher::default();
+        let publisher = DurableCommandPublisher::new(dispatcher.clone(), decode_billing_command);
+        // Zero delay: the second `dispatch_batch` call sees the retried
+        // message immediately due, no sleep needed in the test.
+        let outbox_dispatcher = pharos_messaging::OutboxDispatcher::with_config(
+            outbox,
+            publisher,
+            pharos_messaging::DispatchConfig::new(
+                10,
+                pharos_messaging::RetryPolicy::new(3, std::time::Duration::ZERO),
+            ),
+        );
+
+        let first = outbox_dispatcher.dispatch_batch().await;
+        assert_eq!(
+            first.failure_count(),
+            1,
+            "the first delivery attempt must fail, exercising the flaky dispatcher"
+        );
+        assert!(
+            dispatcher
+                .commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "nothing reached the dispatcher's log on the failed attempt"
+        );
+
+        let second = outbox_dispatcher.dispatch_batch().await;
+        assert!(
+            second.is_ok(),
+            "the retried attempt must succeed: {:?}",
+            second.errors
+        );
+        assert_eq!(
+            *dispatcher
+                .commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            vec![BillingCommand::ReserveFunds {
+                order_id: "order-99".into(),
+                amount_cents: 250,
+            }],
+            "the command that failed once is delivered exactly once on retry, not dropped"
         );
         Ok(())
     }

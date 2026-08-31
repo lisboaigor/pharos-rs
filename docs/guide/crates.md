@@ -209,10 +209,10 @@ Axum integration for HTTP adapters over application handlers:
 
 Saga/process-manager primitives:
 
-- `Saga` (with `on_timeout`), `SagaTransition`, `SagaStore`, `SagaTimeoutStore`, `CommandDispatcher`
-- `SagaRunner` for loading state, reacting to an event, persisting state, and dispatching follow-up commands
+- `Saga` (with `on_timeout`), `SagaTransition`, `SagaStore` (optimistic concurrency on `SagaInstance::version`, via `SagaSaveError`), `SagaTimeoutStore`, `CommandDispatcher`, `DurableCommandPublisher`
+- `SagaRunner` for loading state, reacting to an event, persisting state, and enqueuing follow-up commands onto a durable outbox (`OutboxRepository`) — never dispatching them directly. Run a `pharos_messaging::OutboxDispatcher` against that same outbox, paired with a `DurableCommandPublisher` wrapping the real `CommandDispatcher`, to actually deliver them with the dispatcher's existing retry/backoff/dead-letter machinery
 - Deadlines: `SagaInstance::running_until` and the `deadline` on `Start`/`Advance` schedule a timeout; `SagaRunner::run_due_timeouts` claims elapsed instances (`SagaTimeoutStore::claim_due`, lease-based) and fires `Saga::on_timeout`. Claiming makes the sweep safe to run on multiple service instances concurrently; call it from a periodic task — the app owns the scheduler
-- Compensation on failure: `SagaTransition::Fail { reason, commands }` carries follow-up commands the runner dispatches like a `Complete`'s (after persisting the `Failed` state, before surfacing `SagaRunnerError::Failed`), so an abandoned or expired saga can refund/release atomically with the terminal transition. Pass an empty `Vec` when failing needs no compensation
+- Compensation on failure: `SagaTransition::Fail { reason, commands }` carries follow-up commands the runner enqueues like a `Complete`'s (after persisting the `Failed` state, before surfacing `SagaRunnerError::Failed`), so an abandoned or expired saga's refund/release survives independently of the process that computed it. `store.save` and the enqueue are still two separate awaits, not one transaction — a crash between them still drops the compensation — but once the enqueue itself succeeds, the command is durable and retried on delivery failure, unlike dispatching straight to a `CommandDispatcher`. Pass an empty `Vec` when failing needs no compensation
 - Cross-context sagas: `SagaRunner::handle_any<E: Into<Saga::Event>>` accepts events from several bounded contexts. Define one unifying `Event` enum with a `From` impl per source and register one `EventBus` handler per source type, each forwarding through `handle_any` — the `Saga` trait stays single-event and the fan-in lives in the wiring
 
 ## `pharos-es`
