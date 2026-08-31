@@ -18,7 +18,7 @@
 //! 1. Add `pharos-proto` and `prost` to your `Cargo.toml`:
 //!
 //! ```toml
-//! pharos-proto = { git = "ssh://git@github.com/lisboaigor/pharos-rs", branch = "main" }
+//! pharos-proto = { git = "https://github.com/lisboaigor/pharos-rs", branch = "main" }
 //! prost        = "0.13"
 //! ```
 //!

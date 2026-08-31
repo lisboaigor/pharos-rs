@@ -36,22 +36,23 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, Pool) {
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .start()
         .await
-        .expect("postgres container must start");
+        .unwrap_or_else(|e| panic!("postgres container must start: {e}"));
 
     let host = container
         .get_host()
         .await
-        .expect("container host must resolve");
+        .unwrap_or_else(|e| panic!("container host must resolve: {e}"));
     let port = container
         .get_host_port_ipv4(5432)
         .await
-        .expect("container port must be mapped");
+        .unwrap_or_else(|e| panic!("container port must be mapped: {e}"));
     let connection_string = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    let pool = connect_pool(&connection_string, 8).expect("pool must connect");
+    let pool =
+        connect_pool(&connection_string, 8).unwrap_or_else(|e| panic!("pool must connect: {e}"));
     migrate_postgres_eventing_schema(&pool)
         .await
-        .expect("eventing schema must migrate");
+        .unwrap_or_else(|e| panic!("eventing schema must migrate: {e}"));
 
     (container, pool)
 }

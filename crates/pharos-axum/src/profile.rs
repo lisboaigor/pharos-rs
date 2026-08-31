@@ -150,17 +150,16 @@ mod tests {
             .into_router();
 
         for (method, path) in [(Method::GET, "/query"), (Method::POST, "/command")] {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(path)
-                        .body(Body::empty())
-                        .expect("request builds"),
-                )
-                .await
-                .expect("router must respond");
+            let Ok(request) = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+            else {
+                panic!("request must build");
+            };
+            // The router's `Service::Error` is `Infallible`, so `Ok` is the
+            // only reachable arm — no `else` branch for clippy to want.
+            let Ok(response) = router.clone().oneshot(request).await;
             assert_eq!(response.status(), StatusCode::OK);
         }
     }
@@ -171,16 +170,16 @@ mod tests {
             .query_routes(Router::new().route("/query", get(ok)))
             .into_router();
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/query")
-                    .body(Body::empty())
-                    .expect("request builds"),
-            )
-            .await
-            .expect("router must respond");
+        let Ok(request) = Request::builder()
+            .method(Method::GET)
+            .uri("/query")
+            .body(Body::empty())
+        else {
+            panic!("request must build");
+        };
+        // The router's `Service::Error` is `Infallible`, so `Ok` is the only
+        // reachable arm — no `else` branch for clippy to want.
+        let Ok(response) = router.oneshot(request).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

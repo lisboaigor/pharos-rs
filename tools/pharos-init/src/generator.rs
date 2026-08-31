@@ -35,7 +35,6 @@ pub fn generate(cfg: &ProjectConfig) -> std::io::Result<Vec<GeneratedFile>> {
     }
 
     emit!("Cargo.toml", cargo_toml(cfg));
-    emit!(".cargo/config.toml", cargo_config_toml());
     emit!("src/lib.rs", lib_rs(cfg));
     emit!("src/main.rs", main_rs(cfg));
     emit!("src/domain/mod.rs", domain_mod_rs(cfg));
@@ -248,10 +247,6 @@ fn docker_compose(cfg: &ProjectConfig) -> String {
           app:
             build:
               context: .
-              # Forwards the SSH agent, which the build needs to fetch the
-              # framework from its private repository.
-              ssh:
-                - default
             env_file: [.env]
             ports:
               - "127.0.0.1:3000:3000"
@@ -271,31 +266,20 @@ fn dockerfile(cfg: &ProjectConfig) -> String {
     formatdoc!(
         r#"
         # syntax=docker/dockerfile:1
-        #
-        # `--mount=type=ssh` is not optional here: the framework is a private git
-        # dependency fetched over SSH, and a build has no agent of its own. Build
-        # with `docker build --ssh default .`, or through the compose file, which
-        # already forwards it.
 
         FROM rust:1-bookworm AS builder
         WORKDIR /app
 
         # Dependencies first, so editing source does not rebuild the world. The
-        # stub is enough to resolve and compile them. `--mount=type=ssh` is a
-        # flag on `RUN` itself, not a shell command — inline after `&&` it is
-        # not the flag, it is a nonexistent program by that name, and masking
-        # its failure would skip warming the dependency cache on every build
-        # without ever saying so: the *next* `RUN` below then has to compile
-        # every dependency from scratch anyway, just to build the real binary.
+        # stub is enough to resolve and compile them.
         COPY Cargo.toml Cargo.lock* ./
-        COPY .cargo ./.cargo
-        RUN --mount=type=ssh mkdir src && echo 'fn main() {{}}' > src/main.rs \
+        RUN mkdir src && echo 'fn main() {{}}' > src/main.rs \
             && echo '' > src/lib.rs && cargo build --release
         RUN rm -rf src
 
         COPY src ./src
         # `touch` invalidates the cached artifact so the real code is compiled.
-        RUN --mount=type=ssh touch src/main.rs src/lib.rs \
+        RUN touch src/main.rs src/lib.rs \
             && cargo build --release --bin {name}
 
         FROM debian:bookworm-slim AS runtime
@@ -418,7 +402,7 @@ fn dashboards_provisioning(cfg: &ProjectConfig) -> String {
 // ── Cargo.toml ────────────────────────────────────────────────────────────────
 
 fn cargo_toml(cfg: &ProjectConfig) -> String {
-    let git = "ssh://git@github.com/lisboaigor/pharos-rs";
+    let git = "https://github.com/lisboaigor/pharos-rs";
     let tower_feat = if cfg.uses_axum() {
         r#", features = ["tower"]"#
     } else {
@@ -493,21 +477,6 @@ fn cargo_toml(cfg: &ProjectConfig) -> String {
         "#,
         name = cfg.project_name,
         deps = deps.trim(),
-    )
-}
-
-// ── .cargo/config.toml ───────────────────────────────────────────────────────
-
-fn cargo_config_toml() -> String {
-    // Cargo's built-in SSH client does not use the system ssh-agent or
-    // ~/.ssh/config. Setting git-fetch-with-cli = true delegates all git
-    // operations to the system `git` binary, which picks up the existing
-    // SSH key and agent automatically.
-    formatdoc!(
-        r#"
-        [net]
-        git-fetch-with-cli = true
-    "#
     )
 }
 
@@ -1343,45 +1312,26 @@ mod tests {
         Ok(())
     }
 
-    /// The whole promise is `docker compose up`, and it runs against a private
-    /// git dependency: without the SSH mount the build cannot fetch it.
+    /// The framework dependency is fetched over public HTTPS (the repository
+    /// is public), so the build needs no SSH agent, no `--mount=type=ssh`,
+    /// and no forwarded credential of any kind.
     #[test]
-    fn the_build_forwards_an_ssh_agent() -> std::io::Result<()> {
+    fn the_build_needs_no_ssh_agent_or_credential() -> std::io::Result<()> {
         let (root, _) = generate_into_temp()?;
         let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
         assert!(
-            dockerfile.contains("--mount=type=ssh"),
-            "the build would fail fetching the framework from its private repository"
+            !dockerfile.contains("--mount=type=ssh"),
+            "a public HTTPS dependency needs no SSH mount"
         );
         let compose = fs::read_to_string(root.join("docker-compose.yml"))?;
         assert!(
-            compose.contains("ssh:") && compose.contains("- default"),
-            "compose does not forward the agent the Dockerfile expects"
+            !compose.contains("ssh:"),
+            "a public HTTPS dependency needs no forwarded SSH agent"
         );
-        Ok(())
-    }
-
-    /// `--mount=type=ssh` is a flag on `RUN` itself. Inline after `&&`, in the
-    /// middle of a shell command list, it is not the flag — it is a
-    /// nonexistent program by that name — and every `RUN` line pulling from
-    /// the private git dependency must get the mount as a flag or the build
-    /// cannot authenticate to fetch it.
-    #[test]
-    fn every_ssh_mounted_run_puts_the_flag_on_run_itself_not_inline() -> std::io::Result<()> {
-        let (root, _) = generate_into_temp()?;
-        let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
-        for line in dockerfile.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            if trimmed.contains("--mount=type=ssh") {
-                assert!(
-                    trimmed.starts_with("RUN --mount=type=ssh"),
-                    "`--mount=type=ssh` must immediately follow `RUN`, not appear mid-command: {line:?}"
-                );
-            }
-        }
+        assert!(
+            !root.join(".cargo/config.toml").exists(),
+            "git-fetch-with-cli was only ever needed to delegate SSH auth to the system git"
+        );
         Ok(())
     }
 
@@ -1544,10 +1494,10 @@ mod tests {
         Ok(())
     }
 
-    /// Points every generated `git = "ssh://..."` pharos dependency at this
+    /// Points every generated `git = "https://..."` pharos dependency at this
     /// checkout's own `crates/` instead, so the generated project can be
-    /// built offline, without SSH access to a private repository, against
-    /// the framework version actually under test.
+    /// built offline, without network access, against the framework version
+    /// actually under test.
     ///
     /// A path dependency does not need to be a workspace member: Cargo
     /// resolves each crate's own `workspace = true` fields by walking up
@@ -1562,10 +1512,14 @@ mod tests {
         let workspace_crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
-            .expect("tools/pharos-init has two parent directories: tools/ and the repo root")
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "tools/pharos-init must have two parent directories: tools/ and the repo root",
+                )
+            })?
             .join("crates");
 
-        let git = "ssh://git@github.com/lisboaigor/pharos-rs";
+        let git = "https://github.com/lisboaigor/pharos-rs";
         let mut patched = String::with_capacity(manifest.len());
         for line in manifest.lines() {
             if let Some((name, rest)) = line.split_once('=') {

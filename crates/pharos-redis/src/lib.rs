@@ -391,7 +391,10 @@ mod tests {
     // connect — so these tests exercise the `in_flight` cache's bounding
     // logic without a live Redis server.
     fn broker() -> RedisMessageBroker {
-        RedisMessageBroker::new(redis::Client::open("redis://127.0.0.1:0").expect("URL parses"))
+        let Ok(client) = redis::Client::open("redis://127.0.0.1:0") else {
+            panic!("URL must parse");
+        };
+        RedisMessageBroker::new(client)
     }
 
     #[test]
