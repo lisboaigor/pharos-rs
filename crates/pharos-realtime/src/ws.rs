@@ -25,8 +25,15 @@
 //! - a server-sent ping every [`RealtimeConfig::heartbeat_every`] with a
 //!   [`RealtimeConfig::heartbeat_timeout`] deadline reaps half-open
 //!   connections that TCP alone would hold forever;
+//! - every outbound send and every [`OnMessage::on_message`] call is bounded
+//!   by [`RealtimeConfig::io_timeout`], so a peer that stops reading (or a
+//!   handler that hangs) cannot block the heartbeat and revalidation ticks
+//!   that exist specifically to reap it;
 //! - inbound frames are capped by [`RealtimeConfig::max_message_size`], well
-//!   under the 64 MiB tungstenite would otherwise allow per message.
+//!   under the 64 MiB tungstenite would otherwise allow per message, and
+//!   rate-limited by [`RealtimeConfig::max_inbound_frames_per_second`], so
+//!   one connection cannot turn its own `RoomAuthorizer::authorize` calls
+//!   into an unbounded cost on the embedding app.
 //!
 //! ```ignore
 //! use axum::extract::{Path, State, WebSocketUpgrade};
@@ -60,8 +67,9 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tracing::{Instrument, info_span};
 
 use crate::auth::{Access, ConnectionAuthenticator, Identity, RoomAuthorizer};
@@ -179,6 +187,36 @@ pub struct RealtimeConfig {
     /// closed. Must exceed [`heartbeat_every`](Self::heartbeat_every) or every
     /// connection is reaped on the first tick.
     pub heartbeat_timeout: Duration,
+    /// How long a single outbound send, or a single [`OnMessage::on_message`]
+    /// call, may block before the connection is treated as unresponsive and
+    /// closed.
+    ///
+    /// Every `tokio::select!` branch in the connection pump runs its body to
+    /// completion before the loop can service any *other* branch — including
+    /// the ones that tick the heartbeat and revalidation deadlines. Without a
+    /// bound here, a peer that stops reading its socket (its TCP receive
+    /// window fills, and `sink.send` never resolves) or a slow handler blocks
+    /// those ticks for as long as the stall lasts: the very guards meant to
+    /// reap an unresponsive connection cannot run while it is busy being
+    /// unresponsive. This is what closes that gap.
+    pub io_timeout: Duration,
+    /// Largest sustained rate of inbound frames a single connection may
+    /// submit for authorization and [`OnMessage::on_message`], in frames per
+    /// second. A short burst up to this same count is allowed even
+    /// immediately after the connection opens.
+    ///
+    /// [`max_message_size`](Self::max_message_size) bounds how big one frame
+    /// may be; nothing bounded how *many* a connection could send per
+    /// second. Each accepted frame costs the embedding app one
+    /// [`RoomAuthorizer::authorize`] call — a database or policy-store
+    /// lookup, typically — and, if authorized, one `on_message` call, so an
+    /// ordinary authenticated connection with no rate limit can drive both
+    /// as fast as the local network allows. A frame over the limit is
+    /// dropped without running either, the same as a malformed frame: one
+    /// noisy connection does not get to be a denial-of-service lever against
+    /// its own room's authorizer, but it also is not torn down for a
+    /// legitimate burst.
+    pub max_inbound_frames_per_second: u32,
 }
 
 impl Default for RealtimeConfig {
@@ -189,6 +227,49 @@ impl Default for RealtimeConfig {
             revalidate_every: Duration::from_secs(60),
             heartbeat_every: Duration::from_secs(20),
             heartbeat_timeout: Duration::from_secs(60),
+            io_timeout: Duration::from_secs(30),
+            max_inbound_frames_per_second: 50,
+        }
+    }
+}
+
+/// A per-connection token bucket bounding
+/// [`RealtimeConfig::max_inbound_frames_per_second`].
+///
+/// Lives entirely inside one connection's pump task — no locking, no shared
+/// state — since only that task ever calls [`Self::try_acquire`].
+struct InboundRateLimiter {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl InboundRateLimiter {
+    fn new(rate_per_sec: u32) -> Self {
+        let capacity = f64::from(rate_per_sec.max(1));
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_sec: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Takes one token if one is available, refilling first for however
+    /// long has elapsed since the last call.
+    fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -351,6 +432,9 @@ enum CloseReason {
     Revoked,
     /// No inbound traffic within the heartbeat deadline.
     Timeout,
+    /// An outbound send or an `OnMessage::on_message` call exceeded
+    /// [`RealtimeConfig::io_timeout`].
+    Unresponsive,
 }
 
 impl CloseReason {
@@ -361,6 +445,7 @@ impl CloseReason {
             Self::SubscribeFailed => "subscribe_failed",
             Self::Revoked => "revoked",
             Self::Timeout => "timeout",
+            Self::Unresponsive => "unresponsive",
         }
     }
 }
@@ -385,6 +470,30 @@ where
     Z: RoomAuthorizer,
     M: OnMessage,
 {
+    /// Sends `message`, bounding how long a stalled peer may block the pump.
+    ///
+    /// A `tokio::select!` branch runs its whole body to completion before the
+    /// loop can service any other branch — heartbeat and revalidation ticks
+    /// included. An unbounded `sink.send` therefore lets a peer that simply
+    /// stops reading (its TCP receive window fills and the send future never
+    /// resolves) hold the connection, its room, and its retained backlog open
+    /// forever, immune to every other guard in this loop. Bounding every send
+    /// here is what makes those guards actually apply to a stalled peer.
+    async fn send_bounded(
+        &self,
+        sink: &mut SplitSink<WebSocket, WsMessage>,
+        message: WsMessage,
+    ) -> Result<(), CloseReason> {
+        match timeout(self.config.io_timeout, sink.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(CloseReason::ClientGone),
+            Err(_) => {
+                tracing::warn!("realtime connection exceeded its io_timeout sending a frame");
+                Err(CloseReason::Unresponsive)
+            }
+        }
+    }
+
     /// Pumps the socket until one side ends, a revalidation fails, or the
     /// heartbeat deadline passes.
     async fn run(mut self, socket: WebSocket) -> CloseReason {
@@ -394,7 +503,7 @@ where
             Ok(subscribed) => subscribed,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to subscribe realtime connection to its room");
-                let _ = sink.send(WsMessage::Close(None)).await;
+                let _ = self.send_bounded(&mut sink, WsMessage::Close(None)).await;
                 return CloseReason::SubscribeFailed;
             }
         };
@@ -405,12 +514,11 @@ where
                 metrics::counter!("pharos.realtime.backlog.replayed")
                     .increment(missed.len() as u64);
                 for message in missed {
-                    if sink
-                        .send(WsMessage::Binary(message.payload.into()))
+                    if let Err(reason) = self
+                        .send_bounded(&mut sink, WsMessage::Binary(message.payload.into()))
                         .await
-                        .is_err()
                     {
-                        return CloseReason::ClientGone;
+                        return reason;
                     }
                 }
             }
@@ -436,6 +544,8 @@ where
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut last_seen = Instant::now();
+        let mut inbound_limiter =
+            InboundRateLimiter::new(self.config.max_inbound_frames_per_second);
 
         let reason = loop {
             tokio::select! {
@@ -443,8 +553,11 @@ where
                     let Some(message) = outbound else {
                         break CloseReason::RoomClosed;
                     };
-                    if sink.send(WsMessage::Binary(message.payload.into())).await.is_err() {
-                        break CloseReason::ClientGone;
+                    if let Err(reason) = self
+                        .send_bounded(&mut sink, WsMessage::Binary(message.payload.into()))
+                        .await
+                    {
+                        break reason;
                     }
                     metrics::counter!(
                         "pharos.realtime.messages.delivered",
@@ -470,6 +583,20 @@ where
                         Ok(WsMessage::Close(_)) | Err(_) => break CloseReason::ClientGone,
                     };
 
+                    // Checked before authorization, not after: the point is
+                    // to bound how often `RoomAuthorizer::authorize` itself
+                    // gets called from one connection, not merely how often
+                    // `on_message` runs. A throttled frame is dropped the
+                    // same way a malformed one is — it does not close the
+                    // connection, only skip this one frame.
+                    if !inbound_limiter.try_acquire() {
+                        metrics::counter!("pharos.realtime.frames.rate_limited").increment(1);
+                        tracing::debug!(
+                            "inbound realtime frame dropped: over max_inbound_frames_per_second"
+                        );
+                        continue;
+                    }
+
                     // Publish permission is checked per frame, not per
                     // connection: a right revoked mid-session has to stop the
                     // next message, not the next reconnect. Read access to a
@@ -488,30 +615,50 @@ where
                         continue;
                     }
 
-                    match self.on_message.on_message(&self.identity, &self.room, payload).await {
-                        Ok(None) => {}
-                        Ok(Some(reply)) => {
+                    // Bounded the same way a send is: a handler that hangs
+                    // (a stuck downstream call, a poisoned lock) must not be
+                    // able to suspend the heartbeat and revalidation ticks for
+                    // longer than an ordinary stalled send could.
+                    let outcome = timeout(
+                        self.config.io_timeout,
+                        self.on_message.on_message(&self.identity, &self.room, payload),
+                    )
+                    .await;
+
+                    match outcome {
+                        Ok(Ok(None)) => {}
+                        Ok(Ok(Some(reply))) => {
                             metrics::counter!(
                                 "pharos.realtime.replies.sent",
                                 "kind" => reply.kind
                             )
                             .increment(1);
-                            if sink.send(WsMessage::Binary(reply.payload.into())).await.is_err() {
-                                break CloseReason::ClientGone;
+                            if let Err(reason) = self
+                                .send_bounded(&mut sink, WsMessage::Binary(reply.payload.into()))
+                                .await
+                            {
+                                break reason;
                             }
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 error = %error,
                                 "on_message failed on an inbound realtime frame"
                             );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "on_message exceeded the io_timeout; closing the connection"
+                            );
+                            metrics::counter!("pharos.realtime.on_message.timed_out").increment(1);
+                            break CloseReason::Unresponsive;
                         }
                     }
                 }
 
                 _ = revalidate.tick() => {
                     if !self.still_authorized().await {
-                        let _ = sink.send(WsMessage::Close(None)).await;
+                        let _ = self.send_bounded(&mut sink, WsMessage::Close(None)).await;
                         break CloseReason::Revoked;
                     }
                 }
@@ -519,17 +666,17 @@ where
                 _ = heartbeat.tick() => {
                     if last_seen.elapsed() >= self.config.heartbeat_timeout {
                         tracing::info!("realtime connection exceeded its heartbeat deadline");
-                        let _ = sink.send(WsMessage::Close(None)).await;
+                        let _ = self.send_bounded(&mut sink, WsMessage::Close(None)).await;
                         break CloseReason::Timeout;
                     }
-                    if sink.send(WsMessage::Ping(Bytes::new())).await.is_err() {
-                        break CloseReason::ClientGone;
+                    if let Err(reason) = self.send_bounded(&mut sink, WsMessage::Ping(Bytes::new())).await {
+                        break reason;
                     }
                 }
             }
         };
 
-        let _ = sink.close().await;
+        let _ = timeout(self.config.io_timeout, sink.close()).await;
         reason
     }
 

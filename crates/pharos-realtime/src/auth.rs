@@ -49,11 +49,13 @@ impl std::fmt::Display for Identity {
 /// # Read the token from a header, not the query string
 ///
 /// A query string is not a private channel: it lands in access logs, proxy
-/// logs, and `Referer` headers, and `pharos_axum::observability::request_span`
-/// records the full URI — query included — on a span built at `INFO`, so a
-/// token in `?token=…` is written to the application's own logs on every
-/// handshake. Prefer `Sec-WebSocket-Protocol` or an `Authorization` header.
-/// If a browser API forces a query parameter, make that token single-use and
+/// logs, and `Referer` headers on any link a client follows away from the
+/// page — none of which this framework controls. (`request_span` in
+/// `pharos_axum::observability` is *not* one of those risks: it redacts the
+/// query string before it ever reaches a span field, keeping only the path.
+/// The other channels still see the raw URL, which is reason enough on its
+/// own.) Prefer `Sec-WebSocket-Protocol` or an `Authorization` header. If a
+/// browser API forces a query parameter, make that token single-use and
 /// short-lived, and redact it before it reaches a subscriber.
 pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// Authenticates the connection described by `parts`, returning the

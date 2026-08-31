@@ -12,13 +12,41 @@
 //! next publish. That distinction is the whole point: collecting rooms only on
 //! publish means a room nobody ever publishes to is never collected at all, so
 //! `subscribe` to a fresh room and disconnect, repeated, leaks a channel every
-//! time. `broadcast::channel(capacity)` preallocates its whole ring up front
-//! (~24 KB at the default capacity), so that leak is measured in gigabytes
-//! after a few tens of thousands of cheap handshakes, and the room id usually
-//! comes straight off the request path.
+//! time, and the room id usually comes straight off the request path.
 //!
 //! [`InMemoryHub::with_limits`] additionally caps how many rooms may exist at
 //! once, so even a bug in the drop path cannot grow without bound.
+//!
+//! # What the room ceiling actually bounds
+//!
+//! [`DEFAULT_MAX_ROOMS`] caps the *count* of rooms, but two per-room costs
+//! scale with payload size, not just message count, and neither can be
+//! turned into a byte-independent bound without capping payload size itself
+//! (which this hub does not do — that is the embedding app's call):
+//!
+//! - **The retained backlog.** [`DEFAULT_BACKLOG`] originally sized this in
+//!   messages only, so a room fanning out large payloads retained up to that
+//!   many of them regardless of size. [`InMemoryHub::with_max_backlog_bytes`]
+//!   now bounds it by total payload bytes too, evicting the oldest retained
+//!   message whenever either limit is hit, so the backlog is capped at
+//!   `min(backlog messages, max_backlog_bytes)` *per room* — independent of
+//!   payload size, as long as `max_backlog_bytes` is sized for the payloads
+//!   actually published.
+//! - **The live `broadcast` channel.** `capacity` (see
+//!   [`InMemoryHub::with_capacity`]) is how many not-yet-consumed messages a
+//!   lagging subscriber can hold before it starts missing them, and each
+//!   slot holds a full message — payload included — until consumed. A
+//!   subscriber that keeps up (the ordinary case: [`ws`](crate::ws) pumps
+//!   every message straight out over its socket) keeps this near-empty; one
+//!   that stalls or disconnects without dropping its receiver grows it
+//!   toward `capacity × payload size`. There is no way to bound this by
+//!   bytes without wrapping the channel itself, so sizing `capacity` against
+//!   the largest payload an app actually publishes is the only lever.
+//!
+//! Worst-case per-room memory is therefore approximately
+//! `max_backlog_bytes + capacity × largest_payload_size`, times
+//! [`DEFAULT_MAX_ROOMS`] for the hub-wide ceiling — size the three together
+//! rather than assuming any one of them alone bounds total memory.
 //!
 //! Horizontal scale-out (a NATS-backed hub sharing state across nodes) is
 //! explicitly Fase 7+ in the plan — this backend does not attempt it.
@@ -39,14 +67,24 @@ use crate::hub::{
 
 /// Per-room channel capacity: how many not-yet-delivered messages a lagging
 /// subscriber can fall behind by before it starts missing messages.
-const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+///
+/// Every one of these slots holds a full [`RealtimeMessage`] — payload
+/// included — until its slowest subscriber consumes it or falls further
+/// behind than `capacity` and starts missing messages, so this is a cost
+/// that scales with `capacity × payload size`, same as
+/// [`DEFAULT_BACKLOG`]/[`DEFAULT_MAX_BACKLOG_BYTES`] below. Kept small by
+/// default for the same reason: raise it deliberately with
+/// [`InMemoryHub::with_capacity`] against a known payload size, rather than
+/// discovering the real per-room cost in production.
+const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 
 /// Default ceiling on concurrently tracked rooms.
 ///
-/// Sized so the hub's rooms cannot exceed roughly a few hundred megabytes at
-/// the default channel capacity, which is a resource-exhaustion bound rather
-/// than a product limit — raise it deliberately with
-/// [`InMemoryHub::with_limits`] if an app genuinely needs more.
+/// A resource-exhaustion bound rather than a product limit — raise it
+/// deliberately with [`InMemoryHub::with_limits`] if an app genuinely needs
+/// more. See [the module doc](self#what-the-room-ceiling-actually-bounds)
+/// for how this combines with [`DEFAULT_BACKLOG`] and
+/// [`DEFAULT_MAX_BACKLOG_BYTES`] into a worst-case memory figure.
 const DEFAULT_MAX_ROOMS: usize = 10_000;
 
 /// Messages retained per room for reconnecting subscribers.
@@ -55,6 +93,15 @@ const DEFAULT_MAX_ROOMS: usize = 10_000;
 /// message store. A client that falls further behind resyncs from the app's
 /// own read model, which is authoritative anyway.
 const DEFAULT_BACKLOG: usize = 64;
+
+/// Default ceiling, in bytes, on a room's total retained backlog payload.
+///
+/// [`DEFAULT_BACKLOG`] bounds retention by message *count*, which does
+/// nothing to stop a room fanning out large payloads from retaining
+/// megabytes per message, times [`DEFAULT_MAX_ROOMS`] rooms. This bounds the
+/// same backlog by total payload bytes as well — whichever limit is hit
+/// first evicts the oldest retained message.
+const DEFAULT_MAX_BACKLOG_BYTES: usize = 64 * 1024;
 
 type Rooms = DashMap<RoomId, RoomEntry>;
 
@@ -73,8 +120,12 @@ struct RoomEntry {
     /// Next version to hand out. Starts at 1, so `since = 0` means "I have
     /// seen nothing" and replays the whole retained backlog.
     next_version: u64,
-    /// Newest-last ring of retained messages, capped at `backlog`.
+    /// Newest-last ring of retained messages, capped at `backlog` messages
+    /// and `max_backlog_bytes` total payload bytes, whichever binds first.
     backlog: VecDeque<RealtimeMessage>,
+    /// Running total of `backlog`'s payload bytes, kept incrementally so
+    /// enforcing `max_backlog_bytes` never has to walk the whole deque.
+    backlog_bytes: usize,
 }
 
 /// Single-node, in-process fan-out hub backed by one `broadcast` channel per
@@ -85,6 +136,7 @@ pub struct InMemoryHub {
     capacity: usize,
     max_rooms: usize,
     backlog: usize,
+    max_backlog_bytes: usize,
 }
 
 impl Default for InMemoryHub {
@@ -114,6 +166,7 @@ impl InMemoryHub {
             capacity: capacity.max(1),
             max_rooms: max_rooms.max(1),
             backlog: DEFAULT_BACKLOG,
+            max_backlog_bytes: DEFAULT_MAX_BACKLOG_BYTES,
         }
     }
 
@@ -123,15 +176,35 @@ impl InMemoryHub {
     /// This is the ceiling on what [`RealtimeSubscriber::subscribe_since`] can
     /// replay: a client that fell further behind than this gets
     /// [`Backlog::Gap`] and has to resync from the app's own read model. Zero
-    /// disables retention.
+    /// disables retention. Retention is also bounded by
+    /// [`with_max_backlog_bytes`](Self::with_max_backlog_bytes) — whichever
+    /// limit a room hits first evicts its oldest retained message.
     pub fn with_backlog(mut self, backlog: usize) -> Self {
         self.backlog = backlog;
+        self
+    }
+
+    /// Sets the ceiling, in bytes, on a room's total retained backlog
+    /// payload.
+    ///
+    /// [`with_backlog`](Self::with_backlog) bounds retention by message
+    /// count, which does nothing to stop a room fanning out large payloads
+    /// from retaining megabytes per message — this bounds the same backlog
+    /// by total payload bytes too. Zero means no message is ever retained,
+    /// same effective outcome as `with_backlog(0)`.
+    pub fn with_max_backlog_bytes(mut self, max_backlog_bytes: usize) -> Self {
+        self.max_backlog_bytes = max_backlog_bytes;
         self
     }
 
     /// How many messages per room are retained for reconnection.
     pub fn backlog(&self) -> usize {
         self.backlog
+    }
+
+    /// The byte ceiling on a room's total retained backlog payload.
+    pub fn max_backlog_bytes(&self) -> usize {
+        self.max_backlog_bytes
     }
 
     /// The number of rooms currently tracked.
@@ -157,10 +230,15 @@ impl InMemoryHub {
         msg.version = entry.next_version;
         entry.next_version += 1;
 
-        if self.backlog > 0 {
+        if self.backlog > 0 && self.max_backlog_bytes > 0 {
+            entry.backlog_bytes += msg.payload.len();
             entry.backlog.push_back(msg.clone());
-            while entry.backlog.len() > self.backlog {
-                entry.backlog.pop_front();
+            while entry.backlog.len() > self.backlog || entry.backlog_bytes > self.max_backlog_bytes
+            {
+                let Some(evicted) = entry.backlog.pop_front() else {
+                    break;
+                };
+                entry.backlog_bytes -= evicted.payload.len();
             }
         }
         Some(entry.sender.clone())
@@ -209,6 +287,7 @@ impl InMemoryHub {
                     subscribers: 1,
                     next_version: 1,
                     backlog: VecDeque::new(),
+                    backlog_bytes: 0,
                 });
                 receiver
             }
