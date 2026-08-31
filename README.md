@@ -126,8 +126,9 @@ file — while keeping the application's own logging and tracing wired.
 Most applications should start with the `pharos` facade and import from its prelude:
 
 > Pharos RS is not published to crates.io (every crate sets `publish = false`)
-> and is currently at 0.4.0, pre-1.0. Depend on it by git revision and pin a
-> commit — there is no semver resolution or docs.rs to fall back on.
+> and is currently at 0.5.0, pre-1.0. Depend on it by git revision and pin a
+> commit — there is no semver resolution or docs.rs to fall back on. Coming
+> from 0.4? See the [migration guide](docs/guide/migrating-0.4-to-0.5.md).
 
 ```toml
 pharos = { git = "https://github.com/lisboaigor/pharos-rs", rev = "<commit>", features = ["macros"] }

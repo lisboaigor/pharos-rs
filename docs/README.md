@@ -28,6 +28,7 @@ This folder is the canonical documentation entrypoint for contributors and adopt
 - `guide/jsonb-schema-rollback.md`: rollback playbook for JSONB payload changes.
 - `guide/benchmarks.md`: benchmark baseline and interpretation.
 - `guide/ergonomics-review.md`: ergonomics assessment with recommendations.
+- `guide/migrating-0.4-to-0.5.md`: what broke going to 0.5.0 and how to update.
 
 ## Architecture Decisions
 
