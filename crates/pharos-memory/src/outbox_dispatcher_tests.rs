@@ -164,4 +164,68 @@ mod tests {
         assert_eq!(per_key("order-2"), vec![b"x".to_vec(), b"y".to_vec()]);
         Ok(())
     }
+
+    /// Fails every publish whose payload is in `poison`, succeeds (and
+    /// records) every other one.
+    struct FailOnPayloadPublisher {
+        poison: std::collections::HashSet<Vec<u8>>,
+        seen: std::sync::Mutex<Vec<(Option<String>, Vec<u8>)>>,
+    }
+
+    impl MessagePublisher for FailOnPayloadPublisher {
+        async fn publish(&self, message: Message) -> Result<(), MessagingError> {
+            if self.poison.contains(&message.payload) {
+                return Err(MessagingError::publish(std::io::Error::other(
+                    "broker down for this message",
+                )));
+            }
+            let Ok(mut seen) = self.seen.lock() else {
+                panic!("recording publisher mutex poisoned");
+            };
+            seen.push((message.key.clone(), message.payload.clone()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_blocks_the_rest_of_its_lane_head_of_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = InMemoryOutboxRepository::new();
+        // "order-1"'s first message ("a") always fails to publish; "b" and
+        // "c" would succeed if attempted. A key-less lane ("order-2" here is
+        // its own single-message lane) must be unaffected.
+        for (key, payload) in [
+            ("order-1", b"a".to_vec()),
+            ("order-1", b"b".to_vec()),
+            ("order-1", b"c".to_vec()),
+            ("order-2", b"x".to_vec()),
+        ] {
+            repo.insert(OutboxMessage::new(
+                Message::new("orders", payload, "text/plain").with_key(key),
+            ))
+            .await?;
+        }
+
+        let publisher = std::sync::Arc::new(FailOnPayloadPublisher {
+            poison: std::collections::HashSet::from([b"a".to_vec()]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        // A generous retry budget: if head-of-line blocking did not hold,
+        // "b" and "c" would still publish (out of order) in this same run.
+        let config = DispatchConfig::new(10, RetryPolicy::new(5, Duration::from_secs(60)))
+            .with_concurrency(8);
+        let dispatcher =
+            OutboxDispatcher::with_config(repo, std::sync::Arc::clone(&publisher), config);
+
+        let result = dispatcher.dispatch_batch().await;
+        // Only "order-2"'s message publishes; "order-1"'s lane stops dead at
+        // its first (failing) message.
+        assert_eq!(result.published, 1);
+
+        let Ok(seen) = publisher.seen.lock() else {
+            panic!("recording publisher mutex poisoned");
+        };
+        assert_eq!(*seen, vec![(Some("order-2".to_string()), b"x".to_vec())]);
+        Ok(())
+    }
 }

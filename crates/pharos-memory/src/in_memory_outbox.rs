@@ -55,7 +55,9 @@ impl OutboxRepository for InMemoryOutboxRepository {
                 })
                 .map(|entry| entry.value().clone())
                 .collect();
-            messages.sort_by_key(|message| message.created_at);
+            // `id` (UUID v7) tie-breaks `created_at`: two messages inserted
+            // in the same tick would otherwise have no deterministic order.
+            messages.sort_by_key(|message| (message.created_at, message.id));
             messages.truncate(limit);
             Ok(messages)
         }
@@ -113,7 +115,9 @@ impl OutboxRepository for InMemoryOutboxRepository {
                 .filter(|entry| entry.status == OutboxStatus::Failed)
                 .map(|entry| entry.value().clone())
                 .collect();
-            messages.sort_by_key(|message| message.created_at);
+            // `id` (UUID v7) tie-breaks `created_at`: two messages inserted
+            // in the same tick would otherwise have no deterministic order.
+            messages.sort_by_key(|message| (message.created_at, message.id));
             messages.truncate(limit);
             Ok(messages)
         }

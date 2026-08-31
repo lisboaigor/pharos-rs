@@ -53,6 +53,18 @@ pub const APPLICATION_PROTOBUF: &str = "application/x-protobuf";
 /// assert_eq!(roundtrip.payload.order_id, "ord-1");
 /// ```
 ///
+/// # No upcasting
+///
+/// `schema_version` round-trips through the envelope (`envelope.rs`) but
+/// nothing here reads it to transform an old payload shape into a new one:
+/// unlike [`JsonEventSerializer`], which can be paired with a
+/// `JsonUpcasterRegistry`/`VersionedJsonCodec` to chain versions, there is no
+/// equivalent upcasting hook for the Protobuf path. Evolving a `P` payload's
+/// wire shape across versions is left entirely to Protobuf's own
+/// field-numbering compatibility rules (only add optional fields, never
+/// renumber or change a field's type) — there is no framework-level fallback
+/// if that discipline slips.
+///
 /// [`JsonEventSerializer`]: pharos_app::serialization::JsonEventSerializer
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProtobufEventSerializer;
