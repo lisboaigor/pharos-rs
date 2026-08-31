@@ -11,7 +11,7 @@ use std::str::from_utf8;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pharos_app::{
+use pharos_messaging::{
     Delivery, EventSchema, Message, MessageAcknowledger, MessageConsumer, MessagePublisher,
     MessagingError, SchemaRegistry, SchemaRegistryError,
 };
@@ -39,6 +39,17 @@ impl KafkaPublisher {
             producer,
             queue_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Builds a `FutureProducer` from a `bootstrap.servers` string and wraps
+    /// it. Convenience for the common case; construct the `FutureProducer`
+    /// yourself (via `rdkafka::ClientConfig`) and use [`Self::new`] for any
+    /// setting beyond the broker list — TLS, SASL, compression, batching.
+    pub fn from_bootstrap_servers(brokers: &str) -> Result<Self, rdkafka::error::KafkaError> {
+        let producer: FutureProducer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .create()?;
+        Ok(Self::new(producer))
     }
 
     /// Uses a custom queue timeout for `FutureProducer::send`.
@@ -387,20 +398,29 @@ fn registry_http_client() -> reqwest::Client {
 }
 
 /// Confluent-compatible schema registry client.
+///
+/// `basic_auth` is wrapped in [`Secret`](pharos_core::Secret) — a Confluent
+/// Cloud API key/secret pair — so the derived `Debug` redacts it
+/// automatically instead of printing it in cleartext to whatever logs or
+/// captures this struct (a tracing field on application state, a
+/// `Debug`-formatted error context).
 #[derive(Debug, Clone)]
 pub struct ConfluentSchemaRegistry {
     client: reqwest::Client,
     base_url: String,
-    basic_auth: Option<(String, String)>,
+    basic_auth: Option<pharos_core::Secret<(String, String)>>,
 }
 
 /// Apicurio Registry client.
+///
+/// See [`ConfluentSchemaRegistry`]: `basic_auth` is a [`Secret`](pharos_core::Secret)
+/// for the same reason.
 #[derive(Debug, Clone)]
 pub struct ApicurioSchemaRegistry {
     client: reqwest::Client,
     base_url: String,
     group: String,
-    basic_auth: Option<(String, String)>,
+    basic_auth: Option<pharos_core::Secret<(String, String)>>,
 }
 
 impl ApicurioSchemaRegistry {
@@ -425,7 +445,7 @@ impl ApicurioSchemaRegistry {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        self.basic_auth = Some((username.into(), password.into()));
+        self.basic_auth = Some(pharos_core::Secret::new((username.into(), password.into())));
         self
     }
 
@@ -437,7 +457,10 @@ impl ApicurioSchemaRegistry {
 
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.basic_auth {
-            Some((user, password)) => request.basic_auth(user, Some(password)),
+            Some(secret) => {
+                let (user, password) = secret.expose();
+                request.basic_auth(user, Some(password))
+            }
             None => request,
         }
     }
@@ -469,7 +492,7 @@ impl ConfluentSchemaRegistry {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        self.basic_auth = Some((username.into(), password.into()));
+        self.basic_auth = Some(pharos_core::Secret::new((username.into(), password.into())));
         self
     }
 
@@ -481,7 +504,10 @@ impl ConfluentSchemaRegistry {
 
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.basic_auth {
-            Some((user, password)) => request.basic_auth(user, Some(password)),
+            Some(secret) => {
+                let (user, password) = secret.expose();
+                request.basic_auth(user, Some(password))
+            }
             None => request,
         }
     }

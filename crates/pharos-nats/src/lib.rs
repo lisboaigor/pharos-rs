@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use async_nats::{HeaderMap, HeaderValue, Subscriber};
 use futures::StreamExt;
-use pharos_app::{
+use pharos_messaging::{
     Delivery, Message, MessageAcknowledger, MessageConsumer, MessagePublisher, MessagingError,
 };
 use tracing::{Instrument, info_span};
@@ -28,6 +28,18 @@ impl NatsPublisher {
 }
 
 impl MessagePublisher for NatsPublisher {
+    /// Publishes to core NATS and waits for [`Client::flush`] to confirm the
+    /// server received it.
+    ///
+    /// `client.publish` on its own only enqueues onto an internal `mpsc`
+    /// buffer and returns as soon as that enqueue succeeds — with the server
+    /// unreachable, this still returns `Ok(())`, the outbox dispatcher marks
+    /// the message published, and it is gone for good: at-most-once, not the
+    /// at-least-once every other adapter in this crate family gives. `flush`
+    /// forces a round trip to the server before this function returns, so a
+    /// downed server surfaces here as an error instead of a silent drop.
+    ///
+    /// [`Client::flush`]: async_nats::Client::flush
     async fn publish(&self, message: Message) -> Result<(), MessagingError> {
         let span_topic = message.topic.clone();
         async move {
@@ -48,6 +60,8 @@ impl MessagePublisher for NatsPublisher {
                     .await
                     .map_err(MessagingError::publish)?;
             }
+
+            self.client.flush().await.map_err(MessagingError::publish)?;
 
             metrics::counter!("pharos.nats.messages.published", "topic" => topic).increment(1);
             Ok(())
