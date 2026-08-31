@@ -32,6 +32,15 @@ pub enum MoneyError {
     /// An allocation was requested over zero parts.
     #[error("cannot allocate money over zero parts")]
     InvalidAllocation,
+    /// An allocation was requested over more parts than
+    /// [`Money::MAX_ALLOCATION_PARTS`] allows.
+    #[error("cannot allocate money over {parts} parts, over the {max}-part limit")]
+    TooManyParts {
+        /// The requested part count.
+        parts: usize,
+        /// [`Money::MAX_ALLOCATION_PARTS`].
+        max: usize,
+    },
 }
 
 /// A currency identified by an uppercase code and a minor-unit exponent.
@@ -229,22 +238,41 @@ impl Money {
         Ok(Self::new(amount, self.currency.clone()))
     }
 
+    /// Ceiling on [`Self::allocate`]'s `parts` argument.
+    ///
+    /// `parts` routinely comes straight from request input (an installment
+    /// count, a number of payees) with no natural upper bound of its own,
+    /// and `allocate` builds one [`Money`] per part: a caller-supplied
+    /// `parts` in the millions turns an ordinary field into a
+    /// multi-gigabyte allocation inside the domain layer, and an
+    /// allocation failure in Rust aborts the process rather than returning
+    /// an error. Ten thousand comfortably covers every legitimate use
+    /// (installment plans, payout splits, revenue-share fan-out) with
+    /// headroom to spare.
+    pub const MAX_ALLOCATION_PARTS: usize = 10_000;
+
     /// Splits the amount into `parts` shares that sum exactly to the
     /// original: no minor unit is created or lost. The remainder is spread
     /// one unit at a time over the first shares, so shares differ by at most
     /// one minor unit.
+    ///
+    /// `Money` is one instance of this pattern (integer + scale + checked
+    /// arithmetic), not a special case — the algorithm itself lives in
+    /// [`crate::allocate_minor_units`] and works for any `i128` minor-unit
+    /// quantity, not just money.
+    ///
+    /// Rejects `parts == 0` and `parts` over [`Self::MAX_ALLOCATION_PARTS`].
     pub fn allocate(&self, parts: usize) -> Result<Vec<Self>, MoneyError> {
-        if parts == 0 {
-            return Err(MoneyError::InvalidAllocation);
-        }
-        let parts_i128 = parts as i128;
-        let base = self.amount.div_euclid(parts_i128);
-        let remainder = self.amount.rem_euclid(parts_i128);
-        Ok((0..parts_i128)
-            .map(|index| {
-                let extra = i128::from(index < remainder);
-                Self::new(base + extra, self.currency.clone())
-            })
+        let shares = crate::allocate_minor_units(self.amount, parts, Self::MAX_ALLOCATION_PARTS)
+            .map_err(|error| match error {
+                crate::AllocationError::InvalidAllocation => MoneyError::InvalidAllocation,
+                crate::AllocationError::TooManyParts { parts, max } => {
+                    MoneyError::TooManyParts { parts, max }
+                }
+            })?;
+        Ok(shares
+            .into_iter()
+            .map(|amount| Self::new(amount, self.currency.clone()))
             .collect())
     }
 }
