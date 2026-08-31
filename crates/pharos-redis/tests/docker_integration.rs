@@ -1,4 +1,4 @@
-use pharos_app::{Message, MessageAcknowledger, MessageConsumer, MessagePublisher};
+use pharos_messaging::{Message, MessageAcknowledger, MessageConsumer, MessagePublisher};
 use pharos_redis::RedisMessageBroker;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::{ContainerAsync, GenericImage, runners::AsyncRunner};

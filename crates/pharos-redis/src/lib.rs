@@ -17,9 +17,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use pharos_app::{
+use pharos_messaging::{
     Delivery, Message, MessageAcknowledger, MessageConsumer, MessagePublisher, MessagingError,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,14 @@ use uuid::Uuid;
 /// Suffix appended to a topic name to form its processing list key.
 pub const PROCESSING_SUFFIX: &str = ":processing";
 
+/// Default ceiling on [`RedisMessageBroker`]'s in-process `in_flight` cache.
+/// See [`RedisMessageBroker::with_max_in_flight`].
+const DEFAULT_MAX_IN_FLIGHT: usize = 100_000;
+
+/// Default age past which an `in_flight` entry is treated as stale.
+/// See [`RedisMessageBroker::with_in_flight_ttl`].
+const DEFAULT_IN_FLIGHT_TTL: Duration = Duration::from_secs(3600);
+
 /// Redis list-backed implementation of the messaging traits.
 ///
 /// In-flight deliveries are tracked in process memory (message id → raw list
@@ -36,10 +45,24 @@ pub const PROCESSING_SUFFIX: &str = ":processing";
 /// list. Acknowledge deliveries from the same broker instance that consumed
 /// them; entries orphaned by a crash are reclaimed with
 /// [`recover_processing`](Self::recover_processing).
+///
+/// The cache is bounded ([`DEFAULT_MAX_IN_FLIGHT`] entries,
+/// [`DEFAULT_IN_FLIGHT_TTL`] age — override with
+/// [`with_max_in_flight`](Self::with_max_in_flight) /
+/// [`with_in_flight_ttl`](Self::with_in_flight_ttl)): a delivery whose
+/// handler never calls `ack`/`nack` (a bug, a panic, a message a consumer
+/// silently drops) would otherwise sit in this map for the life of the
+/// process, growing it without bound. An entry that ages out or is evicted
+/// to stay under the cap is not lost — `remove_in_flight` already falls back
+/// to re-encoding the delivery when its cache entry is missing — so bounding
+/// this cache only ever costs a re-encode on a rare, already-abnormal path,
+/// never correctness.
 #[derive(Debug, Clone)]
 pub struct RedisMessageBroker {
     client: redis::Client,
-    in_flight: Arc<DashMap<Uuid, String>>,
+    in_flight: Arc<DashMap<Uuid, (String, Instant)>>,
+    max_in_flight: usize,
+    in_flight_ttl: Duration,
 }
 
 impl RedisMessageBroker {
@@ -48,12 +71,34 @@ impl RedisMessageBroker {
         Self {
             client,
             in_flight: Arc::new(DashMap::new()),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            in_flight_ttl: DEFAULT_IN_FLIGHT_TTL,
         }
     }
 
     /// Creates a Redis broker from a Redis URL.
     pub fn from_url(url: &str) -> Result<Self, redis::RedisError> {
         Ok(Self::new(redis::Client::open(url)?))
+    }
+
+    /// Overrides the entry ceiling on the `in_flight` cache
+    /// ([`DEFAULT_MAX_IN_FLIGHT`] by default).
+    pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = max_in_flight;
+        self
+    }
+
+    /// Overrides the age past which an `in_flight` entry is swept as stale
+    /// ([`DEFAULT_IN_FLIGHT_TTL`] by default).
+    pub fn with_in_flight_ttl(mut self, in_flight_ttl: Duration) -> Self {
+        self.in_flight_ttl = in_flight_ttl;
+        self
+    }
+
+    /// Number of entries currently cached in `in_flight`. Exposed for tests
+    /// and diagnostics.
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Returns the underlying Redis client.
@@ -114,6 +159,31 @@ impl RedisMessageBroker {
         self.client.get_multiplexed_async_connection().await
     }
 
+    /// Caches a delivery's raw entry, keeping `in_flight` bounded.
+    ///
+    /// Sweeps entries older than `in_flight_ttl` first; if the cache is
+    /// still at `max_in_flight` afterward, the new entry is simply not
+    /// cached rather than growing the map further — `remove_in_flight`'s
+    /// re-encode fallback covers an uncached entry, so this never loses
+    /// correctness, only a small amount of work on an already-rare path.
+    fn cache_in_flight(&self, message_id: Uuid, raw: String) {
+        if self.in_flight.len() >= self.max_in_flight {
+            let now = Instant::now();
+            self.in_flight.retain(|_, (_, inserted_at)| {
+                now.duration_since(*inserted_at) < self.in_flight_ttl
+            });
+        }
+        if self.in_flight.len() < self.max_in_flight {
+            self.in_flight.insert(message_id, (raw, Instant::now()));
+        } else {
+            tracing::warn!(
+                max_in_flight = self.max_in_flight,
+                "in_flight cache at capacity even after sweeping stale entries; \
+                 not caching this delivery (ack/nack will re-encode it instead)"
+            );
+        }
+    }
+
     /// Removes a delivery's raw entry from its topic's processing list.
     async fn remove_in_flight(
         &self,
@@ -125,7 +195,7 @@ impl RedisMessageBroker {
         // (works as long as the entry was written by this adapter, whose
         // encoding is deterministic).
         let raw = match self.in_flight.remove(&delivery.message.message_id) {
-            Some((_, raw)) => raw,
+            Some((_, (raw, _))) => raw,
             None => serde_json::to_string(&WireDelivery::from(delivery.clone()))
                 .map_err(|error| map_err(Box::new(error)))?,
         };
@@ -189,7 +259,7 @@ impl MessageConsumer for RedisMessageBroker {
                     let delivery = serde_json::from_str::<WireDelivery>(&raw)
                         .map(Delivery::from)
                         .map_err(MessagingError::consume)?;
-                    self.in_flight.insert(delivery.message.message_id, raw);
+                    self.cache_in_flight(delivery.message.message_id, raw);
                     Ok::<_, MessagingError>(delivery)
                 })
                 .transpose()?;
@@ -310,5 +380,59 @@ impl From<WireMessage> for Message {
             payload: value.payload,
             content_type: value.content_type,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `redis::Client::open` only parses/validates the URL — it does not
+    // connect — so these tests exercise the `in_flight` cache's bounding
+    // logic without a live Redis server.
+    fn broker() -> RedisMessageBroker {
+        RedisMessageBroker::new(redis::Client::open("redis://127.0.0.1:0").expect("URL parses"))
+    }
+
+    #[test]
+    fn caches_entries_up_to_the_configured_cap() {
+        let broker = broker().with_max_in_flight(3);
+        for _ in 0..3 {
+            broker.cache_in_flight(Uuid::now_v7(), "raw".to_string());
+        }
+        assert_eq!(broker.in_flight_len(), 3);
+
+        // A fourth entry, with no stale entries to sweep, is not cached —
+        // the cache stays bounded instead of growing past the cap.
+        broker.cache_in_flight(Uuid::now_v7(), "raw".to_string());
+        assert_eq!(broker.in_flight_len(), 3);
+    }
+
+    #[test]
+    fn sweeps_ttl_expired_entries_to_make_room() {
+        let broker = broker()
+            .with_max_in_flight(2)
+            .with_in_flight_ttl(Duration::from_millis(1));
+        broker.cache_in_flight(Uuid::now_v7(), "old-1".to_string());
+        broker.cache_in_flight(Uuid::now_v7(), "old-2".to_string());
+        assert_eq!(broker.in_flight_len(), 2);
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // At capacity, but both entries are past the 1ms TTL: the sweep
+        // clears them, and the new entry is cached.
+        broker.cache_in_flight(Uuid::now_v7(), "new".to_string());
+        assert_eq!(broker.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn a_zero_cap_never_caches_anything() {
+        // The precondition `remove_in_flight`'s re-encode fallback exists
+        // for: with the cap at zero, nothing is ever cached, so every
+        // ack/nack must take the fallback path — exercised end-to-end
+        // against a live server in `tests/docker_integration.rs`.
+        let broker = broker().with_max_in_flight(0);
+        broker.cache_in_flight(Uuid::now_v7(), "raw".to_string());
+        assert_eq!(broker.in_flight_len(), 0);
     }
 }

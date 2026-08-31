@@ -9,7 +9,7 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Redis messaging adapter for Pharos RS."
 
 [dependencies]
-pharos-app = { path = "../pharos-app", version = "0.4.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.4.0" }
 
 dashmap     = { workspace = true }
 metrics     = { workspace = true }
