@@ -1,11 +1,11 @@
 use order::domain::order::{Order, OrderStatus};
 use order::domain::value_objects::{CustomerId, Money, Quantity};
 use order::infrastructure::PostgresOrderRepository;
-use pharos_app::{Message, OutboxRepository, OutboxStatus};
+use pharos_app::{Message, OutboxRepository, OutboxStatus, save_and_enqueue_in};
 use pharos_core::{AggregateRoot, DomainEvent, Entity, Repository};
 use pharos_postgres::{
-    Pool, PostgresOutboxRepository, connect_pool, migrate_postgres_eventing_schema,
-    save_and_enqueue_in,
+    Pool, PostgresOutboxRepository, PostgresUnitOfWork, connect_pool,
+    migrate_postgres_eventing_schema,
 };
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, runners::AsyncRunner};
@@ -75,6 +75,7 @@ async fn save_and_enqueue_in_commits_relational_rows_and_outbox_atomically() -> 
     repo.migrate().await?;
     migrate_postgres_eventing_schema(&pool).await?;
     let outbox = PostgresOutboxRepository::new(pool.clone());
+    let store = PostgresUnitOfWork::new(pool.clone());
 
     let mut order = Order::create(CustomerId::new())?;
     let order_id = *order.id();
@@ -87,7 +88,7 @@ async fn save_and_enqueue_in_commits_relational_rows_and_outbox_atomically() -> 
     let event_count = order.pending_events().len();
     assert_eq!(event_count, 3);
 
-    save_and_enqueue_in(&pool, &repo, &mut order, |event| {
+    save_and_enqueue_in(&store, &repo, &mut order, |event| {
         Message::new(
             "order-events",
             event.aggregate_id().as_bytes().to_vec(),
@@ -115,7 +116,7 @@ async fn save_and_enqueue_in_commits_relational_rows_and_outbox_atomically() -> 
     let mut stale = loaded;
     stale.set_version(0);
     stale.cancel("simulated staleness".to_string())?;
-    let result = save_and_enqueue_in(&pool, &repo, &mut stale, |event| {
+    let result = save_and_enqueue_in(&store, &repo, &mut stale, |event| {
         Message::new("order-events", Vec::new(), "application/json").with_key(event.aggregate_id())
     })
     .await;

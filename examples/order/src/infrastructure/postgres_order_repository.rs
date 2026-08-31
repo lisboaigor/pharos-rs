@@ -1,7 +1,6 @@
+use pharos_app::TransactionalRepository;
 use pharos_core::{AggregateRoot, Entity, Repository, RepositoryError};
-use pharos_postgres::Pool;
-use pharos_postgres::TransactionalRepository;
-use sqlx::PgConnection;
+use pharos_postgres::{Pool, PostgresUnitOfWork};
 use sqlx::{Row, postgres::PgRow};
 use thiserror::Error;
 use uuid::Uuid;
@@ -74,18 +73,21 @@ fn storage_error(error: impl std::fmt::Display) -> PostgresOrderRepositoryError 
     PostgresOrderRepositoryError::Storage(error.to_string())
 }
 
-impl TransactionalRepository<Order> for PostgresOrderRepository {
+impl TransactionalRepository<Order, PostgresUnitOfWork> for PostgresOrderRepository {
     type Error = PostgresOrderRepositoryError;
 
     /// Persists the order's normalized rows inside the caller's transaction.
     ///
     /// Same OCC contract as `Repository::save`; the caller owns commit and
     /// rollback (and reverts the in-memory version if the transaction fails).
-    async fn save_in_tx(
-        &self,
-        conn: &mut PgConnection,
-        aggregate: &mut Order,
-    ) -> Result<(), RepositoryError<Self::Error>> {
+    async fn save_in_tx<'c, 'g>(
+        &'c self,
+        conn: &'c mut <PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        aggregate: &'c mut Order,
+    ) -> Result<(), RepositoryError<Self::Error>>
+    where
+        'g: 'c,
+    {
         let expected = aggregate.version();
         let new_version = expected + 1;
         let status = status_to_str(aggregate.status());
@@ -101,7 +103,7 @@ impl TransactionalRepository<Order> for PostgresOrderRepository {
             .bind(aggregate.customer_id().as_uuid())
             .bind(status)
             .bind(new_version as i64)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
         } else {
             sqlx::query(
@@ -114,7 +116,7 @@ impl TransactionalRepository<Order> for PostgresOrderRepository {
             .bind(status)
             .bind(new_version as i64)
             .bind(expected as i64)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
         }
         .map_err(|e| RepositoryError::Storage(storage_error(e)))?
@@ -123,7 +125,7 @@ impl TransactionalRepository<Order> for PostgresOrderRepository {
         if affected == 0 {
             let actual = sqlx::query_scalar::<_, i64>("SELECT version FROM orders WHERE id = $1")
                 .bind(order_id)
-                .fetch_optional(&mut *conn)
+                .fetch_optional(&mut **conn)
                 .await
                 .map_err(|e| RepositoryError::Storage(storage_error(e)))?
                 .map(|v| v as u64);
@@ -132,7 +134,7 @@ impl TransactionalRepository<Order> for PostgresOrderRepository {
 
         sqlx::query("DELETE FROM order_items WHERE order_id = $1")
             .bind(order_id)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
             .map_err(|e| RepositoryError::Storage(storage_error(e)))?;
 
@@ -164,7 +166,7 @@ impl TransactionalRepository<Order> for PostgresOrderRepository {
             .bind(quantity)
             .bind(unit_price_cents)
             .bind(pos)
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await
             .map_err(|e| RepositoryError::Storage(storage_error(e)))?;
         }
