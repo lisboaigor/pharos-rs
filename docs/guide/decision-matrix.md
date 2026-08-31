@@ -40,14 +40,21 @@ This is the choice that most often trips up first-time users.
 
 | You need…                                                         | Use                                             |
 | ----------------------------------------------------------------- | ----------------------------------------------- |
-| Every handler runs in **this** process, same transaction window   | `save_and_publish`                              |
-| Events must survive a crash and reach **another** process/service | `save_and_enqueue` + `OutboxDispatcher`         |
-| Atomic aggregate-state + outbox write in one DB transaction       | `pharos::postgres` `save_aggregate_and_enqueue` |
+| Every handler runs in **this** process, same transaction window        | `save_and_publish`                              |
+| Events must survive a crash and reach **another** process/service      | `pharos::postgres` `save_aggregate_and_enqueue` |
+| You can tolerate losing an event on a crash between save and enqueue   | `save_and_enqueue` + `OutboxDispatcher`         |
 
 Rule of thumb: use `save_and_publish` until a second deployable unit needs the
 events. Then switch to the outbox — never publish to a broker directly from a
 command handler, or a crash between "commit" and "publish" silently loses
 events.
+
+`save_and_enqueue` (`pharos-app`) writes the aggregate and the outbox row as
+**two separate statements**, not one transaction: if the process dies between
+them, the event is lost for good. Only `save_aggregate_and_enqueue`
+(`pharos::postgres`) wraps both in a single `BEGIN…COMMIT` and is safe against
+that crash window. This atomic path is currently PostgreSQL-only — see
+[Persistence](#persistence).
 
 ```mermaid
 flowchart TD

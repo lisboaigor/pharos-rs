@@ -128,8 +128,31 @@ are never touched.
 ## Metrics the framework emits
 
 Beyond the HTTP series, `pharos-app` and the adapters count their own work
-through the `metrics` facade: `pharos.events.published`,
-`pharos.postgres.outbox.inserted`, and the retry and circuit-breaker counters in
-`pharos_app::resilience`. Install any `metrics` exporter to collect them; they
-are separate from the `prometheus-client` registry `pharos-axum` uses, which
-exists because that ecosystem has no exemplar support.
+(~60 call sites across the outbox, inbox, saga, DLQ and broker adapters,
+including `pharos.events.published`, `pharos.postgres.outbox.inserted`, and
+the retry and circuit-breaker counters in `pharos_app::resilience`) through
+the `metrics` facade crate. This is a **separate** stack from the
+`prometheus-client` registry `pharos-axum` uses for the HTTP series (that
+registry exists because the `prometheus-client` ecosystem has no exemplar
+support) — the two do not share a scrape endpoint or a Grafana panel.
+
+**By default, none of this is collected.** The `metrics` facade degrades to a
+silent no-op recorder until a process installs one; `pharos_observability::init`
+does not install one, `pharos-init`'s generated projects do not either, and the
+Grafana dashboards `pharos-init` provisions have no panel querying a
+`pharos_*` series — they only cover the HTTP metrics. Every outbox, inbox,
+saga, DLQ and broker counter is silently discarded until you opt in.
+
+To collect them, install a `metrics` exporter once at process start, for
+example [`metrics-exporter-prometheus`](https://docs.rs/metrics-exporter-prometheus):
+
+```rust
+metrics_exporter_prometheus::PrometheusBuilder::new()
+    .install()
+    .expect("failed to install Prometheus metrics recorder");
+```
+
+Do this before any `metrics::counter!`/`histogram!`/`gauge!` call runs, and
+before or alongside `pharos_observability::init`. This recorder exposes its
+own scrape target, independent of `pharos_axum::metrics`'s `/metrics` route —
+scrape both if you want both series.

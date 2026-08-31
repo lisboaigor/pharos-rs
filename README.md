@@ -14,7 +14,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Command/query handlers with validation + tracing applied by the `dispatch` seam
 - Internal-only commands (`#[command(internal)]`): the HTTP entry points refuse to route them, keeping saga-issued payouts/refunds off the wire while in-process dispatch still works
 - Repository abstraction with optimistic concurrency control
-- Atomic aggregate save + outbox in one transaction (`TransactionalRepository` / `save_and_enqueue_in`)
+- Atomic aggregate save + outbox in one transaction (`pharos_app::{TransactionalStore, TransactionalRepository, save_and_enqueue_in}`) — backend-agnostic (the trait and the composing function never name a concrete connection type), though `pharos-postgres`'s `PostgresUnitOfWork` is the only `TransactionalStore` implementation today; other adapters only offer the non-atomic `save_and_enqueue`
 - In-process domain event bus with configurable error policy, retry, and dead-letter decorators
 - Integration event envelope with typed correlation/causation, tenant, trace and schema metadata
 - Schema evolution through JSON upcasters (`VersionedJsonCodec`)
@@ -22,7 +22,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Idempotent consumers in one call (`process_idempotent`)
 - Durable event sourcing and sagas on PostgreSQL (`PgEventStore`, `PgSnapshotStore`, `PgSagaStore`)
 - Saga deadlines: schedule timeouts on `Start`/`Advance` and sweep them with `SagaRunner::run_due_timeouts`
-- Saga compensation on failure: `SagaTransition::Fail` carries follow-up `commands`, dispatched like a `Complete`'s — refund an escrow or release a reservation atomically with the terminal transition
+- Saga compensation on failure: `SagaTransition::Fail` carries follow-up `commands`, dispatched right after the terminal transition is saved — the save and the dispatch are two separate steps, not one transaction, so a crash between them leaves the saga `Failed` with its compensating commands undispatched
 - Cross-context sagas: `SagaRunner::handle_any` folds events from several bounded contexts into one saga instance without changing the `Saga` trait
 - Tower as the cross-cutting pipeline seam (timeouts, limits, authorization)
 - Observability with `tracing` spans and `metrics` counters throughout
@@ -112,17 +112,25 @@ You will be asked:
 From those answers `pharos-init` derives persistence, event delivery, broker, serialization format, and HTTP layer automatically, and generates a ready-to-build project.
 
 It also writes the infrastructure to run it: a Dockerfile, a compose file, and a
-configured observability stack — Prometheus, Grafana, Loki, Tempo, Alloy — with
-metrics, logs and traces already joined by a shared trace id. See
-[the observability guide](docs/guide/observability.md); `pharos-init
+configured observability stack — Prometheus, Grafana, Loki, Tempo, Alloy,
+Telegraf, behind a read-only `docker-socket-proxy` (never a raw Docker-socket
+mount) — with metrics, logs and traces already joined by a shared trace id.
+See [the observability guide](docs/guide/observability.md); `pharos-init
 observability --update` refreshes those files as the framework fixes them.
+Pass `--minimal` (`pharos-init --minimal`) to skip that stack entirely — eight
+fewer containers, no Docker-socket access anywhere in the generated compose
+file — while keeping the application's own logging and tracing wired.
 
 ### Manual setup
 
 Most applications should start with the `pharos` facade and import from its prelude:
 
+> Pharos RS is not published to crates.io (every crate sets `publish = false`)
+> and is currently at 0.4.0, pre-1.0. Depend on it by git revision and pin a
+> commit — there is no semver resolution or docs.rs to fall back on.
+
 ```toml
-pharos = { package = "pharos-rs", version = "0.1", features = ["macros"] }
+pharos = { git = "https://github.com/lisboaigor/pharos-rs", rev = "<commit>", features = ["macros"] }
 ```
 
 ```rust

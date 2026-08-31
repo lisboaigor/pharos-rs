@@ -126,7 +126,7 @@ In production, replace the in-memory outbox with `PostgresOutboxRepository` and 
 ## 6. Next steps
 
 - Use `TenantContext` + `TenantJsonRepository` when the service is multi-tenant.
-- Use `save_and_enqueue_in` (works for the JSONB repository and for explicit relational repositories via `TransactionalRepository`) when aggregate save and outbox insert must commit atomically — see the [persistence ladder](persistence-ladder.md).
+- Use `pharos_app::save_and_enqueue_in` (works for the JSONB repository and for explicit relational repositories via `TransactionalRepository`, against any backend implementing `TransactionalStore` — `pharos-postgres`'s `PostgresUnitOfWork` today) when aggregate save and outbox insert must commit atomically — see the [persistence ladder](persistence-ladder.md).
 - Use `pharos-axum` to expose handlers over HTTP with Axum.
 - Use `pharos-saga` when an event should drive a long-lived workflow.
 - Use `pharos-es` if the aggregate should be rehydrated from an event stream instead of a current-state row.

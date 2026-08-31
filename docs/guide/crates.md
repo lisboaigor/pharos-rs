@@ -131,8 +131,8 @@ adapter:
 | `PostgresDeadLetterQueue`                            | PostgreSQL         | `DeadLetterQueue`                                                                |
 | `PostgresJsonRepository<A>`                          | PostgreSQL JSONB   | `Repository<A>`                                                                  |
 | `TenantJsonRepository<A>`                            | PostgreSQL JSONB   | multi-tenant `Repository<A>`                                                     |
-| `PostgresUnitOfWork`                                 | PostgreSQL         | transactional boundary (`transaction(                                            | conn | ...)`) |
-| `TransactionalRepository<A>` + `save_and_enqueue_in` | PostgreSQL         | atomic aggregate save + outbox for any repository (JSONB or explicit relational) |
+| `PostgresUnitOfWork`                                 | PostgreSQL         | closure-based transactional boundary (`transaction(                                            | conn | ...)`), and `pharos_app::TransactionalStore` (`Tx<'a> = sqlx::Transaction<'a, Postgres>`) |
+| `pharos_app::{TransactionalRepository, save_and_enqueue_in}` | any `TransactionalStore` (only PostgreSQL today) | atomic aggregate save + outbox for any repository (JSONB or explicit relational), against any backend — the trait and the composing function never name a concrete connection type |
 | `PgEventStore<I, E>` / `PgSnapshotStore<I, S>`       | PostgreSQL JSONB   | `EventStore` / `SnapshotStore` (`pharos-es`) with PK-arbitrated OCC on append    |
 | `PgSagaStore<I, S>`                                  | PostgreSQL JSONB   | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`); `claim_due` uses `FOR UPDATE SKIP LOCKED` + lease over a partial index, so timeout sweeps scale horizontally |
 
