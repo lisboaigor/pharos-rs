@@ -616,12 +616,26 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
     let handler_construction = handler_construction(cfg, &agg);
     let dispatcher_setup = outbox_dispatcher_setup(cfg);
 
+    // `{agg}` (the aggregate type) is only referenced by name in this file
+    // through `repo_expression`'s `<{agg}>` turbofish, which
+    // `handler_construction` calls for every `EventDelivery` except
+    // `AtomicOutbox` (its handler takes the pool directly and builds its own
+    // repository internally). Importing it unconditionally left `main.rs`
+    // with a genuinely unused import under `AtomicOutbox` — caught only once
+    // CI started running `every_generated_profile_typechecks` under
+    // `-D warnings`, since a plain `cargo build` locally only warns.
     let module = cfg.module();
+    let agg_import = if matches!(cfg.event_delivery, EventDelivery::AtomicOutbox) {
+        String::new()
+    } else {
+        format!("use {pkg}::domain::{module}::{agg};\n")
+    };
+
     formatdoc!(
         r#"
         use std::net::SocketAddr;
         use {pkg}::application::handlers::Create{agg}Handler;
-        use {pkg}::domain::{module}::{agg};
+        {agg_import}
 
         /// Serves the metrics scrape on its own port, so `/metrics` is never part
         /// of the public API surface. OpenMetrics is the only exposition that
