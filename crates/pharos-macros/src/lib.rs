@@ -163,7 +163,31 @@ pub fn derive_aggregate_root(input: TokenStream) -> TokenStream {
     .into()
 }
 
-#[proc_macro_derive(DomainEvent, attributes(occurred_at, aggregate_id))]
+/// Derives `pharos_core::DomainEvent` for an enum whose variants are the
+/// aggregate's event types.
+///
+/// `event_type()` defaults to the variant's Rust identifier, literally.
+/// That name is the event's identity on the wire — it is what an
+/// `EventBus` topic decoder and an `EventUpcasterRegistry` key on — so
+/// renaming a variant (a plain refactor, no compiler error) silently changes
+/// routing for every event already written under the old name. Pin the wire
+/// name explicitly with `#[event(name = "...")]` per variant when a variant
+/// may ever be renamed after events exist.
+///
+/// `schema_version()` defaults to `0`. Bump it with `#[event(schema_version = N)]`
+/// whenever a variant's payload shape changes in a way that is not purely
+/// additive, and pair it with a store-side upcaster (e.g.
+/// `pharos-postgres`'s `EventUpcasterRegistry`) keyed on the same
+/// `(event_type, schema_version)`.
+///
+/// ```ignore
+/// #[derive(DomainEvent)]
+/// enum OrderEvent {
+///     #[event(name = "OrderPlaced", schema_version = 1)]
+///     Placed { #[aggregate_id] order_id: String, #[occurred_at] at: DateTime<Utc> },
+/// }
+/// ```
+#[proc_macro_derive(DomainEvent, attributes(occurred_at, aggregate_id, event))]
 pub fn derive_domain_event(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     let name = &ast.ident;
@@ -185,10 +209,33 @@ pub fn derive_domain_event(input: TokenStream) -> TokenStream {
     let mut type_arms = Vec::new();
     let mut at_arms = Vec::new();
     let mut id_arms = Vec::new();
+    let mut version_arms = Vec::new();
 
     for v in variants {
         let vname = &v.ident;
-        let vname_str = vname.to_string();
+        let mut vname_str = vname.to_string();
+        let mut schema_version: u32 = 0;
+        for attr in &v.attrs {
+            if !attr.path().is_ident("event") {
+                continue;
+            }
+            if let Err(e) = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("name") {
+                    let lit: LitStr = meta.value()?.parse()?;
+                    vname_str = lit.value();
+                    Ok(())
+                } else if meta.path.is_ident("schema_version") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    schema_version = lit.base10_parse()?;
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported option; expected `name` or `schema_version`"))
+                }
+            }) {
+                return e.to_compile_error().into();
+            }
+        }
+        version_arms.push(quote! { Self::#vname { .. } => #schema_version });
 
         let named = match &v.fields {
             Fields::Named(f) => &f.named,
@@ -238,6 +285,9 @@ pub fn derive_domain_event(input: TokenStream) -> TokenStream {
             }
             fn aggregate_id(&self) -> &str {
                 match self { #(#id_arms),* }
+            }
+            fn schema_version(&self) -> u32 {
+                match self { #(#version_arms),* }
             }
         }
     }
@@ -691,14 +741,16 @@ pub fn id_type(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    let ExternalPaths { serde, uuid } = external_paths();
+
     let mut out = proc_macro2::TokenStream::new();
     for name in idents {
         out.extend(quote! {
             #[derive(
-                Debug, Clone, Copy, PartialEq, Eq, Hash,
-                ::serde::Serialize, ::serde::Deserialize
+                Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+                #serde::Serialize, #serde::Deserialize
             )]
-            pub struct #name(::uuid::Uuid);
+            pub struct #name(#uuid::Uuid);
 
             impl #name {
                 /// Generates a new time-ordered identifier (UUID v7).
@@ -708,20 +760,20 @@ pub fn id_type(input: TokenStream) -> TokenStream {
                 }
                 /// Generates a new time-ordered identifier (UUID v7).
                 pub fn new_v7() -> Self {
-                    Self(::uuid::Uuid::now_v7())
+                    Self(#uuid::Uuid::now_v7())
                 }
                 /// Builds the identifier from an existing `Uuid`.
-                pub fn from_uuid(value: ::uuid::Uuid) -> Self {
+                pub fn from_uuid(value: #uuid::Uuid) -> Self {
                     Self(value)
                 }
                 /// Returns the underlying `Uuid`.
-                pub fn as_uuid(&self) -> ::uuid::Uuid {
+                pub fn as_uuid(&self) -> #uuid::Uuid {
                     self.0
                 }
             }
 
-            impl ::std::convert::From<::uuid::Uuid> for #name {
-                fn from(value: ::uuid::Uuid) -> Self { Self(value) }
+            impl ::std::convert::From<#uuid::Uuid> for #name {
+                fn from(value: #uuid::Uuid) -> Self { Self(value) }
             }
 
             impl ::std::fmt::Display for #name {
@@ -731,9 +783,9 @@ pub fn id_type(input: TokenStream) -> TokenStream {
             }
 
             impl ::std::str::FromStr for #name {
-                type Err = ::uuid::Error;
+                type Err = #uuid::Error;
                 fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
-                    ::uuid::Uuid::parse_str(s).map(Self)
+                    #uuid::Uuid::parse_str(s).map(Self)
                 }
             }
         });
@@ -856,6 +908,40 @@ fn pharos_paths() -> syn::Result<PharosPaths> {
         .unwrap_or_else(|| quote!(::pharos_app));
 
     Ok(PharosPaths { core, app })
+}
+
+/// Paths under which generated code reaches `serde` and `uuid`.
+///
+/// Resolved the same way as [`pharos_paths`] (via `proc-macro-crate`) rather
+/// than hardcoded as `::serde`/`::uuid`, so `id_type!` still compiles for a
+/// caller who depends on either crate under a different Cargo dependency
+/// name (a workspace alias, a vendored fork). Falls back to the plain path
+/// when the dependency cannot be resolved, matching the previous behavior.
+struct ExternalPaths {
+    serde: proc_macro2::TokenStream,
+    uuid: proc_macro2::TokenStream,
+}
+
+fn external_paths() -> ExternalPaths {
+    use proc_macro_crate::{FoundCrate, crate_name};
+
+    let resolve = |package: &str, default: &str| -> proc_macro2::TokenStream {
+        match crate_name(package) {
+            Ok(FoundCrate::Name(name)) => {
+                let ident = Ident::new(&name, proc_macro2::Span::call_site());
+                quote!(::#ident)
+            }
+            Ok(FoundCrate::Itself) | Err(_) => {
+                let ident = Ident::new(default, proc_macro2::Span::call_site());
+                quote!(::#ident)
+            }
+        }
+    };
+
+    ExternalPaths {
+        serde: resolve("serde", "serde"),
+        uuid: resolve("uuid", "uuid"),
+    }
 }
 
 fn find_field_with_attr<'a>(ast: &'a DeriveInput, attr: &str) -> syn::Result<&'a syn::Field> {

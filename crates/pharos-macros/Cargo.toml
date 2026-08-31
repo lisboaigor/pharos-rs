@@ -23,6 +23,7 @@ pharos-app     = { path = "../pharos-app", version = "0.4.0" }
 # `Secret` is asserted to stay redacted inside the generated span.
 pharos-core    = { path = "../pharos-core", version = "0.4.0" }
 pharos-testing = { path = "../pharos-testing", version = "0.4.0" }
+chrono         = { workspace = true }
 tokio          = { workspace = true }
 tracing        = { workspace = true }
 serde          = { workspace = true }
