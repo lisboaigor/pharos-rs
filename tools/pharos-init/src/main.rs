@@ -9,7 +9,7 @@ use console::style;
 
 fn main() {
     match cli::parse(std::env::args()) {
-        cli::Command::New => scaffold(),
+        cli::Command::New { minimal } => scaffold(minimal),
         cli::Command::Observability(options) => refresh(options),
         cli::Command::Help => println!("{}", cli::HELP),
         cli::Command::Version => println!("pharos-init {}", env!("CARGO_PKG_VERSION")),
@@ -82,10 +82,10 @@ fn refresh(options: update::Options) {
     );
 }
 
-fn scaffold() {
+fn scaffold(minimal: bool) {
     banner();
 
-    let cfg = match config::collect() {
+    let cfg = match config::collect(minimal) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("  {}  {}", style("✗").red().bold(), e);

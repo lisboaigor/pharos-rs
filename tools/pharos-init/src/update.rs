@@ -146,14 +146,15 @@ fn read_manifest(root: &Path) -> Vec<(String, u64)> {
 fn write_manifest(root: &Path, changes: &[Change]) -> std::io::Result<()> {
     let mut body = String::from("# written by pharos-init — do not edit\n");
     for change in changes {
-        // A kept file is recorded as it is on disk, so the next refresh still
-        // recognises it as edited rather than treating it as untouched.
-        let hash = match change.outcome {
-            Outcome::Kept => fs::read_to_string(root.join(change.rel_path))
-                .map(|c| fingerprint(&c))
-                .unwrap_or_default(),
-            _ => asset_hash(change.rel_path),
-        };
+        // A kept file gets no entry: recording its on-disk hash would make the
+        // *next* refresh see it as untouched (current matches recorded) and
+        // silently overwrite it. No entry means "not written by us", which
+        // keeps classify() returning Kept until the content ever matches what
+        // the framework actually wrote.
+        if change.outcome == Outcome::Kept {
+            continue;
+        }
+        let hash = asset_hash(change.rel_path);
         let _ = writeln!(body, "{} {hash}", change.rel_path);
     }
     let manifest = root.join(MANIFEST);
@@ -240,14 +241,15 @@ mod tests {
         refresh(&root, Options::default())?;
 
         // Stand in for a framework-side change by rolling the file back to
-        // something older while leaving the manifest recording that content.
+        // something older while leaving the manifest recording that content
+        // as what was written — i.e. the state before the framework moved on.
         fs::write(root.join(SAMPLE), "old framework content\n")?;
-        write_manifest(
-            &root,
-            &[Change {
-                rel_path: SAMPLE,
-                outcome: Outcome::Kept,
-            }],
+        fs::write(
+            root.join(MANIFEST),
+            format!(
+                "# written by pharos-init — do not edit\n{SAMPLE} {}\n",
+                fingerprint("old framework content\n")
+            ),
         )?;
 
         let changes = refresh(&root, Options::default())?;
@@ -262,6 +264,23 @@ mod tests {
         refresh(&root, Options::default())?;
         fs::write(root.join(SAMPLE), "# tuned by hand\n")?;
 
+        let changes = refresh(&root, Options::default())?;
+        assert_eq!(outcome_of(&changes, SAMPLE), Some("kept"));
+        assert_eq!(fs::read_to_string(root.join(SAMPLE))?, "# tuned by hand\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_locally_edited_asset_stays_kept_across_repeated_refreshes() -> std::io::Result<()> {
+        let root = project()?;
+        refresh(&root, Options::default())?;
+        fs::write(root.join(SAMPLE), "# tuned by hand\n")?;
+
+        let changes = refresh(&root, Options::default())?;
+        assert_eq!(outcome_of(&changes, SAMPLE), Some("kept"));
+
+        // No further edit happens here — this is what a second, unrelated
+        // `pharos-init observability --update` run later looks like.
         let changes = refresh(&root, Options::default())?;
         assert_eq!(outcome_of(&changes, SAMPLE), Some("kept"));
         assert_eq!(fs::read_to_string(root.join(SAMPLE))?, "# tuned by hand\n");

@@ -3,7 +3,7 @@ use std::fs;
 use indoc::formatdoc;
 
 use crate::assets;
-use crate::config::{EventDelivery, Http, Persistence, ProjectConfig, Serialization};
+use crate::config::{Broker, EventDelivery, Http, Persistence, ProjectConfig, Serialization};
 
 // ── public surface ────────────────────────────────────────────────────────────
 
@@ -56,16 +56,19 @@ pub fn generate(cfg: &ProjectConfig) -> std::io::Result<Vec<GeneratedFile>> {
     emit!(".dockerignore", dockerignore());
     emit!("docker-compose.yml", docker_compose(cfg));
     emit!(".env.example", env_example(cfg));
-    emit!(
-        "docker/grafana/provisioning/dashboards/dashboards.yml",
-        dashboards_provisioning(cfg)
-    );
-    for asset in assets::OBSERVABILITY {
-        emit!(asset.rel_path, asset.contents.to_string());
+    if cfg.observability {
+        emit!(
+            "docker/grafana/provisioning/dashboards/dashboards.yml",
+            dashboards_provisioning(cfg)
+        );
+        for asset in assets::OBSERVABILITY {
+            emit!(asset.rel_path, asset.contents.to_string());
+        }
+        // Baseline for `pharos-init observability --update`: it is what
+        // later tells a file nobody touched from one the project edited on
+        // purpose. Only meaningful when the stack it tracks was written.
+        crate::update::write_baseline(&root)?;
     }
-    // Baseline for `pharos-init observability --update`: it is what later tells
-    // a file nobody touched from one the project edited on purpose.
-    crate::update::write_baseline(&root)?;
 
     if cfg.uses_axum() {
         emit!("src/web/mod.rs", web_mod_rs(cfg));
@@ -105,37 +108,141 @@ fn docker_compose(cfg: &ProjectConfig) -> String {
         ""
     };
 
-    let depends = if cfg.uses_postgres() {
-        "    depends_on:\n      postgres:\n        condition: service_healthy\n"
+    let redis = if cfg.uses_redis() {
+        r#"  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+"#
     } else {
         ""
     };
+
+    // Apache Kafka's own image, single-node KRaft mode — no ZooKeeper
+    // service to also stand up. `CLUSTER_ID` is required but arbitrary; this
+    // one is just a fixed, valid base64 UUID.
+    let kafka = if cfg.uses_kafka() {
+        r#"  kafka:
+    image: apache/kafka:3.9.0
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+    restart: unless-stopped
+"#
+    } else {
+        ""
+    };
+
+    let mut depends = String::new();
+    if cfg.uses_postgres() {
+        depends.push_str("      postgres:\n        condition: service_healthy\n");
+    }
+    if cfg.uses_redis() {
+        depends.push_str("      redis:\n        condition: service_healthy\n");
+    }
+    if cfg.uses_kafka() {
+        depends.push_str("      kafka:\n        condition: service_healthy\n");
+    }
+    if !depends.is_empty() {
+        depends = format!("    depends_on:\n{depends}");
+    }
+
     let pg_volume = if cfg.uses_postgres() {
         "  postgres_data:\n"
     } else {
         ""
     };
+    let redis_volume = if cfg.uses_redis() {
+        "  redis_data:\n"
+    } else {
+        ""
+    };
+    let kafka_volume = if cfg.uses_kafka() {
+        "  kafka_data:\n"
+    } else {
+        ""
+    };
 
-    let obs_services = assets::COMPOSE_SERVICES;
-    let obs_volumes = assets::COMPOSE_VOLUMES;
+    let obs_services = if cfg.observability {
+        assets::COMPOSE_SERVICES
+    } else {
+        ""
+    };
+    let obs_volumes = if cfg.observability {
+        assets::COMPOSE_VOLUMES
+    } else {
+        ""
+    };
+
+    let header = if cfg.observability {
+        formatdoc!(
+            r#"
+            # Everything this application needs to run, plus the observability that
+            # makes it explainable: metrics, logs and traces, already wired.
+            #
+            #   docker compose up -d
+            #   open http://localhost:3002        # Grafana (admin/admin)
+            #
+            # The service is named `app` on purpose: the Prometheus job, the log
+            # pipeline and the dashboards all key off that name, which is what lets
+            # their configuration ship unmodified.
+            #
+            # Editing a mounted config file (docker/**) does NOT reach a running
+            # container — `up -d` only recreates a service whose definition changed.
+            # Apply those with:
+            #   docker compose up -d --force-recreate prometheus grafana loki tempo alloy
+            #
+            # `app` and Grafana are published on 127.0.0.1 only, same as Postgres
+            # below — reachable from this machine, not from the rest of the LAN.
+            # Grafana in particular ships with the admin/admin default until
+            # GRAFANA_ADMIN_PASSWORD is changed in .env, and has read access to
+            # every trace, log and metric this stack collects. Widen either
+            # binding deliberately (a reverse proxy on another host, an intentional
+            # LAN demo) rather than by dropping the `127.0.0.1:` prefix as a
+            # shortcut.
+            "#
+        )
+    } else {
+        formatdoc!(
+            r#"
+            # Everything this application needs to run. Scaffolded with `--minimal`:
+            # no observability stack (Prometheus/Grafana/Loki/Tempo/Alloy/Telegraf),
+            # no Docker-socket access anywhere in this file. The app still logs and
+            # traces on its own (see .env's OTEL_EXPORTER_OTLP_ENDPOINT); there is
+            # just no collector or dashboard bundled to send them to.
+            #
+            #   docker compose up -d
+            "#
+        )
+    };
 
     formatdoc!(
         r#"
-        # Everything this application needs to run, plus the observability that
-        # makes it explainable: metrics, logs and traces, already wired.
-        #
-        #   docker compose up -d
-        #   open http://localhost:3002        # Grafana (admin/admin)
-        #
-        # The service is named `app` on purpose: the Prometheus job, the log
-        # pipeline and the dashboards all key off that name, which is what lets
-        # their configuration ship unmodified.
-        #
-        # Editing a mounted config file (docker/**) does NOT reach a running
-        # container — `up -d` only recreates a service whose definition changed.
-        # Apply those with:
-        #   docker compose up -d --force-recreate prometheus grafana loki tempo alloy
-        name: {name}
+        {header}name: {name}
 
         services:
           app:
@@ -147,12 +254,12 @@ fn docker_compose(cfg: &ProjectConfig) -> String {
                 - default
             env_file: [.env]
             ports:
-              - "3000:3000"
+              - "127.0.0.1:3000:3000"
         {depends}    restart: unless-stopped
 
-        {postgres}{obs_services}
+        {postgres}{redis}{kafka}{obs_services}
         volumes:
-        {pg_volume}{obs_volumes}
+        {pg_volume}{redis_volume}{kafka_volume}{obs_volumes}
         "#
     )
 }
@@ -174,11 +281,16 @@ fn dockerfile(cfg: &ProjectConfig) -> String {
         WORKDIR /app
 
         # Dependencies first, so editing source does not rebuild the world. The
-        # stub is enough to resolve and compile them.
+        # stub is enough to resolve and compile them. `--mount=type=ssh` is a
+        # flag on `RUN` itself, not a shell command — inline after `&&` it is
+        # not the flag, it is a nonexistent program by that name, and masking
+        # its failure would skip warming the dependency cache on every build
+        # without ever saying so: the *next* `RUN` below then has to compile
+        # every dependency from scratch anyway, just to build the real binary.
         COPY Cargo.toml Cargo.lock* ./
         COPY .cargo ./.cargo
-        RUN mkdir src && echo 'fn main() {{}}' > src/main.rs && echo '' > src/lib.rs \
-            && --mount=type=ssh cargo build --release || true
+        RUN --mount=type=ssh mkdir src && echo 'fn main() {{}}' > src/main.rs \
+            && echo '' > src/lib.rs && cargo build --release
         RUN rm -rf src
 
         COPY src ./src
@@ -230,9 +342,44 @@ fn env_example(cfg: &ProjectConfig) -> String {
     } else {
         String::new()
     };
+    let redis = if cfg.uses_redis() {
+        formatdoc!(
+            r#"
+            REDIS_URL=redis://redis:6379
+            "#
+        )
+    } else {
+        String::new()
+    };
+    let kafka = if cfg.uses_kafka() {
+        formatdoc!(
+            r#"
+            KAFKA_BROKERS=kafka:9092
+            "#
+        )
+    } else {
+        String::new()
+    };
+    let otel_endpoint = if cfg.observability {
+        "http://tempo:4317"
+    } else {
+        // `--minimal` scaffolds no Tempo to send to; leaving this pointed at
+        // a host that does not exist would make every span export fail.
+        ""
+    };
+    let grafana = if cfg.observability {
+        formatdoc!(
+            r#"
+            GRAFANA_ADMIN_USER=admin
+            GRAFANA_ADMIN_PASSWORD=admin
+            "#
+        )
+    } else {
+        String::new()
+    };
     formatdoc!(
         r#"
-        {db}
+        {db}{redis}{kafka}
         # Filter directives. The framework's own targets are merged in by
         # `pharos_observability::init`, so they cannot be dropped by accident.
         RUST_LOG=info
@@ -243,12 +390,10 @@ fn env_example(cfg: &ProjectConfig) -> String {
         LOG_FORMAT=json
 
         # Where spans go. Empty disables export; the application still logs.
-        OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+        OTEL_EXPORTER_OTLP_ENDPOINT={otel_endpoint}
         OTEL_TRACES_SAMPLER_ARG=1.0
 
-        GRAFANA_ADMIN_USER=admin
-        GRAFANA_ADMIN_PASSWORD=admin
-        "#
+        {grafana}"#
     )
 }
 
@@ -389,8 +534,97 @@ fn lib_rs(cfg: &ProjectConfig) -> String {
 fn main_rs(cfg: &ProjectConfig) -> String {
     match cfg.http {
         Http::Axum => axum_main_rs(cfg),
-        Http::None => minimal_main_rs(),
+        Http::None => minimal_main_rs(cfg),
     }
+}
+
+/// Builds the `Create{agg}Handler` construction expression, matching
+/// whichever constructor shape [`handlers_rs`] generated for this
+/// `event_delivery` — the three handler variants take different arguments
+/// (`(repo, bus)`, `(repo, outbox)`, or `(pool)` alone), so this must stay in
+/// lockstep with [`inprocess_handler`]/[`outbox_handler`]/[`atomic_handler`].
+fn handler_construction(cfg: &ProjectConfig, agg: &str) -> String {
+    match cfg.event_delivery {
+        EventDelivery::InProcess => {
+            let repo_expr = repo_expression(cfg, agg);
+            formatdoc!(
+                r#"
+                let repo = {repo_expr};
+                let bus  = pharos_app::EventBus::new();
+                let handler = std::sync::Arc::new(Create{agg}Handler::new(repo, bus));
+                "#
+            )
+        }
+        EventDelivery::Outbox => {
+            let repo_expr = repo_expression(cfg, agg);
+            formatdoc!(
+                r#"
+                let repo   = {repo_expr};
+                let outbox = std::sync::Arc::new(pharos_postgres::PostgresOutboxRepository::new(pool.clone()));
+                outbox.migrate().await?;
+                let handler = std::sync::Arc::new(Create{agg}Handler::new(repo, outbox));
+                "#
+            )
+        }
+        EventDelivery::AtomicOutbox => formatdoc!(
+            r#"
+            let handler = std::sync::Arc::new(Create{agg}Handler::new(pool.clone()));
+            "#
+        ),
+    }
+}
+
+/// Background task that drains the outbox to the configured broker.
+///
+/// Without this, `save_and_enqueue`/`save_aggregate_and_enqueue` fill the
+/// outbox but nothing ever calls `OutboxDispatcher::dispatch_batch`, so
+/// events accumulate as `pending` forever. Emitted whenever
+/// [`ProjectConfig::uses_outbox`] is true; empty otherwise.
+fn outbox_dispatcher_setup(cfg: &ProjectConfig) -> String {
+    if !cfg.uses_outbox() {
+        return String::new();
+    }
+    let publisher_setup = match cfg.broker {
+        Broker::Redis => formatdoc!(
+            r#"
+            let redis_url = std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://redis:6379".to_string());
+            let dispatch_publisher = pharos_redis::RedisMessageBroker::from_url(&redis_url)?;
+            "#
+        ),
+        Broker::Kafka => formatdoc!(
+            r#"
+            let kafka_brokers = std::env::var("KAFKA_BROKERS")
+                .unwrap_or_else(|_| "kafka:9092".to_string());
+            let dispatch_publisher = pharos_kafka::KafkaPublisher::from_bootstrap_servers(&kafka_brokers)?;
+            "#
+        ),
+        // Not reachable from the interactive prompt today (every
+        // `event_delivery` that sets `uses_outbox()` also selects a broker),
+        // but kept exhaustive rather than assuming that stays true.
+        Broker::None => {
+            return "// TODO: no broker configured — wire OutboxDispatcher to one before this \
+                     runs in production, or the outbox never drains.\n"
+                .to_string();
+        }
+    };
+    formatdoc!(
+        r#"
+        {publisher_setup}
+        let dispatch_repo = pharos_postgres::PostgresOutboxRepository::new(pool.clone());
+        tokio::spawn(async move {{
+            let dispatcher = pharos_app::OutboxDispatcher::new(dispatch_repo, dispatch_publisher);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            loop {{
+                interval.tick().await;
+                let result = dispatcher.dispatch_batch().await;
+                if !result.errors.is_empty() {{
+                    tracing::warn!(errors = ?result.errors, "outbox dispatch reported errors");
+                }}
+            }}
+        }});
+        "#
+    )
 }
 
 fn axum_main_rs(cfg: &ProjectConfig) -> String {
@@ -410,18 +644,8 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
         String::new()
     };
 
-    let outbox_setup = if cfg.uses_outbox() && cfg.uses_postgres() {
-        formatdoc!(
-            r#"
-            let outbox = std::sync::Arc::new(pharos_postgres::PostgresOutboxRepository::new(pool.clone()));
-            outbox.migrate().await?;
-        "#
-        )
-    } else {
-        String::new()
-    };
-
-    let repo_expr = repo_expression(cfg, &agg);
+    let handler_construction = handler_construction(cfg, &agg);
+    let dispatcher_setup = outbox_dispatcher_setup(cfg);
 
     let module = cfg.module();
     formatdoc!(
@@ -464,14 +688,8 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
             let metrics = pharos_observability::http::http_metrics();
             tokio::spawn(serve_metrics(std::sync::Arc::clone(&metrics)));
             {pg_setup}
-            let repo = {repo_expr};
-            {outbox_setup}
-            let bus     = pharos_app::EventBus::new();
-            let handler = std::sync::Arc::new(Create{agg}Handler::new(
-                std::sync::Arc::clone(&repo),
-                bus.clone(),
-            ));
-
+            {handler_construction}
+            {dispatcher_setup}
             // `instrument` applies the observability layers in the one order
             // where both the request span and its exemplars work.
             let app  = pharos_observability::http::instrument({pkg}::web::router(handler), metrics);
@@ -485,15 +703,31 @@ fn axum_main_rs(cfg: &ProjectConfig) -> String {
     )
 }
 
-fn minimal_main_rs() -> String {
+fn minimal_main_rs(cfg: &ProjectConfig) -> String {
+    let pg_setup = if cfg.uses_postgres() {
+        formatdoc!(
+            r#"
+            let database_url = std::env::var("DATABASE_URL")
+                .expect("DATABASE_URL must be set");
+            let pool = pharos_postgres::connect_pool(&database_url, 16)?;
+            pharos_postgres::migrate_postgres_aggregate_schema(&pool).await?;
+        "#
+        )
+    } else {
+        String::new()
+    };
+    let dispatcher_setup = outbox_dispatcher_setup(cfg);
     formatdoc!(
         r#"
         #[tokio::main]
         async fn main() -> Result<(), Box<dyn std::error::Error>> {{
             // Logging and traces; the guard flushes pending spans on the way out.
             let _observability = pharos_observability::init(env!("CARGO_PKG_NAME"))?;
+            {pg_setup}
+            {dispatcher_setup}
             tracing::info!("service starting");
             // TODO: wire handlers and start the processing loop
+            std::future::pending::<()>().await;
             Ok(())
         }}
     "#
@@ -523,15 +757,9 @@ fn aggregate_rs(cfg: &ProjectConfig) -> String {
 
         use super::events::{agg}Event;
 
+        // id_type! already derives FromStr (via uuid::Uuid::parse_str), which
+        // is what PostgresJsonRepository requires.
         id_type!({agg}Id);
-
-        // id_type! does not derive FromStr; PostgresJsonRepository requires it.
-        impl std::str::FromStr for {agg}Id {{
-            type Err = uuid::Error;
-            fn from_str(s: &str) -> Result<Self, Self::Err> {{
-                uuid::Uuid::parse_str(s).map(Self)
-            }}
-        }}
 
         #[derive(Debug, Clone, Entity, AggregateRoot, Serialize, Deserialize)]
         pub struct {agg} {{
@@ -569,8 +797,13 @@ fn events_rs(cfg: &ProjectConfig) -> String {
         r#"
         use chrono::{{DateTime, Utc}};
         use pharos_macros::DomainEvent;
+        use serde::{{Deserialize, Serialize}};
 
-        #[derive(Debug, Clone, DomainEvent)]
+        // Serialize/Deserialize: the outbox and event-store paths both
+        // encode this type as the wire payload (`serde_json::to_vec` in the
+        // generated command handler, or as the event-sourced state if this
+        // profile evolves that way).
+        #[derive(Debug, Clone, Serialize, Deserialize, DomainEvent)]
         pub enum {agg}Event {{
             {agg}Created {{
                 #[aggregate_id]
@@ -1014,33 +1247,53 @@ fn postgres_repo_and_outbox_types(cfg: &ProjectConfig, agg: &str) -> (String, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Broker, SystemKind};
+    use crate::config::SystemKind;
 
     /// The interactive prompt needs a terminal, which is why the generator went
     /// untested. Building the config directly is what makes it verifiable.
-    fn config(into: &std::path::Path) -> ProjectConfig {
+    ///
+    /// Builds a `ProjectConfig` through the same derivation
+    /// [`collect`](crate::config::collect) uses
+    /// ([`crate::config::derive_technical_choices`]), for any
+    /// `(SystemKind, serves_http)` the interactive prompt can produce —
+    /// so a test exercising "EventDriven with HTTP" is exercising a
+    /// reachable combination, not a fixture that has drifted from what the
+    /// prompt actually derives.
+    fn config_for(into: &std::path::Path, kind: SystemKind, serves_http: bool) -> ProjectConfig {
+        // Only SingleService/ModularMonolith read `stores_data` from the
+        // (skipped, in tests) Q3; EventDriven/HighThroughput always store.
+        let stores_data = true;
+        let derived = crate::config::derive_technical_choices(&kind, serves_http, stores_data);
         ProjectConfig {
             project_name: "demoapp".into(),
             context_name: "order".into(),
             location: into.to_path_buf(),
-            kind: SystemKind::SingleService,
-            persistence: Persistence::PostgresJson,
-            event_delivery: EventDelivery::InProcess,
-            broker: Broker::None,
-            serialization: Serialization::Json,
-            http: Http::Axum,
+            kind,
+            persistence: derived.persistence,
+            event_delivery: derived.event_delivery,
+            broker: derived.broker,
+            serialization: derived.serialization,
+            http: derived.http,
+            observability: true,
         }
     }
 
     /// A directory per call: tests run in parallel, and a shared one had them
     /// deleting each other's output.
     fn generate_into_temp() -> std::io::Result<(std::path::PathBuf, Vec<GeneratedFile>)> {
+        generate_into_temp_for(SystemKind::SingleService, true)
+    }
+
+    fn generate_into_temp_for(
+        kind: SystemKind,
+        serves_http: bool,
+    ) -> std::io::Result<(std::path::PathBuf, Vec<GeneratedFile>)> {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("pharos-init-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
-        let cfg = config(&root);
+        let cfg = config_for(&root, kind, serves_http);
         let files = generate(&cfg)?;
         Ok((cfg.output_path(), files))
     }
@@ -1108,6 +1361,45 @@ mod tests {
         Ok(())
     }
 
+    /// `--mount=type=ssh` is a flag on `RUN` itself. Inline after `&&`, in the
+    /// middle of a shell command list, it is not the flag — it is a
+    /// nonexistent program by that name — and every `RUN` line pulling from
+    /// the private git dependency must get the mount as a flag or the build
+    /// cannot authenticate to fetch it.
+    #[test]
+    fn every_ssh_mounted_run_puts_the_flag_on_run_itself_not_inline() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
+        for line in dockerfile.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.contains("--mount=type=ssh") {
+                assert!(
+                    trimmed.starts_with("RUN --mount=type=ssh"),
+                    "`--mount=type=ssh` must immediately follow `RUN`, not appear mid-command: {line:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A masked failure here is a silent one: the dependency-warming layer
+    /// never actually populates the build cache, so every subsequent build
+    /// recompiles every dependency from scratch on the *next* `RUN` instead —
+    /// slow, but never a build failure a developer would notice.
+    #[test]
+    fn the_dependency_warming_step_does_not_swallow_its_own_failure() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
+        assert!(
+            !dockerfile.contains("|| true"),
+            "a masked failure here defeats the whole point of warming the dependency cache"
+        );
+        Ok(())
+    }
+
     /// The service name is the invariant that lets every config ship unmodified.
     #[test]
     fn the_application_service_is_named_app() -> std::io::Result<()> {
@@ -1126,26 +1418,67 @@ mod tests {
         Ok(())
     }
 
+    /// `app` and Grafana are the only services with a published port —
+    /// Grafana holds admin/admin until the operator changes it, and both
+    /// must be reachable from this machine only by default, same as
+    /// Postgres. Publishing on a bare port number binds `0.0.0.0`, which is
+    /// reachable from the whole LAN.
+    #[test]
+    fn published_ports_are_bound_to_localhost_only() -> std::io::Result<()> {
+        let (root, _) = generate_into_temp()?;
+        let compose = fs::read_to_string(root.join("docker-compose.yml"))?;
+        for line in compose.lines() {
+            let trimmed = line.trim();
+            // A published port mapping is `"HOST:CONTAINER"` (optionally
+            // `"IP:HOST:CONTAINER"`); every other quoted, colon-containing
+            // value in this file (image tags, volume mounts) is not one.
+            if trimmed.starts_with('-') && trimmed.contains(':') && trimmed.ends_with('"') {
+                let after_dash = trimmed.trim_start_matches('-').trim();
+                let looks_like_a_port_mapping = after_dash
+                    .trim_matches('"')
+                    .split(':')
+                    .next_back()
+                    .is_some_and(|last| last.chars().all(|c| c.is_ascii_digit()));
+                if looks_like_a_port_mapping {
+                    assert!(
+                        after_dash.starts_with("\"127.0.0.1:"),
+                        "published port is not bound to localhost: {line:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `formatdoc!` strips common indentation, which once lifted `postgres:`
     /// out of `services:` and produced a file the schema rejects. Compose is the
     /// only authority on its own format, so ask it — skipped where it is absent.
     #[test]
     fn compose_is_accepted_by_compose_itself() -> std::io::Result<()> {
-        let (root, _) = generate_into_temp()?;
-        fs::copy(root.join(".env.example"), root.join(".env"))?;
+        // EventDriven and HighThroughput add the Redis and Kafka service
+        // blocks respectively — covered here, not just the default
+        // SingleService profile that has neither.
+        for (kind, serves_http) in [
+            (SystemKind::SingleService, true),
+            (SystemKind::EventDriven, true),
+            (SystemKind::HighThroughput, true),
+        ] {
+            let (root, _) = generate_into_temp_for(kind.clone(), serves_http)?;
+            fs::copy(root.join(".env.example"), root.join(".env"))?;
 
-        let Ok(output) = std::process::Command::new("docker")
-            .args(["compose", "config", "--quiet"])
-            .current_dir(&root)
-            .output()
-        else {
-            return Ok(());
-        };
-        assert!(
-            output.status.success(),
-            "compose rejected the generated file:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            let Ok(output) = std::process::Command::new("docker")
+                .args(["compose", "config", "--quiet"])
+                .current_dir(&root)
+                .output()
+            else {
+                return Ok(());
+            };
+            assert!(
+                output.status.success(),
+                "compose rejected the generated file for {kind:?}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         Ok(())
     }
 
@@ -1161,6 +1494,141 @@ mod tests {
         );
         let manifest = fs::read_to_string(root.join("Cargo.toml"))?;
         assert!(manifest.contains("pharos-observability"));
+        Ok(())
+    }
+
+    /// `--minimal` (`ProjectConfig::observability = false`) must remove
+    /// every trace of the observability stack — the compose services, the
+    /// docker/ asset tree, and above all any mention of the Docker socket —
+    /// while still leaving the application's own logging/tracing wired,
+    /// since that costs nothing extra and needs no collector to be useful.
+    #[test]
+    fn minimal_skips_the_observability_stack_entirely() -> std::io::Result<()> {
+        let root_dir =
+            std::env::temp_dir().join(format!("pharos-init-minimal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root_dir);
+        fs::create_dir_all(&root_dir)?;
+        let cfg = ProjectConfig {
+            observability: false,
+            ..config_for(&root_dir, SystemKind::SingleService, true)
+        };
+        generate(&cfg)?;
+        let root = cfg.output_path();
+
+        assert!(
+            !root.join("docker/grafana").exists(),
+            "docker/ observability assets must not be written under --minimal"
+        );
+
+        let compose = fs::read_to_string(root.join("docker-compose.yml"))?;
+        for absent in [
+            "prometheus",
+            "grafana",
+            "telegraf",
+            "loki",
+            "alloy",
+            "docker-socket-proxy",
+            "docker.sock",
+        ] {
+            assert!(
+                !compose.contains(absent),
+                "docker-compose.yml must not mention `{absent}` under --minimal"
+            );
+        }
+
+        let main = fs::read_to_string(root.join("src/main.rs"))?;
+        assert!(
+            main.contains("pharos_observability::init"),
+            "the app should still log/trace on its own even without the collector stack"
+        );
+        Ok(())
+    }
+
+    /// Points every generated `git = "ssh://..."` pharos dependency at this
+    /// checkout's own `crates/` instead, so the generated project can be
+    /// built offline, without SSH access to a private repository, against
+    /// the framework version actually under test.
+    ///
+    /// A path dependency does not need to be a workspace member: Cargo
+    /// resolves each crate's own `workspace = true` fields by walking up
+    /// from *that crate's* manifest, so `crates/pharos-core` still resolves
+    /// against this repository's root workspace even though the generated
+    /// project's own manifest is a standalone, non-member `Cargo.toml`
+    /// living outside this tree entirely.
+    fn point_dependencies_at_this_checkout(root: &std::path::Path) -> std::io::Result<()> {
+        let manifest_path = root.join("Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path)?;
+
+        let workspace_crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("tools/pharos-init has two parent directories: tools/ and the repo root")
+            .join("crates");
+
+        let git = "ssh://git@github.com/lisboaigor/pharos-rs";
+        let mut patched = String::with_capacity(manifest.len());
+        for line in manifest.lines() {
+            if let Some((name, rest)) = line.split_once('=') {
+                let crate_name = name.trim();
+                if crate_name.starts_with("pharos-") && rest.contains(git) {
+                    let crate_path = workspace_crates.join(crate_name);
+                    let replaced = rest.replacen(
+                        &format!(r#"git = "{git}""#),
+                        &format!(r#"path = "{}""#, crate_path.display()),
+                        1,
+                    );
+                    patched.push_str(crate_name);
+                    patched.push_str(" =");
+                    patched.push_str(&replaced);
+                    patched.push('\n');
+                    continue;
+                }
+            }
+            patched.push_str(line);
+            patched.push('\n');
+        }
+        fs::write(manifest_path, patched)
+    }
+
+    /// The audit finding this closes: the generator had never once been
+    /// checked against `cargo build`, and `EventDriven`/`HighThroughput`
+    /// with HTTP generated a `main.rs` that did not typecheck — the
+    /// handler's `new()` signature (three different shapes depending on
+    /// `EventDelivery`) had drifted from what `main.rs` actually called it
+    /// with. Every `(SystemKind, serves_http)` pair the interactive prompt
+    /// can produce is generated and `cargo check`ed here, against this
+    /// checkout's own crates (see [`point_dependencies_at_this_checkout`]),
+    /// so a future drift between a handler's constructor and its call site
+    /// fails this test instead of only surfacing for someone running
+    /// `pharos-init` for real.
+    #[test]
+    fn every_generated_profile_typechecks() -> std::io::Result<()> {
+        use std::process::Command;
+
+        let profiles = [
+            (SystemKind::SingleService, true),
+            (SystemKind::SingleService, false),
+            (SystemKind::ModularMonolith, true),
+            (SystemKind::EventDriven, true),
+            (SystemKind::EventDriven, false),
+            (SystemKind::HighThroughput, true),
+            (SystemKind::HighThroughput, false),
+        ];
+
+        for (kind, serves_http) in profiles {
+            let (root, _) = generate_into_temp_for(kind.clone(), serves_http)?;
+            point_dependencies_at_this_checkout(&root)?;
+
+            let output = Command::new("cargo")
+                .args(["check", "--offline", "--quiet"])
+                .current_dir(&root)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "generated project for {kind:?} (http={serves_http}) failed to typecheck:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         Ok(())
     }
 }

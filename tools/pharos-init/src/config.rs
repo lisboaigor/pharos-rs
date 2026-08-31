@@ -72,6 +72,13 @@ pub struct ProjectConfig {
     pub broker: Broker,
     pub serialization: Serialization,
     pub http: Http,
+    /// Whether to scaffold the seven-container observability stack
+    /// (Prometheus, node-exporter, Telegraf, Loki, Alloy, Tempo, Grafana)
+    /// and its `docker-socket-proxy`. `true` by default — set from
+    /// `pharos-init --minimal` / `pharos-init new --minimal`, which is the
+    /// only way to turn it off; there is no interactive prompt for this, to
+    /// keep the "3 questions only" flow intact for the common case.
+    pub observability: bool,
 }
 
 impl ProjectConfig {
@@ -166,7 +173,7 @@ impl ProjectConfig {
 
 // ── interactive collection — 3 questions only ─────────────────────────────────
 
-pub fn collect() -> Result<ProjectConfig, dialoguer::Error> {
+pub fn collect(minimal: bool) -> Result<ProjectConfig, dialoguer::Error> {
     let project_name = ask("Project name")?;
     let context_name = ask("Main bounded context  (e.g. order, player, tournament)")?;
 
@@ -230,7 +237,41 @@ pub fn collect() -> Result<ProjectConfig, dialoguer::Error> {
         }
     };
 
-    // ── derive all technical choices ──────────────────────────────────────────
+    let derived = derive_technical_choices(&kind, serves_http, stores_data);
+
+    Ok(ProjectConfig {
+        project_name,
+        context_name,
+        location,
+        kind,
+        persistence: derived.persistence,
+        event_delivery: derived.event_delivery,
+        broker: derived.broker,
+        serialization: derived.serialization,
+        http: derived.http,
+        observability: !minimal,
+    })
+}
+
+/// The technical choices [`collect`] derives from the three questions it
+/// asks — factored out as a pure function so tests can build every
+/// `(SystemKind, serves_http)` combination the interactive prompt can
+/// produce without a terminal, and so there is exactly one place this
+/// derivation lives rather than one the prompt uses and a second a test
+/// fixture quietly drifts from.
+pub struct DerivedChoices {
+    pub persistence: Persistence,
+    pub event_delivery: EventDelivery,
+    pub broker: Broker,
+    pub serialization: Serialization,
+    pub http: Http,
+}
+
+pub fn derive_technical_choices(
+    kind: &SystemKind,
+    serves_http: bool,
+    stores_data: bool,
+) -> DerivedChoices {
     let (persistence, event_delivery, broker, serialization) = match kind {
         SystemKind::SingleService | SystemKind::ModularMonolith => (
             if stores_data {
@@ -262,17 +303,13 @@ pub fn collect() -> Result<ProjectConfig, dialoguer::Error> {
 
     let http = if serves_http { Http::Axum } else { Http::None };
 
-    Ok(ProjectConfig {
-        project_name,
-        context_name,
-        location,
-        kind,
+    DerivedChoices {
         persistence,
         event_delivery,
         broker,
         serialization,
         http,
-    })
+    }
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────

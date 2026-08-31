@@ -79,7 +79,10 @@ pub const OBSERVABILITY: &[Asset] = &[
 /// database), and this block is the invariant one.
 pub const COMPOSE_SERVICES: &str = r#"
   # Observability. None of these publish a port: they are reachable only from
-  # inside the compose network, except Grafana, which is the way in.
+  # inside the compose network, except Grafana, which is the way in — bound
+  # to 127.0.0.1 only, since it holds the admin/admin default until
+  # GRAFANA_ADMIN_PASSWORD is changed and has read access to every trace, log
+  # and metric this stack collects.
   prometheus:
     image: prom/prometheus:v3.4.1
     # Overriding `command` discards the image's default, so its flags have to be
@@ -107,16 +110,33 @@ pub const COMPOSE_SERVICES: &str = r#"
       - /:/host:ro,rslave
     restart: unless-stopped
 
-  # Per-container resource usage. `user: root` with the entrypoint called
-  # directly: the image's default entrypoint drops privileges and loses access
-  # to the Docker socket.
+  # The only container that touches the Docker socket, and it touches it
+  # read-only, through a proxy that exposes just four endpoint groups
+  # (CONTAINERS, INFO, EVENTS, PING/VERSION) — no exec, no volumes, no image
+  # management, no writes at all (POST stays unset, which defaults to off).
+  # Telegraf and Alloy talk to this over the compose network instead of
+  # mounting the socket themselves, so neither needs `user: root` or
+  # host-level Docker API access to do per-container metrics/logs.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.4
+    environment:
+      CONTAINERS: 1
+      INFO: 1
+      EVENTS: 1
+      PING: 1
+      VERSION: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  # Per-container resource usage, via docker-socket-proxy — never touches the
+  # host socket directly.
   telegraf:
     image: telegraf:1.35-alpine
-    user: root
     entrypoint: ["telegraf"]
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./docker/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    depends_on: [docker-socket-proxy]
     restart: unless-stopped
 
   # Logs. Prometheus stores numeric series only; log text does not fit in it.
@@ -128,17 +148,16 @@ pub const COMPOSE_SERVICES: &str = r#"
       - loki_data:/loki
     restart: unless-stopped
 
-  # Reads every container's stdout through the Docker API and pushes it to Loki.
+  # Reads every container's stdout through the Docker API (via
+  # docker-socket-proxy, never the host socket directly) and pushes it to Loki.
   alloy:
     image: grafana/alloy:v1.18.1
-    user: root
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./docker/alloy/config.alloy:/etc/alloy/config.alloy:ro
       # Read positions per container. Without persisting them, a restart would
       # re-send every log from the beginning and duplicate everything in Loki.
       - alloy_data:/var/lib/alloy/data
-    depends_on: [loki]
+    depends_on: [loki, docker-socket-proxy]
     restart: unless-stopped
 
   # Traces, over OTLP.
@@ -153,7 +172,7 @@ pub const COMPOSE_SERVICES: &str = r#"
   grafana:
     image: grafana/grafana:11.6.1
     ports:
-      - "3002:3000"
+      - "127.0.0.1:3002:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
