@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use pharos_saga::{SagaInstance, SagaStatus, SagaStore, SagaTimeoutStore};
+use pharos_saga::{SagaInstance, SagaSaveError, SagaStatus, SagaStore, SagaTimeoutStore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::Row;
@@ -23,8 +23,10 @@ CREATE TABLE IF NOT EXISTS pharos_sagas (
     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
     deadline_at TIMESTAMPTZ NULL,
     updated_at TIMESTAMPTZ NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
     PRIMARY KEY (saga_type, saga_id)
 );
+ALTER TABLE pharos_sagas ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_pharos_sagas_due
     ON pharos_sagas (saga_type, deadline_at)
     WHERE status = 'running' AND deadline_at IS NOT NULL;
@@ -108,6 +110,20 @@ impl<I, S> PgSagaStore<I, S> {
     pub async fn migrate(&self) -> Result<(), PgPoolError> {
         migrate_postgres_saga_schema(&self.pool).await
     }
+
+    async fn stored_version(&self, saga_id: &str) -> Result<Option<u64>, PostgresSagaStoreError> {
+        let row =
+            sqlx::query("SELECT version FROM pharos_sagas WHERE saga_type = $1 AND saga_id = $2")
+                .bind(&self.saga_type)
+                .bind(saga_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|r| {
+            let v: i64 = r.try_get("version")?;
+            Ok::<_, PostgresSagaStoreError>(v as u64)
+        })
+        .transpose()
+    }
 }
 
 fn instance_from_row<I, S>(
@@ -128,12 +144,14 @@ where
     let status: String = row.try_get("status")?;
     let deadline: Option<DateTime<Utc>> = row.try_get("deadline_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+    let version: i64 = row.try_get("version")?;
     Ok(SagaInstance {
         id,
         state: serde_json::from_value(state)?,
         status: status_from_str(&status)?,
         deadline,
         updated_at,
+        version: version as u64,
     })
 }
 
@@ -148,7 +166,8 @@ where
     async fn load(&self, id: &I) -> Result<Option<SagaInstance<I, S>>, Self::Error> {
         async move {
             let row = sqlx::query(
-                "SELECT saga_id, state, status, deadline_at, updated_at FROM pharos_sagas
+                "SELECT saga_id, state, status, deadline_at, updated_at, version
+                 FROM pharos_sagas
                  WHERE saga_type = $1 AND saga_id = $2",
             )
             .bind(&self.saga_type)
@@ -164,27 +183,68 @@ where
         .await
     }
 
-    async fn save(&self, instance: SagaInstance<I, S>) -> Result<(), Self::Error> {
+    async fn save(&self, instance: SagaInstance<I, S>) -> Result<(), SagaSaveError<Self::Error>> {
         async move {
-            let state = serde_json::to_string(&instance.state)?;
-            sqlx::query(
-                "INSERT INTO pharos_sagas
-                    (saga_type, saga_id, state, status, deadline_at, updated_at)
-                 VALUES ($1, $2, $3::jsonb, $4, $5, $6)
-                 ON CONFLICT (saga_type, saga_id) DO UPDATE
-                 SET state = EXCLUDED.state,
-                     status = EXCLUDED.status,
-                     deadline_at = EXCLUDED.deadline_at,
-                     updated_at = EXCLUDED.updated_at",
-            )
-            .bind(&self.saga_type)
-            .bind(instance.id.to_string())
-            .bind(&state)
-            .bind(status_to_str(instance.status))
-            .bind(instance.deadline)
-            .bind(instance.updated_at)
-            .execute(&self.pool)
-            .await?;
+            let state = serde_json::to_string(&instance.state)
+                .map_err(|e| SagaSaveError::Storage(PostgresSagaStoreError::Serialization(e)))?;
+            let expected = instance.version;
+            let new_version = expected as i64 + 1;
+            let saga_id = instance.id.to_string();
+
+            // `expected == 0` means the caller believes no row exists yet:
+            // an INSERT that another writer wins is a conflict, exactly like
+            // an UPDATE whose `version` predicate misses. Splitting the two
+            // is what makes this a real compare-and-swap instead of the
+            // previous unconditional UPSERT, which let two concurrent
+            // `react` outcomes for the same saga silently overwrite one
+            // another — the second `save` always won, and the first's
+            // dispatched commands were never reflected in the persisted
+            // state.
+            let affected = if expected == 0 {
+                sqlx::query(
+                    "INSERT INTO pharos_sagas
+                        (saga_type, saga_id, state, status, deadline_at, updated_at, version)
+                     VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
+                     ON CONFLICT (saga_type, saga_id) DO NOTHING",
+                )
+                .bind(&self.saga_type)
+                .bind(&saga_id)
+                .bind(&state)
+                .bind(status_to_str(instance.status))
+                .bind(instance.deadline)
+                .bind(instance.updated_at)
+                .bind(new_version)
+                .execute(&self.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE pharos_sagas
+                     SET state = $3::jsonb, status = $4, deadline_at = $5, updated_at = $6,
+                         version = $7
+                     WHERE saga_type = $1 AND saga_id = $2 AND version = $8",
+                )
+                .bind(&self.saga_type)
+                .bind(&saga_id)
+                .bind(&state)
+                .bind(status_to_str(instance.status))
+                .bind(instance.deadline)
+                .bind(instance.updated_at)
+                .bind(new_version)
+                .bind(expected as i64)
+                .execute(&self.pool)
+                .await
+            }
+            .map_err(|e| SagaSaveError::Storage(PostgresSagaStoreError::Storage(e)))?
+            .rows_affected();
+
+            if affected == 0 {
+                let actual = self
+                    .stored_version(&saga_id)
+                    .await
+                    .map_err(SagaSaveError::Storage)?;
+                return Err(SagaSaveError::ConcurrencyConflict { expected, actual });
+            }
+
             metrics::counter!(
                 "pharos.postgres.saga_store.saved",
                 "saga_type" => self.saga_type.clone()
@@ -219,6 +279,13 @@ where
             // either applies a transition or crashes and the lease expires.
             // The RETURNING clause reads the deadline from the CTE, so the
             // caller sees the original (elapsed) deadline, not the lease.
+            //
+            // Bumping `version` here too means a concurrent event handler's
+            // `save` — racing this claim on the same saga — arbitrates
+            // through the same compare-and-swap `save` already uses: only
+            // one of them can be first, and the loser gets a
+            // `ConcurrencyConflict` instead of silently clobbering the
+            // claim's lease with a stale `deadline_at`.
             let rows = sqlx::query(
                 "WITH due AS (
                      SELECT saga_type, saga_id, deadline_at FROM pharos_sagas
@@ -231,11 +298,11 @@ where
                      FOR UPDATE SKIP LOCKED
                  )
                  UPDATE pharos_sagas p
-                 SET deadline_at = $4
+                 SET deadline_at = $4, version = p.version + 1
                  FROM due
                  WHERE p.saga_type = due.saga_type AND p.saga_id = due.saga_id
                  RETURNING p.saga_id, p.state, p.status,
-                           due.deadline_at AS deadline_at, p.updated_at",
+                           due.deadline_at AS deadline_at, p.updated_at, p.version",
             )
             .bind(&self.saga_type)
             .bind(now)

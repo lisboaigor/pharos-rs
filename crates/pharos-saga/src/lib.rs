@@ -38,6 +38,16 @@ pub struct SagaInstance<I, S> {
     pub deadline: Option<DateTime<Utc>>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Version this instance was loaded (or created) at, for
+    /// [`SagaStore::save`]'s optimistic-concurrency check.
+    ///
+    /// `0` means "never persisted": [`save`](SagaStore::save) must create the
+    /// row rather than update one. A caller never sets this to anything but
+    /// what [`SagaStore::load`] (or a fresh [`running`](Self::running)) handed
+    /// it — `save` derives the version it actually stores (`version + 1`)
+    /// from its own count, so there is no way to hand-construct an instance
+    /// that claims a version beyond what was legitimately persisted.
+    pub version: u64,
 }
 
 impl<I, S> SagaInstance<I, S> {
@@ -49,6 +59,7 @@ impl<I, S> SagaInstance<I, S> {
             status: SagaStatus::Running,
             deadline: None,
             updated_at: Utc::now(),
+            version: 0,
         }
     }
 
@@ -143,6 +154,33 @@ pub trait Saga: Send + Sync + 'static {
     }
 }
 
+/// Error returned by [`SagaStore::save`].
+///
+/// Distinguishes a lost optimistic-concurrency race from an ordinary storage
+/// failure — the same split `pharos_core::RepositoryError` draws for
+/// aggregates. `pharos-saga` has no dependency on `pharos-core` (each crate
+/// in this workspace owns its own boundary error type), so this is a small
+/// local echo of that shape rather than a re-export. Without it, `save` had
+/// no way to refuse a write whose [`SagaInstance::version`] no longer matched
+/// what was stored, so two events racing on the same saga silently
+/// overwrote one another instead of one of them failing visibly.
+#[derive(Debug, Error)]
+pub enum SagaSaveError<E: Error + 'static> {
+    /// The version `save` was given no longer matches what is stored:
+    /// something else saved this instance first. [`SagaRunner`] reloads and
+    /// recomputes the transition against the fresh state before retrying.
+    #[error("saga concurrency conflict: expected version {expected}, found {actual:?}")]
+    ConcurrencyConflict {
+        /// Version the caller's [`SagaInstance`] was loaded at.
+        expected: u64,
+        /// Version currently stored, when known.
+        actual: Option<u64>,
+    },
+    /// Adapter-specific storage failure.
+    #[error(transparent)]
+    Storage(E),
+}
+
 /// Persistence boundary for saga instances.
 pub trait SagaStore<I, S>: Send + Sync + 'static {
     /// Concrete storage error.
@@ -154,11 +192,22 @@ pub trait SagaStore<I, S>: Send + Sync + 'static {
         id: &I,
     ) -> impl Future<Output = Result<Option<SagaInstance<I, S>>, Self::Error>> + Send;
 
-    /// Upserts an instance.
+    /// Persists an instance, enforcing optimistic concurrency on
+    /// [`SagaInstance::version`].
+    ///
+    /// `instance.version == 0` means "this saga has never been persisted":
+    /// implementations must create the row, refusing with
+    /// [`SagaSaveError::ConcurrencyConflict`] if one already exists (someone
+    /// else created it first). Otherwise implementations must update only
+    /// when the stored version still equals `instance.version`, storing
+    /// `instance.version + 1`, and refuse with
+    /// [`SagaSaveError::ConcurrencyConflict`] otherwise. An implementation
+    /// that upserts unconditionally reintroduces the lost-update bug this
+    /// type exists to prevent.
     fn save(
         &self,
         instance: SagaInstance<I, S>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), SagaSaveError<Self::Error>>> + Send;
 }
 
 /// Saga store that can also claim instances with an elapsed deadline.
@@ -224,6 +273,39 @@ where
         /// Reason supplied by the saga's transition.
         reason: String,
     },
+    /// [`SagaStore::save`] lost an optimistic-concurrency race and
+    /// [`SagaRunner::handle`]'s bounded retry ([`SagaRunner::MAX_CONFLICT_RETRIES`]
+    /// attempts) still could not win it — sustained contention on one saga
+    /// instance, not a transient loss.
+    #[error(
+        "saga concurrency conflict was not resolved after retrying: expected version \
+         {expected}, found {actual:?}"
+    )]
+    Conflict {
+        /// Version this attempt expected to find stored.
+        expected: u64,
+        /// Version actually stored, when known.
+        actual: Option<u64>,
+    },
+}
+
+impl<SE, StoreE, DispatchE> SagaRunnerError<SE, StoreE, DispatchE>
+where
+    SE: Error + 'static,
+    StoreE: Error + 'static,
+    DispatchE: Error + 'static,
+{
+    /// Splits a [`SagaSaveError`] into the matching [`SagaRunnerError`]
+    /// variant: a lost race becomes [`Conflict`](Self::Conflict), everything
+    /// else becomes [`Store`](Self::Store).
+    fn from_save_error(error: SagaSaveError<StoreE>) -> Self {
+        match error {
+            SagaSaveError::ConcurrencyConflict { expected, actual } => {
+                Self::Conflict { expected, actual }
+            }
+            SagaSaveError::Storage(error) => Self::Store(error),
+        }
+    }
 }
 
 /// Drives a saga end-to-end: load state, react, save, dispatch commands.
@@ -234,6 +316,12 @@ pub struct SagaRunner<SG, Store, Dispatcher> {
 }
 
 impl<SG, Store, Dispatcher> SagaRunner<SG, Store, Dispatcher> {
+    /// Upper bound on how many times [`handle`](Self::handle) retries a
+    /// transition after an optimistic-concurrency conflict before giving up
+    /// and returning [`SagaRunnerError::Conflict`]. Bounded so a saga stuck
+    /// under sustained contention fails loudly instead of retrying forever.
+    pub const MAX_CONFLICT_RETRIES: u32 = 8;
+
     /// Creates a runner.
     pub fn new(saga: SG, store: Store, dispatcher: Dispatcher) -> Self {
         Self {
@@ -251,6 +339,17 @@ where
     Dispatcher: CommandDispatcher<SG::Command>,
 {
     /// Handles an event from start to finish.
+    ///
+    /// Load → react → save is retried up to [`Self::MAX_CONFLICT_RETRIES`]
+    /// times when [`SagaStore::save`] reports a
+    /// [`SagaSaveError::ConcurrencyConflict`] — two events for the same saga
+    /// instance handled concurrently (two consumers, or a saga event racing a
+    /// timeout sweep) load the same state, and without this the second
+    /// `save` used to win silently, discarding whatever the first one
+    /// computed even though its commands had already been dispatched. A
+    /// retry reloads the state the winner actually persisted and recomputes
+    /// [`Saga::react`] against it, so the loser's effect is folded in rather
+    /// than lost.
     pub async fn handle(
         &self,
         event: &SG::Event,
@@ -259,17 +358,48 @@ where
             return Ok(());
         };
 
-        let current = self.store.load(&id).await.map_err(SagaRunnerError::Store)?;
-        let transition = self
-            .saga
-            .react(current.as_ref(), event)
-            .await
-            .map_err(SagaRunnerError::Saga)?;
+        let mut last_conflict = None;
+        for _ in 0..Self::MAX_CONFLICT_RETRIES {
+            let current = self.store.load(&id).await.map_err(SagaRunnerError::Store)?;
+            let transition = self
+                .saga
+                .react(current.as_ref(), event)
+                .await
+                .map_err(SagaRunnerError::Saga)?;
 
-        if matches!(transition, SagaTransition::Ignore) {
-            return Ok(());
+            if matches!(transition, SagaTransition::Ignore) {
+                return Ok(());
+            }
+
+            // A terminal instance must not be revived by a redelivered or
+            // late-arriving duplicate just because `react` did not itself
+            // check `status` — at-least-once delivery means a duplicate of
+            // an event this saga already completed or failed on can still
+            // arrive, and `Saga::react` is user-supplied business logic that
+            // should not have to re-derive "am I already done?" in every
+            // implementation.
+            if let Some(instance) = &current
+                && !matches!(instance.status, SagaStatus::Running)
+            {
+                tracing::warn!(
+                    saga_status = ?instance.status,
+                    "ignoring a non-Ignore transition computed for a saga instance that already \
+                     reached a terminal status; a duplicate or late-arriving event cannot revive it"
+                );
+                return Ok(());
+            }
+
+            match self.apply_transition(id.clone(), current, transition).await {
+                Ok(()) => return Ok(()),
+                Err(SagaRunnerError::Conflict { expected, actual }) => {
+                    last_conflict = Some((expected, actual));
+                }
+                Err(other) => return Err(other),
+            }
         }
-        self.apply_transition(id, current, transition).await
+
+        let (expected, actual) = last_conflict.unwrap_or((0, None));
+        Err(SagaRunnerError::Conflict { expected, actual })
     }
 
     /// Handles an event that isn't the saga's own [`Saga::Event`] but converts
@@ -321,7 +451,7 @@ where
                 self.store
                     .save(instance)
                     .await
-                    .map_err(SagaRunnerError::Store)?;
+                    .map_err(SagaRunnerError::from_save_error)?;
                 self.dispatch_all(commands).await
             }
             SagaTransition::Advance {
@@ -338,7 +468,7 @@ where
                 self.store
                     .save(instance)
                     .await
-                    .map_err(SagaRunnerError::Store)?;
+                    .map_err(SagaRunnerError::from_save_error)?;
                 self.dispatch_all(commands).await
             }
             SagaTransition::Complete { state, commands } => {
@@ -351,7 +481,7 @@ where
                 self.store
                     .save(instance)
                     .await
-                    .map_err(SagaRunnerError::Store)?;
+                    .map_err(SagaRunnerError::from_save_error)?;
                 self.dispatch_all(commands).await
             }
             SagaTransition::Fail { reason, commands } => {
@@ -364,7 +494,7 @@ where
                     self.store
                         .save(instance)
                         .await
-                        .map_err(SagaRunnerError::Store)?;
+                        .map_err(SagaRunnerError::from_save_error)?;
                 }
                 // Compensating commands are dispatched the same way a
                 // `Complete`'s are: the saga is terminally failed, but the
@@ -372,6 +502,12 @@ where
                 // Dispatched after persisting the failed state so a crash
                 // between the two never leaves a live saga believing it can
                 // still act.
+                //
+                // The cost of that ordering: `store.save` and `dispatch_all`
+                // are two separate awaits, not one transaction. A crash
+                // between them leaves the saga terminally `Failed` with its
+                // compensating commands never dispatched and no retry —
+                // this is NOT atomic with the terminal transition.
                 self.dispatch_all(commands).await?;
                 Err(SagaRunnerError::Failed { reason })
             }
@@ -426,7 +562,7 @@ where
                 self.store
                     .save(instance)
                     .await
-                    .map_err(SagaRunnerError::Store)?;
+                    .map_err(SagaRunnerError::from_save_error)?;
                 processed += 1;
                 continue;
             }
@@ -545,12 +681,16 @@ mod tests {
 
         async fn save(
             &self,
-            instance: SagaInstance<String, BillingState>,
-        ) -> Result<(), Self::Error> {
-            self.instances
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(instance.id.clone(), instance);
+            mut instance: SagaInstance<String, BillingState>,
+        ) -> Result<(), SagaSaveError<Self::Error>> {
+            let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+            let expected = instance.version;
+            let actual = instances.get(&instance.id).map(|stored| stored.version);
+            if actual.unwrap_or(0) != expected {
+                return Err(SagaSaveError::ConcurrencyConflict { expected, actual });
+            }
+            instance.version = expected + 1;
+            instances.insert(instance.id.clone(), instance);
             Ok(())
         }
     }
@@ -563,20 +703,34 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<SagaInstance<String, BillingState>>, Self::Error> {
             let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
-            let mut due: Vec<_> = instances
+            let mut candidate_ids: Vec<String> = instances
                 .values()
                 .filter(|i| {
                     i.status == SagaStatus::Running
                         && i.deadline.is_some_and(|deadline| deadline <= now)
                 })
-                .cloned()
+                .map(|i| i.id.clone())
                 .collect();
-            due.sort_by_key(|i| i.deadline);
-            due.truncate(limit);
-            // Claim: postpone the stored deadline, return the original one.
-            for claimed in &due {
-                if let Some(stored) = instances.get_mut(&claimed.id) {
+            candidate_ids.sort_by_key(|id| instances[id].deadline);
+            candidate_ids.truncate(limit);
+
+            // Claim: postpone the stored deadline and bump the version (so a
+            // concurrent `save` racing this claim loses the compare-and-swap
+            // instead of silently clobbering the lease). The caller must see
+            // the original (elapsed) deadline and the post-claim version —
+            // the same split the PostgreSQL adapter's `RETURNING` draws
+            // between its `due` CTE (pre-claim deadline) and the updated row
+            // (post-claim version) — so the clone happens *after* bumping,
+            // with the original deadline restored onto it afterward.
+            let mut due = Vec::with_capacity(candidate_ids.len());
+            for id in candidate_ids {
+                if let Some(stored) = instances.get_mut(&id) {
+                    let original_deadline = stored.deadline;
                     stored.deadline = Some(now + lease);
+                    stored.version += 1;
+                    let mut claimed = stored.clone();
+                    claimed.deadline = original_deadline;
+                    due.push(claimed);
                 }
             }
             Ok(due)
