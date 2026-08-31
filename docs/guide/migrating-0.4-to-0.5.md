@@ -1,8 +1,8 @@
 # Migrating from 0.4 to 0.5
 
 0.5.0 closes out a framework-wide correctness audit. Most of it is
-non-breaking (new methods, new optional behavior, bug fixes), but five
-changes touch public API shape. This page covers only those five — see the
+non-breaking (new methods, new optional behavior, bug fixes), but six
+changes touch public API shape. This page covers only those six — see the
 commit log for the full set of fixes.
 
 ## 1. The transactional seam moved from `pharos-postgres` to `pharos-app`
@@ -102,6 +102,37 @@ runner retries a lost race automatically.
 `ProcessOutcome::StillProcessing` (another consumer holds the message's
 lease; it was nacked and requeued rather than dropped). An exhaustive
 `match` on `ProcessOutcome` needs a new arm.
+
+## 6. `SagaRunner` enqueues commands onto a durable outbox instead of dispatching them directly
+
+```rust
+// before
+let runner = SagaRunner::new(saga, store, dispatcher);
+
+// after
+let runner = SagaRunner::new(saga, store, outbox, map_command);
+```
+
+`SagaRunner<SG, Store, Dispatcher>` becomes `SagaRunner<SG, Store, Outbox,
+MapCommand>`, where `Outbox: OutboxRepository` and `MapCommand: Fn(&SG::Command)
+-> pharos_messaging::Message` — the same role `map_event` plays for
+`pharos_app::save_and_enqueue_in`. `SagaRunnerError` drops its `DispatchE`
+parameter and gains `Enqueue(OutboxError)`.
+
+`CommandDispatcher` is unchanged, but `SagaRunner` no longer calls it. To
+actually deliver enqueued commands, run a `pharos_messaging::OutboxDispatcher`
+against the same outbox, paired with the new `DurableCommandPublisher`
+wrapping your real `CommandDispatcher`:
+
+```rust
+let publisher = DurableCommandPublisher::new(my_dispatcher, decode_command);
+let drainer = OutboxDispatcher::new(outbox, publisher);
+drainer.dispatch_batch().await; // delivers whatever the runner enqueued
+```
+
+This gets you real retry/backoff/dead-letter handling on saga commands,
+which the direct-dispatch path never had — a failed or unreachable
+`CommandDispatcher::dispatch` used to be lost with no recovery.
 
 ## Everything else
 
