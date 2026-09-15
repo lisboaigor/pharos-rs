@@ -43,8 +43,9 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, Meta, PathArguments, Token, Type,
-    parse::Parser, parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned,
+    Data, DeriveInput, Expr, Fields, FnArg, GenericArgument, Ident, ItemFn, LitStr, Meta, Pat,
+    PathArguments, Token, Type, parse::Parser, parse_macro_input, parse_quote,
+    punctuated::Punctuated, spanned::Spanned,
 };
 
 #[proc_macro_derive(Entity, attributes(id))]
@@ -461,6 +462,98 @@ pub fn external_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     quote!(#ast).into()
+}
+
+/// Arguments to [`requires_roles`]: a free expression (typically a `|` chain
+/// of role variants) followed by `, principal = <ident>`.
+struct RequiresRolesArgs {
+    roles: Expr,
+    principal: Ident,
+}
+
+impl syn::parse::Parse for RequiresRolesArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let roles: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let principal_kw: Ident = input.parse()?;
+        if principal_kw != "principal" {
+            return Err(syn::Error::new(
+                principal_kw.span(),
+                "expected `principal = <parameter name>`",
+            ));
+        }
+        input.parse::<Token![=]>()?;
+        let principal: Ident = input.parse()?;
+        Ok(Self { roles, principal })
+    }
+}
+
+/// Inserts an authorization check as the first statement of a route
+/// function, checking a `principal` parameter against a declared set of
+/// roles before the rest of the function body runs.
+///
+/// The role requirement lives on the route — not on any `Command` the route
+/// dispatches — because the same command can be reachable through more than
+/// one route with different access policies, or not be HTTP-reachable at
+/// all. `roles` is any expression (typically a `|` chain of role variants,
+/// e.g. `Role::Vendedor | Role::Admin`); the parameter named by `principal`
+/// must implement [`pharos_app::Authorize<R>`](../pharos_app/trait.Authorize.html)
+/// for whatever type `roles` evaluates to.
+///
+/// ```ignore
+/// #[pharos_macros::requires_roles(Role::Vendedor | Role::Admin, principal = user)]
+/// pub async fn iniciar(
+///     State(s): State<VendasState>,
+///     user: AuthUser,
+///     Json(mut cmd): Json<IniciarVenda>,
+/// ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+///     cmd.venda_id = Uuid::now_v7();
+///     cmd.vendedor_id = user.id;
+///     let id = dispatch(&*s.vendas, cmd).await?;
+///     Ok((StatusCode::CREATED, Json(json!({ "venda_id": id.to_string() }))))
+/// }
+/// ```
+///
+/// Expands the body's first statement to
+/// `pharos_app::Authorize::authorize(&user, Role::Vendedor | Role::Admin)?;`
+/// — a fully qualified trait call, so it works whether or not
+/// `pharos_app::Authorize` is imported in the target file. Requires the
+/// annotated function to declare a parameter named `principal` (`user` in
+/// the example above); this is checked at expansion time, not left to a
+/// less legible "no such parameter" error from the generated call.
+#[proc_macro_attribute]
+pub fn requires_roles(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let RequiresRolesArgs { roles, principal } = parse_macro_input!(attr as RequiresRolesArgs);
+    let mut func = parse_macro_input!(item as ItemFn);
+
+    let has_principal_param = func.sig.inputs.iter().any(|arg| match arg {
+        FnArg::Typed(pat_type) => {
+            matches!(&*pat_type.pat, Pat::Ident(id) if id.ident == principal)
+        }
+        FnArg::Receiver(_) => false,
+    });
+    if !has_principal_param {
+        return err(
+            func.sig.span(),
+            &format!(
+                "#[requires_roles(...)] expects a parameter named `{principal}` \
+                 (set via `principal = {principal}`), but no such parameter was found",
+            ),
+        )
+        .into();
+    }
+
+    let app = match pharos_paths() {
+        Ok(paths) => paths.app,
+        Err(e) => return e.into_compile_error().into(),
+    };
+
+    let check: syn::Stmt = parse_quote! {
+        #app::Authorize::authorize(&#principal, #roles)?;
+    };
+    func.block.stmts.insert(0, check);
+
+    quote!(#func).into()
 }
 
 /// Which dispatchable trait a derive targets; captures the small differences

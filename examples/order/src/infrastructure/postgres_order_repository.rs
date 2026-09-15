@@ -80,14 +80,11 @@ impl TransactionalRepository<Order, PostgresUnitOfWork> for PostgresOrderReposit
     ///
     /// Same OCC contract as `Repository::save`; the caller owns commit and
     /// rollback (and reverts the in-memory version if the transaction fails).
-    async fn save_in_tx<'c, 'g>(
+    async fn save_in_tx<'c>(
         &'c self,
-        conn: &'c mut <PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        conn: &'c mut <PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx,
         aggregate: &'c mut Order,
-    ) -> Result<(), RepositoryError<Self::Error>>
-    where
-        'g: 'c,
-    {
+    ) -> Result<(), RepositoryError<Self::Error>> {
         let expected = aggregate.version();
         let new_version = expected + 1;
         let status = status_to_str(aggregate.status());

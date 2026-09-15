@@ -37,7 +37,7 @@ pub use messaging::{
     MessagePublisher, MessagingError, RetryDecision, RetryPolicy,
 };
 pub use outbox::{
-    OutboxError, OutboxMessage, OutboxRepository, OutboxStatus, SweepError,
+    OutboxError, OutboxMessage, OutboxRepository, OutboxSignal, OutboxStatus, SweepError,
     sweep_failed_to_dead_letter,
 };
 pub use outbox_dispatcher::{

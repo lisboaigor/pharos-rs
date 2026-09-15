@@ -78,6 +78,24 @@ pub fn extract(headers: &BTreeMap<String, String>) -> Context {
     global::get_text_map_propagator(|propagator| propagator.extract(&ReadHeaders(headers)))
 }
 
+/// [`pharos_app::MessageEnricher`] that stamps an outgoing message with the
+/// current trace context, via [`inject`].
+///
+/// Register it on a store's outbox delivery (e.g.
+/// `pharos_postgres::PostgresAggregateStore::with_enricher`) so every event a
+/// request enqueues carries that request's `traceparent`. A relay that later
+/// dispatches the message (`pharos_observability::propagation::extract`, or
+/// the equivalent inbound wiring) re-parents its own span under this one, so
+/// the request and everything it causes stay one trace instead of the relay
+/// starting a new one each time.
+pub struct TraceContextHeaders;
+
+impl pharos_app::MessageEnricher for TraceContextHeaders {
+    fn enrich(&self, message: &mut pharos_app::Message) {
+        inject(&mut message.headers);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

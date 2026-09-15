@@ -83,34 +83,30 @@ impl PostgresUnitOfWork {
 }
 
 impl pharos_app::TransactionalStore for PostgresUnitOfWork {
-    // `Pool::begin` returns an owned, `'static` transaction — it does not
-    // actually borrow `&self` — so the GAT parameter is unused in this
-    // instantiation. `pharos_app::TransactionalStore::Tx` still declares one
-    // per backend that *does* need to borrow its store.
-    type Tx<'a> = sqlx::Transaction<'static, sqlx::Postgres>;
+    // `Pool::begin` returns an owned, `'static` transaction, which is why
+    // `pharos_app::TransactionalStore::Tx` is a plain associated type rather
+    // than a GAT borrowed from `&self`.
+    type Tx = sqlx::Transaction<'static, sqlx::Postgres>;
     type Error = PostgresTransactionError;
 
-    async fn begin(&self) -> Result<Self::Tx<'_>, Self::Error> {
+    async fn begin(&self) -> Result<Self::Tx, Self::Error> {
         self.pool
             .begin()
             .await
             .map_err(PostgresTransactionError::Transaction)
     }
 
-    async fn commit<'a>(&'a self, tx: Self::Tx<'a>) -> Result<(), Self::Error> {
+    async fn commit(&self, tx: Self::Tx) -> Result<(), Self::Error> {
         tx.commit()
             .await
             .map_err(PostgresTransactionError::Transaction)
     }
 
-    async fn insert_outbox_in_tx<'a, 'g>(
+    async fn insert_outbox_in_tx<'a>(
         &'a self,
-        tx: &'a mut Self::Tx<'g>,
+        tx: &'a mut Self::Tx,
         message: &'a OutboxMessage,
-    ) -> Result<(), Self::Error>
-    where
-        'g: 'a,
-    {
+    ) -> Result<(), Self::Error> {
         insert_outbox_in_tx(tx, message).await
     }
 }

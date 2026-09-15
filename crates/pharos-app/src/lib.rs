@@ -77,7 +77,12 @@
 //!     Process -->|error| Failed
 //! ```
 
+pub mod aggregate_store;
+pub mod authorize;
+pub mod cascade;
 pub mod command;
+#[cfg(feature = "messaging")]
+pub mod enrichment;
 pub mod error;
 pub mod event_bus;
 pub mod event_handler;
@@ -114,12 +119,19 @@ pub use pharos_messaging::{
     schema_registry,
 };
 
+pub use aggregate_store::{AggregateStore, StoreError};
+pub use authorize::Authorize;
+pub use cascade::{CascadeError, CascadedCommand, cascade};
 pub use command::{
     Command, CommandHandler, DispatchError, FieldViolation, ValidationError, dispatch,
 };
+#[cfg(feature = "messaging")]
+pub use enrichment::MessageEnricher;
+#[cfg(all(feature = "messaging", feature = "tenant-task-local"))]
+pub use enrichment::TenantHeader;
 pub use error::ApplicationError;
 pub use event_bus::{EventBus, EventBusError, PublishErrorPolicy};
-pub use event_handler::EventHandler;
+pub use event_handler::{CascadingEventHandler, EventHandler};
 pub use integration_event::{CausationId, CorrelationId, IntegrationEvent};
 #[cfg(feature = "messaging")]
 pub use pharos_messaging::{
@@ -127,7 +139,7 @@ pub use pharos_messaging::{
     DeadLetterMessage, DeadLetterQueue, Delivery, DispatchConfig, DispatchResult, EventSchema,
     FailureKind, IdempotencyDecision, InboxError, InboxMessage, InboxStatus, InboxStore, Message,
     MessageAcknowledger, MessageConsumer, MessagePublisher, MessagingError, OutboxDispatchError,
-    OutboxDispatcher, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
+    OutboxDispatcher, OutboxError, OutboxMessage, OutboxRepository, OutboxSignal, OutboxStatus,
     PartitionAssignment, ProcessError, ProcessOutcome, RetryDecision, RetryPolicy, SchemaRegistry,
     SchemaRegistryError, SweepError, process_idempotent, process_idempotent_with_retry,
     sweep_failed_to_dead_letter,

@@ -288,6 +288,143 @@ where
     }
 }
 
+/// Tenant-scoped JSONB repository that resolves its tenant from
+/// [`pharos_app::CURRENT_TENANT`] on every operation, instead of being
+/// constructed for one fixed tenant.
+///
+/// [`TenantJsonRepository`] takes a `&TenantContext` at construction time —
+/// the right shape when the caller already has one in hand (a saga step, a
+/// one-off script). An application whose handlers are built once at startup
+/// and then serve many tenants' requests on the same long-lived instance
+/// needs the opposite: a repository that is itself tenant-agnostic and reads
+/// the tenant fresh from the task-local for every call. That is what this
+/// type is for, and it is what [`crate::PostgresAggregateStore`] uses
+/// internally.
+///
+/// Requires the `tenant-task-local` feature (enabled transitively — see this
+/// crate's `pharos-app` dependency).
+pub struct CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot,
+{
+    pool: Pool,
+    aggregate_type: std::sync::Arc<str>,
+    _marker: std::marker::PhantomData<fn() -> A>,
+}
+
+impl<A> std::fmt::Debug for CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CurrentTenantJsonRepository")
+            .field("aggregate_type", &self.aggregate_type)
+            .finish_non_exhaustive()
+    }
+}
+
+// Written by hand instead of `#[derive(Clone)]`: the derive would add a
+// spurious `A: Clone` bound (it clones every field including
+// `PhantomData<fn() -> A>`, and the derive macro is not smart enough to see
+// that a `PhantomData` never actually holds an `A`). Every real field here
+// (`Pool`, `Arc<str>`) is cheap to clone regardless of `A`.
+impl<A> Clone for CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            aggregate_type: self.aggregate_type.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A> CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot,
+{
+    /// Creates a repository over `pool` for the given aggregate type. The
+    /// tenant is resolved per operation, not here.
+    pub fn new(pool: Pool, aggregate_type: impl Into<std::sync::Arc<str>>) -> Self {
+        Self {
+            pool,
+            aggregate_type: aggregate_type.into(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Resolves the current tenant and hands back a [`TenantJsonRepository`]
+    /// scoped to it. Fails when no tenant is in scope — the deny-by-default
+    /// posture [`pharos_app::CURRENT_TENANT`] documents.
+    fn scoped(&self) -> Result<TenantJsonRepository<A>, PostgresRepositoryError> {
+        let tenant = pharos_app::CURRENT_TENANT
+            .try_with(|t| *t)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                PostgresRepositoryError::Storage(sqlx::Error::Protocol(
+                    "tenant context missing in the persistence operation".into(),
+                ))
+            })?;
+        Ok(TenantJsonRepository::new(
+            self.pool.clone(),
+            &tenant,
+            &*self.aggregate_type,
+        ))
+    }
+}
+
+impl<A> Repository<A> for CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot + Serialize + DeserializeOwned + Send + Sync + 'static,
+    <A as Entity>::Id: Display + FromStr + Send + Sync + 'static,
+    <<A as Entity>::Id as FromStr>::Err: Display + Send + Sync + 'static,
+{
+    type Error = PostgresRepositoryError;
+
+    async fn find_by_id(&self, id: &A::Id) -> Result<Option<A>, Self::Error> {
+        self.scoped()?.find_by_id(id).await
+    }
+
+    async fn save(&self, aggregate: &mut A) -> Result<(), RepositoryError<Self::Error>> {
+        self.scoped()
+            .map_err(RepositoryError::Storage)?
+            .save(aggregate)
+            .await
+    }
+
+    async fn delete(&self, id: &A::Id) -> Result<(), Self::Error> {
+        self.scoped()?.delete(id).await
+    }
+}
+
+/// Same tenant-per-operation resolution as the `Repository` impl above,
+/// giving [`crate::PostgresAggregateStore`]'s outbox delivery mode the
+/// atomic snapshot-plus-outbox guarantee without pinning the repository to
+/// one tenant at construction time.
+impl<A> pharos_app::TransactionalRepository<A, crate::PostgresUnitOfWork>
+    for CurrentTenantJsonRepository<A>
+where
+    A: AggregateRoot + Serialize + DeserializeOwned + Send + Sync + 'static,
+    <A as Entity>::Id: Display + FromStr + Send + Sync + 'static,
+    <<A as Entity>::Id as FromStr>::Err: Display + Send + Sync + 'static,
+{
+    type Error = PostgresRepositoryError;
+
+    async fn save_in_tx<'c>(
+        &'c self,
+        conn: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx,
+        aggregate: &'c mut A,
+    ) -> Result<(), RepositoryError<Self::Error>> {
+        self.scoped()
+            .map_err(RepositoryError::Storage)?
+            .save_in_tx(conn, aggregate)
+            .await
+    }
+}
+
 /// Tenant-scoped transactional composition: implementing this alongside
 /// [`Repository`] lets [`save_and_enqueue_in`](crate::save_and_enqueue_in) cover
 /// the aggregate snapshot **and** the outbox inserts in one `BEGIN … COMMIT`,
@@ -305,14 +442,11 @@ where
 {
     type Error = PostgresRepositoryError;
 
-    async fn save_in_tx<'c, 'g>(
+    async fn save_in_tx<'c>(
         &'c self,
-        conn: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        conn: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx,
         aggregate: &'c mut A,
-    ) -> Result<(), RepositoryError<Self::Error>>
-    where
-        'g: 'c,
-    {
+    ) -> Result<(), RepositoryError<Self::Error>> {
         let aggregate_id =
             parse_aggregate_id(&aggregate.id().to_string()).map_err(RepositoryError::Storage)?;
         let expected = aggregate.version();

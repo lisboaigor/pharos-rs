@@ -476,7 +476,7 @@ async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() ->
     };
 
     // Atomic: the tenant-scoped snapshot and both outbox rows commit together.
-    save_and_enqueue_in(&store, &repo, &mut aggregate, map_to_message).await?;
+    save_and_enqueue_in(&store, &repo, &mut aggregate, map_to_message_fallibly).await?;
     assert_eq!(aggregate.version(), 1);
 
     let found = repo.find_by_id(&agg_id).await?;
@@ -495,7 +495,7 @@ async fn save_and_enqueue_in_commits_tenant_aggregate_and_outbox_atomically() ->
             occurred_at: Utc::now(),
         }],
     };
-    let result = save_and_enqueue_in(&store, &repo, &mut stale, map_to_message).await;
+    let result = save_and_enqueue_in(&store, &repo, &mut stale, map_to_message_fallibly).await;
     assert!(matches!(
         result,
         Err(SaveAndEnqueueError::Repository(
@@ -564,6 +564,12 @@ fn map_to_message(event: &TestEvent) -> Message {
         "text/plain",
     )
     .with_key(&event.aggregate_id)
+}
+
+/// Adapts [`map_to_message`]'s infallible signature to the fallible
+/// `map_event` `save_and_enqueue_in` now takes.
+fn map_to_message_fallibly(event: &TestEvent) -> Result<Message, std::convert::Infallible> {
+    Ok(map_to_message(event))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

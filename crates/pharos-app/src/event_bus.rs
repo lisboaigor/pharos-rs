@@ -10,7 +10,8 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{Instrument, debug, info_span};
 
-use crate::event_handler::EventHandler;
+use crate::cascade::CascadeError;
+use crate::event_handler::{CascadingEventHandler, EventHandler};
 
 /// Errors produced while publishing events through the [`EventBus`].
 #[derive(Debug, Error)]
@@ -45,6 +46,16 @@ pub enum EventBusError {
         #[source]
         source: serde_json::Error,
     },
+    /// A command returned by a [`CascadingEventHandler`] failed. Commands
+    /// already dispatched earlier in the same cascade are not undone.
+    #[error("cascaded command failed for '{event_type}': {source}")]
+    CascadeFailed {
+        /// Logical event type whose cascade produced the failing command.
+        event_type: &'static str,
+        /// The cascaded command's own failure, naming the command.
+        #[source]
+        source: CascadeError,
+    },
 }
 
 /// Decides what happens when a handler fails during [`EventBus::publish`].
@@ -78,6 +89,11 @@ type DecodeFn =
 type DecoderRegistry = HashMap<String, (TypeId, DecodeFn)>;
 
 trait ErasedHandler: Send + Sync {
+    /// Stable name for this handler, used for tracing and as the basis of a
+    /// per-handler inbox consumer id a caller derives (see
+    /// [`EventBus::handler_names_for_topic`]).
+    fn name(&self) -> &'static str;
+
     fn call<'a>(
         &'a self,
         event: &'a (dyn Any + Send + Sync),
@@ -94,6 +110,10 @@ where
     E: DomainEvent,
     H: EventHandler<E>,
 {
+    fn name(&self) -> &'static str {
+        type_name::<H>()
+    }
+
     fn call<'a>(
         &'a self,
         event: &'a (dyn Any + Send + Sync),
@@ -124,6 +144,66 @@ where
                     event_type: typed.event_type(),
                     source: Box::new(error),
                 })
+        })
+    }
+}
+
+struct CascadingHandlerWrapper<E, H> {
+    inner: Arc<H>,
+    _marker: PhantomData<fn(E)>,
+}
+
+impl<E, H> ErasedHandler for CascadingHandlerWrapper<E, H>
+where
+    E: DomainEvent,
+    H: CascadingEventHandler<E>,
+{
+    fn name(&self) -> &'static str {
+        type_name::<H>()
+    }
+
+    fn call<'a>(
+        &'a self,
+        event: &'a (dyn Any + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EventBusError>> {
+        let handler = Arc::clone(&self.inner);
+        Box::pin(async move {
+            // The map is keyed by `TypeId::of::<E>()`, so this downcast always
+            // succeeds; the fallible API documents that invariant defensively.
+            let typed = event
+                .downcast_ref::<E>()
+                .ok_or_else(|| EventBusError::HandlerError {
+                    event_type: "<unknown>",
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "event bus invariant violated: TypeId matched but downcast failed",
+                    ),
+                })?;
+
+            let cascaded = handler
+                .handle(typed)
+                .instrument(info_span!(
+                    "event_handler",
+                    handler = type_name::<H>(),
+                    event_type = typed.event_type(),
+                    event.aggregate_id = typed.aggregate_id(),
+                ))
+                .await
+                .map_err(|error| EventBusError::HandlerError {
+                    event_type: typed.event_type(),
+                    source: Box::new(error),
+                })?;
+
+            for command in cascaded {
+                command
+                    .dispatch()
+                    .await
+                    .map_err(|source| EventBusError::CascadeFailed {
+                        event_type: typed.event_type(),
+                        source,
+                    })?;
+            }
+
+            Ok(())
         })
     }
 }
@@ -189,6 +269,32 @@ impl EventBus {
         H: EventHandler<E>,
     {
         let wrapper = Arc::new(HandlerWrapper::<E, H> {
+            inner: Arc::new(handler),
+            _marker: PhantomData,
+        });
+
+        self.handlers
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(TypeId::of::<E>())
+            .or_default()
+            .push(wrapper);
+    }
+
+    /// Registers a [`CascadingEventHandler`] for a concrete domain event type.
+    ///
+    /// Behaves exactly like [`register`](Self::register) for ordering and
+    /// error-policy purposes — it shares the same per-event-type handler
+    /// list — except this handler returns the commands it wants run instead
+    /// of running them itself; [`publish`](Self::publish) dispatches them
+    /// right after the handler returns. See [`CascadingEventHandler`] for the
+    /// cascade's failure semantics.
+    pub fn register_cascading<E, H>(&self, handler: H)
+    where
+        E: DomainEvent,
+        H: CascadingEventHandler<E>,
+    {
+        let wrapper = Arc::new(CascadingHandlerWrapper::<E, H> {
             inner: Arc::new(handler),
             _marker: PhantomData,
         });
@@ -404,6 +510,94 @@ impl EventBus {
         .await
     }
 
+    /// Names of the handlers registered for the event type `topic` decodes
+    /// into, in registration order — for a caller (the outbox relay) that
+    /// wants to dispatch to each handler individually, tracking its own
+    /// idempotency/retry outcome per handler instead of one outcome for the
+    /// whole event. See [`dispatch_trusted_bytes_to_handler`](Self::dispatch_trusted_bytes_to_handler).
+    ///
+    /// Empty when `topic` has no registered decoder or no handler is
+    /// registered for the type it decodes into.
+    pub fn handler_names_for_topic(&self, topic: &str) -> Vec<&'static str> {
+        let Some(type_id) = ({
+            let decoders = self.decoders.read().unwrap_or_else(|p| p.into_inner());
+            decoders.get(topic).map(|(type_id, _)| *type_id)
+        }) else {
+            return Vec::new();
+        };
+
+        let map = self.handlers.read().unwrap_or_else(|p| p.into_inner());
+        match map.get(&type_id) {
+            Some(handlers) => handlers.iter().map(|h| h.name()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Decodes a trusted payload and dispatches it to a single named
+    /// handler, leaving every other handler registered for the same event
+    /// type untouched — the per-handler counterpart of
+    /// [`publish_trusted_bytes`](Self::publish_trusted_bytes), which
+    /// dispatches to all of them at once.
+    ///
+    /// Get `handler_name` from [`handler_names_for_topic`](Self::handler_names_for_topic).
+    /// An unknown topic or a name that matches no registered handler is a
+    /// no-op, logged at debug level — the same posture `publish_trusted_bytes`
+    /// takes for an unknown topic. This re-decodes `payload` on every call;
+    /// dispatching to several handlers for the same bytes pays that cost
+    /// once per handler, same as `publish_trusted_bytes` already pays it
+    /// once per delivery.
+    ///
+    /// Same trust requirement as `publish_trusted_bytes`: only ever call
+    /// this with bytes you already trust.
+    pub async fn dispatch_trusted_bytes_to_handler(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        handler_name: &str,
+    ) -> Result<(), EventBusError> {
+        let span = info_span!(
+            "event_bus.dispatch_trusted_bytes_to_handler",
+            event.topic = topic,
+            handler = handler_name,
+        );
+
+        async move {
+            let Some((type_id, decoder)) = ({
+                let decoders = self.decoders.read().unwrap_or_else(|p| p.into_inner());
+                decoders.get(topic).cloned()
+            }) else {
+                debug!(topic, "no decoder registered for topic");
+                return Ok(());
+            };
+
+            let boxed = decoder(payload).map_err(|source| EventBusError::DecodeError {
+                topic: topic.to_owned(),
+                source,
+            })?;
+
+            let handler = {
+                let map = self.handlers.read().unwrap_or_else(|p| p.into_inner());
+                match map.get(&type_id) {
+                    Some(handlers) => handlers.iter().find(|h| h.name() == handler_name).cloned(),
+                    None => None,
+                }
+            };
+
+            let Some(handler) = handler else {
+                debug!(
+                    handler = handler_name,
+                    "no handler registered with this name"
+                );
+                return Ok(());
+            };
+
+            let any: &(dyn Any + Send + Sync) = &*boxed;
+            handler.call(any).await
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Deprecated alias for [`publish_trusted_bytes`](Self::publish_trusted_bytes).
     ///
     /// Renamed to make the trust requirement impossible to miss at the call
@@ -613,5 +807,225 @@ mod tests {
             .await
             .expect("dispatch");
         assert_eq!(&*seen.lock().unwrap(), &["still works".to_string()]);
+    }
+
+    // A second, distinct handler type for `Echo`, so `handler_names_for_topic`
+    // has two different names to tell apart (two `Recorder` instances would
+    // share the same `type_name`).
+    struct SecondRecorder(Arc<std::sync::Mutex<Vec<String>>>);
+    impl EventHandler<Echo> for SecondRecorder {
+        type Error = std::convert::Infallible;
+        async fn handle(&self, event: &Echo) -> Result<(), Self::Error> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.note.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn handler_names_for_topic_lists_registered_handlers_in_order() {
+        let bus = EventBus::new();
+        bus.register::<Echo, _>(Recorder(Arc::default()));
+        bus.register::<Echo, _>(SecondRecorder(Arc::default()));
+        bus.register_decoder::<Echo>("Echo");
+
+        let names = bus.handler_names_for_topic("Echo");
+        assert_eq!(names.len(), 2);
+        assert!(names[0].ends_with("Recorder"));
+        assert!(names[1].ends_with("SecondRecorder"));
+
+        // No decoder for this topic: empty, not a panic.
+        assert!(bus.handler_names_for_topic("Unknown").is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_trusted_bytes_to_handler_only_runs_the_named_handler() {
+        let bus = EventBus::new();
+        let seen1 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        bus.register::<Echo, _>(Recorder(Arc::clone(&seen1)));
+        bus.register::<Echo, _>(SecondRecorder(Arc::clone(&seen2)));
+        bus.register_decoder::<Echo>("Echo");
+
+        let names = bus.handler_names_for_topic("Echo");
+        let event = Echo {
+            aggregate_id: "a-1".to_string(),
+            occurred_at: Utc::now(),
+            note: "only the first".to_string(),
+        };
+        let payload = serde_json::to_vec(&event).expect("serialize");
+
+        // Dispatching to the first handler by name leaves the second
+        // untouched — the per-handler counterpart of `publish_trusted_bytes`,
+        // which would have run both.
+        bus.dispatch_trusted_bytes_to_handler("Echo", &payload, names[0])
+            .await
+            .expect("dispatch to the first handler");
+        assert_eq!(&*seen1.lock().unwrap(), &["only the first".to_string()]);
+        assert!(seen2.lock().unwrap().is_empty());
+
+        // Dispatching to the second by name now runs only that one.
+        bus.dispatch_trusted_bytes_to_handler("Echo", &payload, names[1])
+            .await
+            .expect("dispatch to the second handler");
+        assert_eq!(&*seen1.lock().unwrap(), &["only the first".to_string()]);
+        assert_eq!(&*seen2.lock().unwrap(), &["only the first".to_string()]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn dispatch_trusted_bytes_to_handler_is_a_noop_for_unknown_topic_or_name() {
+        let bus = EventBus::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        bus.register::<Echo, _>(Recorder(Arc::clone(&seen)));
+        bus.register_decoder::<Echo>("Echo");
+
+        let event = Echo {
+            aggregate_id: "a-1".to_string(),
+            occurred_at: Utc::now(),
+            note: "hello".to_string(),
+        };
+        let payload = serde_json::to_vec(&event).expect("serialize");
+
+        bus.dispatch_trusted_bytes_to_handler("Unknown", &payload, "whatever")
+            .await
+            .expect("unknown topic is a no-op");
+        bus.dispatch_trusted_bytes_to_handler("Echo", &payload, "NotRegistered")
+            .await
+            .expect("unknown handler name is a no-op");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    use crate::cascade::{CascadedCommand, cascade};
+    use crate::command::{Command, CommandHandler};
+
+    struct RecordNote(String);
+
+    impl Command for RecordNote {
+        const NAME: &'static str = "RecordNote";
+    }
+
+    struct Recording(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CommandHandler<RecordNote> for Recording {
+        type Output = ();
+        type Error = std::convert::Infallible;
+
+        async fn handle(&self, cmd: RecordNote) -> Result<(), Self::Error> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).push(cmd.0);
+            Ok(())
+        }
+    }
+
+    struct AlwaysFailsCommand;
+
+    impl Command for AlwaysFailsCommand {
+        const NAME: &'static str = "AlwaysFailsCommand";
+    }
+
+    struct AlwaysFailingCommandHandler;
+
+    impl CommandHandler<AlwaysFailsCommand> for AlwaysFailingCommandHandler {
+        type Output = ();
+        type Error = Boom;
+
+        async fn handle(&self, _cmd: AlwaysFailsCommand) -> Result<(), Self::Error> {
+            Err(Boom)
+        }
+    }
+
+    struct CascadingRecorder(Arc<Recording>);
+
+    impl CascadingEventHandler<Ping> for CascadingRecorder {
+        type Error = std::convert::Infallible;
+
+        async fn handle(
+            &self,
+            _event: &Ping,
+        ) -> Result<Vec<Box<dyn CascadedCommand>>, Self::Error> {
+            Ok(vec![
+                cascade(RecordNote("first".to_string()), Arc::clone(&self.0)),
+                cascade(RecordNote("second".to_string()), Arc::clone(&self.0)),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn cascading_handler_dispatches_returned_commands_in_order() {
+        let bus = EventBus::new();
+        let notes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::new(Recording(Arc::clone(&notes)));
+        bus.register_cascading::<Ping, _>(CascadingRecorder(recorder));
+
+        bus.publish(&ping()).await.unwrap();
+
+        assert_eq!(
+            &*notes.lock().unwrap_or_else(|p| p.into_inner()),
+            &["first".to_string(), "second".to_string()]
+        );
+    }
+
+    struct CascadingWithAFailure(Arc<Recording>);
+
+    impl CascadingEventHandler<Ping> for CascadingWithAFailure {
+        type Error = std::convert::Infallible;
+
+        async fn handle(
+            &self,
+            _event: &Ping,
+        ) -> Result<Vec<Box<dyn CascadedCommand>>, Self::Error> {
+            Ok(vec![
+                cascade(RecordNote("before".to_string()), Arc::clone(&self.0)),
+                cascade(AlwaysFailsCommand, Arc::new(AlwaysFailingCommandHandler)),
+                cascade(RecordNote("after".to_string()), Arc::clone(&self.0)),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_cascaded_command_stops_the_rest_of_its_own_cascade() {
+        let bus = EventBus::new();
+        let notes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::new(Recording(Arc::clone(&notes)));
+        bus.register_cascading::<Ping, _>(CascadingWithAFailure(recorder));
+
+        let result = bus.publish(&ping()).await;
+
+        assert!(matches!(result, Err(EventBusError::CascadeFailed { .. })));
+        // "before" was dispatched ahead of the failing command and stays
+        // committed; "after" never ran because the cascade stops at the
+        // first failure — a cascade is a best-effort chain, not a saga.
+        assert_eq!(
+            &*notes.lock().unwrap_or_else(|p| p.into_inner()),
+            &["before".to_string()]
+        );
+    }
+
+    struct AlwaysFailingCascadingHandler;
+
+    impl CascadingEventHandler<Ping> for AlwaysFailingCascadingHandler {
+        type Error = Boom;
+
+        async fn handle(
+            &self,
+            _event: &Ping,
+        ) -> Result<Vec<Box<dyn CascadedCommand>>, Self::Error> {
+            Err(Boom)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_cascading_handler_never_builds_any_cascaded_command() {
+        let bus = EventBus::new();
+        bus.register_cascading::<Ping, _>(AlwaysFailingCascadingHandler);
+
+        let result = bus.publish(&ping()).await;
+
+        assert!(matches!(result, Err(EventBusError::HandlerError { .. })));
     }
 }

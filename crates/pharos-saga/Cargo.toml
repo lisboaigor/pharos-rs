@@ -1,6 +1,6 @@
 [package]
 name = "pharos-saga"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -10,7 +10,7 @@ description = "Saga and process-manager building blocks for Pharos."
 
 [dependencies]
 chrono = { workspace = true }
-pharos-messaging = { path = "../pharos-messaging", version = "0.5.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.6.0" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

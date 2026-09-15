@@ -43,6 +43,7 @@
 //! [`POSTGRES_AGGREGATE_SCHEMA`] (JSON repository), or translate them into your
 //! migration tool for production usage.
 
+mod aggregate_store;
 mod dead_letter;
 #[cfg(feature = "es")]
 mod event_store;
@@ -54,6 +55,7 @@ mod saga_store;
 mod tenant_repository;
 mod transaction;
 
+pub use aggregate_store::PostgresAggregateStore;
 pub use dead_letter::{
     POSTGRES_DEAD_LETTER_SCHEMA, PostgresDeadLetterQueue, migrate_postgres_dead_letter_schema,
 };
@@ -76,7 +78,7 @@ pub use saga_store::{
     POSTGRES_SAGA_SCHEMA, PgSagaStore, PostgresSagaStoreError, migrate_postgres_saga_schema,
 };
 pub use tenant_repository::{
-    POSTGRES_TENANT_AGGREGATE_SCHEMA, TenantJsonRepository,
+    CurrentTenantJsonRepository, POSTGRES_TENANT_AGGREGATE_SCHEMA, TenantJsonRepository,
     migrate_postgres_tenant_aggregate_schema,
 };
 pub use transaction::{

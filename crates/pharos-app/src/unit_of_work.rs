@@ -59,36 +59,59 @@ impl UnitOfWorkError {
 // That is correct about a *closure-shaped* trait (`fn transaction(&self, f:
 // impl FnOnce(&mut Conn) -> ...)`), where `Conn` has to be named concretely
 // for the closure signature to type-check at all. It does not hold for a
-// trait built around an associated type with its own lifetime parameter
-// (a GAT): [`TransactionalStore::Tx<'a>`] below lets [`save_and_enqueue_in`]
-// hold one live transaction handle across two independent calls — the
-// repository's [`TransactionalRepository::save_in_tx`] and the store's own
-// [`TransactionalStore::insert_outbox_in_tx`] — without either the trait or
-// the composing function ever naming a concrete connection type. The
-// conclusion the old comment drew (bind the handle to one driver) was
-// stronger than the actual problem required.
+// trait built around an associated type ([`TransactionalStore::Tx`] below):
+// it lets [`save_and_enqueue_in`] hold one live transaction handle across two
+// independent calls — the repository's [`TransactionalRepository::save_in_tx`]
+// and the store's own [`TransactionalStore::insert_outbox_in_tx`] — without
+// either the trait or the composing function ever naming a concrete
+// connection type. The conclusion the old comment drew (bind the handle to
+// one driver) was stronger than the actual problem required.
+//
+// A later revision made `Tx` a GAT (`type Tx<'a>: Send where Self: 'a`, with
+// `begin` returning `Self::Tx<'_>` borrowed from `&self`) to additionally let
+// a backend's handle borrow its store. That shape hits rust-lang/rust#100013
+// ("lifetime bound not satisfied") whenever `save_and_enqueue_in` is called
+// from inside another trait's `async fn` — exactly the shape of a
+// `CommandHandler::handle` calling it on a locally-owned `Store`. No backend
+// implementation ever needed the borrow (`pharos-postgres`'s handle is
+// already an owned, `'static` transaction), so `Tx` went back to a plain
+// associated type — same composability, no lifetime parameter, and the bug
+// no longer applies.
 
 /// Backend-agnostic transactional boundary.
 ///
-/// `Tx<'a>` is the live handle a backend's queries run against inside one
-/// transaction. For `pharos-postgres`, that is a `sqlx::Transaction<'a,
-/// Postgres>`; a different backend names its own type. Generic code that
-/// composes an aggregate save with an outbox insert — [`save_and_enqueue_in`]
-/// — is written once, against this trait, and never names a concrete
-/// connection type: the same composing function works against any backend
-/// that implements it, not only PostgreSQL.
+/// `Tx` is the live handle a backend's queries run against inside one
+/// transaction. For `pharos-postgres`, that is an owned `sqlx::Transaction<
+/// 'static, Postgres>`; a different backend names its own type. Generic code
+/// that composes an aggregate save with an outbox insert —
+/// [`save_and_enqueue_in`] — is written once, against this trait, and never
+/// names a concrete connection type: the same composing function works
+/// against any backend that implements it, not only PostgreSQL.
+///
+/// `Tx` is a plain associated type, not a GAT over a borrow of `&self`: an
+/// earlier design used `type Tx<'a>: Send where Self: 'a`, with `begin`
+/// returning `Self::Tx<'_>` tied to `&self`'s borrow. That shape — a GAT
+/// whose lifetime parameter is itself introduced inside another trait's
+/// `async fn` body (a `CommandHandler::handle` calling [`save_and_enqueue_in`]
+/// on a locally-owned `Store`) — triggers rust-lang/rust#100013 ("lifetime
+/// bound not satisfied"), a real, still-open rustc limitation on opaque-type
+/// nesting. Every backend implementation to date (`pharos-postgres`'s
+/// `PostgresUnitOfWork`) already produces an owned, `'static` handle — the
+/// borrowed-`'a` generality was never exercised — so dropping the lifetime
+/// parameter costs no real backend-agnosticism while sidestepping the bug
+/// entirely. A backend that genuinely needs a borrowed handle can still wrap
+/// it in an owned guard (e.g. `Arc<Mutex<..>>` or a boxed handle) to satisfy
+/// `Tx: Send` without a lifetime parameter.
 #[cfg(feature = "messaging")]
 pub trait TransactionalStore: Send + Sync {
-    /// The live transaction handle, valid for as long as the borrow of
-    /// `self` that produced it.
-    type Tx<'a>: Send
-    where
-        Self: 'a;
+    /// The live transaction handle, owned by the caller once `begin` returns
+    /// it.
+    type Tx: Send;
     /// Storage error.
     type Error: Error + Send + Sync + 'static;
 
     /// Opens a new transaction.
-    fn begin(&self) -> impl Future<Output = Result<Self::Tx<'_>, Self::Error>> + Send;
+    fn begin(&self) -> impl Future<Output = Result<Self::Tx, Self::Error>> + Send;
 
     /// Commits a transaction opened with [`Self::begin`].
     ///
@@ -96,29 +119,16 @@ pub trait TransactionalStore: Send + Sync {
     /// simply dropped to roll back), the handle cannot be reused — the type
     /// system enforces the "one transaction, one outcome" rule a closure-
     /// shaped API would only enforce by convention.
-    fn commit<'a>(
-        &'a self,
-        tx: Self::Tx<'a>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn commit(&self, tx: Self::Tx) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Inserts a pending outbox message using the same live transaction a
     /// [`TransactionalRepository::save_in_tx`] call just wrote the aggregate
     /// through, so both become visible atomically or neither does.
-    ///
-    /// `'g` (the transaction's own lifetime, fixed by whichever [`Self::begin`]
-    /// call produced `tx`) is deliberately a separate parameter from the
-    /// lifetimes of this call's own borrows: without that, a caller could
-    /// never reborrow `tx` more than once — through `save_in_tx`, then
-    /// through this method, then move it into `commit` — because each
-    /// reborrow's lifetime would be forced equal to the transaction's whole
-    /// lifetime instead of just this one call's.
-    fn insert_outbox_in_tx<'a, 'g>(
+    fn insert_outbox_in_tx<'a>(
         &'a self,
-        tx: &'a mut Self::Tx<'g>,
+        tx: &'a mut Self::Tx,
         message: &'a OutboxMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a
-    where
-        'g: 'a;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 }
 
 /// A repository whose `save` can run inside a [`TransactionalStore`]'s live
@@ -148,18 +158,11 @@ where
     type Error: Error + Send + Sync + 'static;
 
     /// Persists the aggregate using the caller's live transaction handle.
-    ///
-    /// `'g` (the transaction's own lifetime) is deliberately independent
-    /// from this call's own borrows — see
-    /// [`TransactionalStore::insert_outbox_in_tx`] for why that has to be
-    /// true for a caller to reborrow `tx` more than once.
-    fn save_in_tx<'c, 'g>(
+    fn save_in_tx<'c>(
         &'c self,
-        tx: &'c mut Store::Tx<'g>,
+        tx: &'c mut Store::Tx,
         aggregate: &'c mut A,
-    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send + 'c
-    where
-        'g: 'c;
+    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send + 'c;
 }
 
 /// Error returned by [`save_and_enqueue_in`].
@@ -177,6 +180,12 @@ where
     /// Opening/committing the transaction, or writing the outbox, failed.
     #[error(transparent)]
     Store(StoreErr),
+    /// `map_event` failed to turn a pending domain event into an outgoing
+    /// [`Message`]. Surfaces before any transaction opens: an event that
+    /// cannot be mapped is caught before the aggregate save is attempted, so
+    /// nothing is left half-committed.
+    #[error("event mapping failed: {0}")]
+    Mapping(#[source] Box<dyn Error + Send + Sync + 'static>),
 }
 
 /// Persists an aggregate through any [`TransactionalRepository`] and enqueues
@@ -190,8 +199,13 @@ where
 /// On any failure the aggregate's in-memory state is left intact: the
 /// version is reverted and the pending events are kept, so a retry starts
 /// clean. Events are drained only after the commit succeeds.
+///
+/// `map_event` is fallible (e.g. serializing the event payload): every
+/// pending event is mapped **before** any transaction opens, so a mapping
+/// failure never leaves a half-open transaction behind and never needs a
+/// placeholder payload for the events it could not map.
 #[cfg(feature = "messaging")]
-pub async fn save_and_enqueue_in<A, Store, Repo, F>(
+pub async fn save_and_enqueue_in<A, Store, Repo, F, E>(
     store: &Store,
     repo: &Repo,
     aggregate: &mut A,
@@ -201,17 +215,19 @@ where
     A: AggregateRoot,
     Store: TransactionalStore,
     Repo: TransactionalRepository<A, Store>,
-    F: Fn(&A::Event) -> Message + Send + Sync,
+    F: Fn(&A::Event) -> Result<Message, E> + Send + Sync,
+    E: Error + Send + Sync + 'static,
 {
     let expected = aggregate.version();
 
-    // Build the outbox messages from the still-pending events; they are only
-    // drained after the transaction commits.
-    let messages: Vec<OutboxMessage> = aggregate
-        .pending_events()
-        .iter()
-        .map(|e| OutboxMessage::new(map_event(e)))
-        .collect();
+    // Build the outbox messages from the still-pending events, before
+    // touching the database; they are only drained after the transaction
+    // commits.
+    let mut messages = Vec::with_capacity(aggregate.pending_events().len());
+    for event in aggregate.pending_events() {
+        let message = map_event(event).map_err(|e| SaveAndEnqueueError::Mapping(Box::new(e)))?;
+        messages.push(OutboxMessage::new(message));
+    }
 
     let result = async {
         let mut tx = store.begin().await.map_err(SaveAndEnqueueError::Store)?;

@@ -48,6 +48,98 @@ impl<R: Repository<Order>> CommandHandler<ConfirmOrder> for ConfirmOrderHandler<
 }
 ```
 
+## Event handler that returns cascaded commands
+
+An event handler that needs to trigger follow-up commands doesn't have to
+`await` each one inline and decide by hand what to do with a failure. Return
+them instead: register with `register_cascading` and implement
+`CascadingEventHandler`, building each command with `cascade(command, handler)`.
+`EventBus::publish` runs them in order right after your handler, and a
+failure — yours or a cascaded command's — goes through the same
+`PublishErrorPolicy` as any other handler failure, instead of being silently
+dropped or only logged.
+
+```rust
+use std::sync::Arc;
+use pharos::prelude::*;
+use pharos_app::{CascadingEventHandler, cascade, CascadedCommand};
+
+struct NotifyAndRestock {
+    notifications: Arc<NotificationHandlers>,
+    inventory: Arc<InventoryHandlers>,
+}
+
+impl CascadingEventHandler<OrderEvent> for NotifyAndRestock {
+    type Error = std::convert::Infallible;
+
+    async fn handle(
+        &self,
+        event: &OrderEvent,
+    ) -> Result<Vec<Box<dyn CascadedCommand>>, Self::Error> {
+        let OrderEvent::OrderConfirmed { order_id, .. } = event else {
+            return Ok(vec![]);
+        };
+        Ok(vec![
+            cascade(SendConfirmation { order_id: *order_id }, Arc::clone(&self.notifications)),
+            cascade(DecrementStock { order_id: *order_id }, Arc::clone(&self.inventory)),
+        ])
+    }
+}
+
+bus.register_cascading::<OrderEvent, _>(NotifyAndRestock { notifications, inventory });
+```
+
+A cascade is a best-effort chain, not a saga: a command already dispatched
+before a failing one is **not** rolled back. When a step's id is needed by a
+later step in the same cascade (e.g. an id-generating creation command
+followed by commands that target the new aggregate), generate that id
+yourself before building the `Vec` and pass it into every command that needs
+it — see `criar_com_id`-style constructors that take the id instead of
+generating it internally.
+
+## Relay with per-handler inbox isolation
+
+`publish_trusted_bytes` (the outbox relay's usual bridge back into `EventBus`)
+dispatches one payload to *every* handler registered for its event type as a
+single unit — a retry re-runs all of them, including ones that already
+succeeded, and one handler's idempotency record covers the whole delivery.
+When several independent handlers react to the same event, drive them one at
+a time instead, each under its own inbox consumer id, so a stuck handler
+doesn't force the others to redo work:
+
+```rust
+use pharos_app::{EventBus, IdempotencyDecision, InboxStore, Message};
+
+async fn despachar(bus: &EventBus, inbox: &impl InboxStore, message: &Message) -> anyhow::Result<()> {
+    let mut alguma_falha = false;
+    for handler in bus.handler_names_for_topic(&message.topic) {
+        let consumer = format!("relay:{handler}");
+        if let IdempotencyDecision::AlreadyCompleted =
+            inbox.begin_processing(message.message_id, &consumer).await?
+        {
+            continue; // this handler already finished; don't redo its work
+        }
+
+        match bus
+            .dispatch_trusted_bytes_to_handler(&message.topic, &message.payload, handler)
+            .await
+        {
+            Ok(()) => inbox.mark_completed(message.message_id, &consumer).await?,
+            Err(e) => {
+                inbox.mark_failed(message.message_id, &consumer, e.to_string()).await?;
+                alguma_falha = true;
+            }
+        }
+    }
+    if alguma_falha { anyhow::bail!("one or more handlers failed") } else { Ok(()) }
+}
+```
+
+The outbox row this runs against still follows the dispatcher's own
+`RetryPolicy`/backoff as one unit (see the next recipe) — what changes is
+that each handler's own success or failure is tracked and skipped
+independently, instead of the whole delivery being one pass/fail outcome.
+
 ## Command handler with transactional save + enqueue
 
 When another process consumes your events, persist the aggregate and the outbox
@@ -200,6 +292,43 @@ meant to run:
 ```rust
 // A saga's CommandDispatcher dispatches it normally; only HTTP is refused.
 dispatcher.dispatch(ReleasePayout { wager_id }).await?;
+```
+
+## Authorization declared on the route
+
+Roles belong to the route, not to the command it dispatches — the same
+command can be reachable through more than one route with different access
+policies (or not be HTTP-reachable at all, see above). `#[requires_roles(...)]`
+declares the roles right on the route function, and checks them before the
+rest of the body runs:
+
+```rust
+#[pharos_macros::requires_roles(Role::Vendedor | Role::Admin, principal = user)]
+pub async fn iniciar(
+    State(s): State<VendasState>,
+    user: AuthUser,
+    Json(mut cmd): Json<IniciarVenda>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    cmd.venda_id = Uuid::now_v7();
+    cmd.vendedor_id = user.id;
+    let id = dispatch(&*s.vendas, cmd).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "venda_id": id.to_string() }))))
+}
+```
+
+`principal` names the function's authenticated-user parameter (`user` above);
+its type must implement `pharos_app::Authorize<R>` for whatever `R` the roles
+expression evaluates to — implement it once for your app's principal type,
+bridging to whatever authorization check you already have:
+
+```rust
+impl pharos_app::Authorize<Roles> for AuthUser {
+    type Error = AppError;
+
+    fn authorize(&self, required: Roles) -> Result<(), AppError> {
+        self.exigir_role(required)
+    }
+}
 ```
 
 ## Saga that compensates on failure

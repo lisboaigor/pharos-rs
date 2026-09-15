@@ -89,12 +89,14 @@ async fn save_and_enqueue_in_commits_relational_rows_and_outbox_atomically() -> 
     assert_eq!(event_count, 3);
 
     save_and_enqueue_in(&store, &repo, &mut order, |event| {
-        Message::new(
-            "order-events",
-            event.aggregate_id().as_bytes().to_vec(),
-            "application/json",
+        Ok::<_, std::convert::Infallible>(
+            Message::new(
+                "order-events",
+                event.aggregate_id().as_bytes().to_vec(),
+                "application/json",
+            )
+            .with_key(event.aggregate_id()),
         )
-        .with_key(event.aggregate_id())
     })
     .await?;
 
@@ -117,7 +119,10 @@ async fn save_and_enqueue_in_commits_relational_rows_and_outbox_atomically() -> 
     stale.set_version(0);
     stale.cancel("simulated staleness".to_string())?;
     let result = save_and_enqueue_in(&store, &repo, &mut stale, |event| {
-        Message::new("order-events", Vec::new(), "application/json").with_key(event.aggregate_id())
+        Ok::<_, std::convert::Infallible>(
+            Message::new("order-events", Vec::new(), "application/json")
+                .with_key(event.aggregate_id()),
+        )
     })
     .await;
     assert!(result.is_err(), "stale save must be rejected");

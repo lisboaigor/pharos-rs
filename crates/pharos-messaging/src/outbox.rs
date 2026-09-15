@@ -1,10 +1,50 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::messaging::Message;
+
+/// In-process wake-up signal between an outbox writer and its dispatcher.
+///
+/// A dispatcher normally polls the outbox table on a fixed interval — simple,
+/// but it puts that interval on the critical path of "how long after commit
+/// does an event's effects run". `OutboxSignal` closes that gap for same-
+/// process writer/dispatcher pairs: the writer calls [`Self::notify`] right
+/// after its transaction commits, and a dispatcher loop selects on
+/// [`Self::notified`] alongside its regular tick, draining immediately
+/// instead of waiting out the rest of the interval. The interval remains the
+/// fallback — a missed or coalesced notification (multiple `notify` calls
+/// before the dispatcher wakes collapse to one wake-up, same as
+/// [`tokio::sync::Notify`]) is never fatal, only slower.
+///
+/// This is strictly a same-process optimization: it carries no information
+/// across machines, so a multi-replica dispatcher still needs its interval
+/// tuned to an acceptable worst-case latency.
+#[derive(Clone, Default)]
+pub struct OutboxSignal(Arc<Notify>);
+
+impl OutboxSignal {
+    /// Creates a new signal, initially with nothing pending.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wakes one waiting [`Self::notified`] caller, if any; otherwise leaves
+    /// a permit for the next call to consume immediately.
+    pub fn notify(&self) {
+        self.0.notify_one();
+    }
+
+    /// Resolves on the next [`Self::notify`] call (or immediately, if a
+    /// permit from a previous call is still outstanding).
+    pub async fn notified(&self) {
+        self.0.notified().await
+    }
+}
 
 /// Current lifecycle status of an outbox message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

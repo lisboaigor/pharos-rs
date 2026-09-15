@@ -128,14 +128,11 @@ where
 {
     type Error = PostgresRepositoryError;
 
-    async fn save_in_tx<'c, 'g>(
+    async fn save_in_tx<'c>(
         &'c self,
-        tx: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx<'g>,
+        tx: &'c mut <crate::PostgresUnitOfWork as pharos_app::TransactionalStore>::Tx,
         aggregate: &'c mut A,
-    ) -> Result<(), RepositoryError<Self::Error>>
-    where
-        'g: 'c,
-    {
+    ) -> Result<(), RepositoryError<Self::Error>> {
         let aggregate_id = aggregate.id().to_string();
         let expected = aggregate.version();
         let new_version = expected + 1;
