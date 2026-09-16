@@ -82,6 +82,8 @@ pub mod authorize;
 pub mod cascade;
 pub mod command;
 #[cfg(feature = "messaging")]
+pub mod default_store;
+#[cfg(feature = "messaging")]
 pub mod enrichment;
 pub mod error;
 pub mod event_bus;
@@ -125,6 +127,8 @@ pub use cascade::{CascadeError, CascadedCommand, cascade};
 pub use command::{
     Command, CommandHandler, DispatchError, FieldViolation, ValidationError, dispatch,
 };
+#[cfg(feature = "messaging")]
+pub use default_store::DefaultAggregateStore;
 #[cfg(feature = "messaging")]
 pub use enrichment::MessageEnricher;
 #[cfg(all(feature = "messaging", feature = "tenant-task-local"))]

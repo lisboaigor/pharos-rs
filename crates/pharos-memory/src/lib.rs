@@ -24,6 +24,7 @@
 //! | [`InMemoryDeadLetterQueue`] | In-memory | `DeadLetterQueue` |
 //! | [`InMemorySchemaRegistry`] | In-memory | `SchemaRegistry` |
 //! | [`InMemoryConsumerGroupCoordinator`] | In-memory | `ConsumerGroupCoordinator` |
+//! | [`InMemoryUnitOfWork`] | `DashMap` | `Repository` + `TransactionalStore` + `TransactionalRepository` |
 //!
 //! # Adapter map
 //!
@@ -58,6 +59,7 @@ pub mod in_memory_messaging;
 pub mod in_memory_outbox;
 pub mod in_memory_repository;
 pub mod in_memory_schema_registry;
+pub mod in_memory_unit_of_work;
 
 #[cfg(test)]
 mod outbox_dispatcher_tests;
@@ -69,3 +71,4 @@ pub use in_memory_messaging::InMemoryMessageBroker;
 pub use in_memory_outbox::InMemoryOutboxRepository;
 pub use in_memory_repository::{InMemoryRepoError, InMemoryRepository};
 pub use in_memory_schema_registry::InMemorySchemaRegistry;
+pub use in_memory_unit_of_work::{InMemoryTx, InMemoryUnitOfWork, InMemoryUnitOfWorkError};
