@@ -25,6 +25,9 @@
 //! | [`InMemorySchemaRegistry`] | In-memory | `SchemaRegistry` |
 //! | [`InMemoryConsumerGroupCoordinator`] | In-memory | `ConsumerGroupCoordinator` |
 //! | [`InMemoryUnitOfWork`] | `DashMap` | `Repository` + `TransactionalStore` + `TransactionalRepository` |
+//! | [`InMemoryEventStore`] (feature `es`) | `DashMap` | `EventStore` |
+//! | [`InMemorySnapshotStore`] (feature `es`) | `DashMap` | `SnapshotStore` |
+//! | [`InMemorySagaStore`] (feature `saga`) | `DashMap` | `SagaStore` + `SagaTimeoutStore` |
 //!
 //! # Adapter map
 //!
@@ -54,10 +57,14 @@
 
 pub mod in_memory_consumer_group;
 pub mod in_memory_dead_letter;
+#[cfg(feature = "es")]
+pub mod in_memory_event_store;
 pub mod in_memory_inbox;
 pub mod in_memory_messaging;
 pub mod in_memory_outbox;
 pub mod in_memory_repository;
+#[cfg(feature = "saga")]
+pub mod in_memory_saga_store;
 pub mod in_memory_schema_registry;
 pub mod in_memory_unit_of_work;
 
@@ -66,9 +73,15 @@ mod outbox_dispatcher_tests;
 
 pub use in_memory_consumer_group::InMemoryConsumerGroupCoordinator;
 pub use in_memory_dead_letter::InMemoryDeadLetterQueue;
+#[cfg(feature = "es")]
+pub use in_memory_event_store::{
+    InMemoryEventStore, InMemoryEventStoreError, InMemorySnapshotStore,
+};
 pub use in_memory_inbox::InMemoryInboxStore;
 pub use in_memory_messaging::InMemoryMessageBroker;
 pub use in_memory_outbox::InMemoryOutboxRepository;
 pub use in_memory_repository::{InMemoryRepoError, InMemoryRepository};
+#[cfg(feature = "saga")]
+pub use in_memory_saga_store::{InMemorySagaStore, InMemorySagaStoreError};
 pub use in_memory_schema_registry::InMemorySchemaRegistry;
 pub use in_memory_unit_of_work::{InMemoryTx, InMemoryUnitOfWork, InMemoryUnitOfWorkError};

@@ -8,14 +8,38 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lisboaigor/pharos-rs"
 
 [dependencies]
-pharos-core = { path = "../pharos-core", version = "0.6.0" }
-pharos-app  = { path = "../pharos-app", version = "0.6.0" }
-tracing          = { workspace = true }
+pharos-core      = { path = "../pharos-core", version = "0.6.0" }
+pharos-app       = { path = "../pharos-app", version = "0.6.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.6.0", optional = true }
+pharos-es        = { path = "../pharos-es", version = "0.6.0", optional = true }
+pharos-saga      = { path = "../pharos-saga", version = "0.6.0", optional = true }
+tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+chrono   = { workspace = true, optional = true }
+uuid     = { workspace = true, optional = true }
+serde    = { workspace = true, optional = true }
+futures  = { workspace = true, optional = true }
+
+[features]
+# The adapter conformance kit (`contract` module): async functions that
+# exercise a trait's full contract — not just its happy path — against any
+# implementation. Off by default: it pulls in `pharos-messaging`,
+# `pharos-es`, and `pharos-saga` purely to name their traits, which a crate
+# that only needs `EventCapture`/`TestSubscriber` shouldn't have to build.
+contract = [
+    "dep:pharos-messaging",
+    "dep:pharos-es",
+    "dep:pharos-saga",
+    "dep:chrono",
+    "dep:uuid",
+    "dep:serde",
+    "dep:futures",
+]
 
 [dev-dependencies]
-chrono = { workspace = true }
-tokio  = { workspace = true }
+chrono         = { workspace = true }
+tokio          = { workspace = true }
+pharos-memory  = { path = "../pharos-memory", version = "0.6.0" }
 
 [lints]
 workspace = true
