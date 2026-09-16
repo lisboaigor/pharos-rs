@@ -1,6 +1,6 @@
 [package]
 name = "pharos-testing"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -8,11 +8,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lisboaigor/pharos-rs"
 
 [dependencies]
-pharos-core      = { path = "../pharos-core", version = "0.6.0" }
-pharos-app       = { path = "../pharos-app", version = "0.6.0" }
-pharos-messaging = { path = "../pharos-messaging", version = "0.6.0", optional = true }
-pharos-es        = { path = "../pharos-es", version = "0.6.0", optional = true }
-pharos-saga      = { path = "../pharos-saga", version = "0.6.0", optional = true }
+pharos-core      = { path = "../pharos-core", version = "0.7.0" }
+pharos-app       = { path = "../pharos-app", version = "0.7.0" }
+pharos-messaging = { path = "../pharos-messaging", version = "0.7.0", optional = true }
+pharos-es        = { path = "../pharos-es", version = "0.7.0", optional = true }
+pharos-saga      = { path = "../pharos-saga", version = "0.7.0", optional = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono   = { workspace = true, optional = true }
@@ -39,7 +39,7 @@ contract = [
 [dev-dependencies]
 chrono         = { workspace = true }
 tokio          = { workspace = true }
-pharos-memory  = { path = "../pharos-memory", version = "0.6.0" }
+pharos-memory  = { path = "../pharos-memory", version = "0.7.0" }
 
 # Only builds (and only makes sense) with the `contract` feature enabled —
 # it exercises `pharos_testing::contract` against `pharos-memory`'s
