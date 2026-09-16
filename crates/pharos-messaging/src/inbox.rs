@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -98,35 +96,32 @@ impl InboxError {
 }
 
 /// Stores inbox records and implements consumer idempotency.
-pub trait InboxStore: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait InboxStore: Sync + 'static {
     /// Starts processing or returns the current idempotency decision.
-    fn begin_processing(
+    async fn begin_processing(
         &self,
         message_id: Uuid,
         consumer: &str,
-    ) -> impl Future<Output = Result<IdempotencyDecision, InboxError>> + Send;
+    ) -> Result<IdempotencyDecision, InboxError>;
 
     /// Marks a message as successfully processed.
-    fn mark_completed(
-        &self,
-        message_id: Uuid,
-        consumer: &str,
-    ) -> impl Future<Output = Result<(), InboxError>> + Send;
+    async fn mark_completed(&self, message_id: Uuid, consumer: &str) -> Result<(), InboxError>;
 
     /// Marks a message as failed.
-    fn mark_failed(
+    async fn mark_failed(
         &self,
         message_id: Uuid,
         consumer: &str,
         error: String,
-    ) -> impl Future<Output = Result<(), InboxError>> + Send;
+    ) -> Result<(), InboxError>;
 
     /// Returns the inbox record when it exists.
-    fn get(
+    async fn get(
         &self,
         message_id: Uuid,
         consumer: &str,
-    ) -> impl Future<Output = Result<Option<InboxMessage>, InboxError>> + Send;
+    ) -> Result<Option<InboxMessage>, InboxError>;
 }
 
 #[cfg(test)]

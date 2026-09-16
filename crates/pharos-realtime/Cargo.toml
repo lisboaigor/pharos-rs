@@ -11,13 +11,14 @@ description = "Real-time WebSocket / pub-sub primitives for Pharos RS (room broa
 [dependencies]
 # The workspace's `axum` dependency does not enable `ws` by default (nothing
 # else in the workspace needed WebSockets before this crate) — enabled here.
-axum      = { workspace = true, features = ["ws"] }
-dashmap   = { workspace = true }
-futures   = { workspace = true }
-metrics   = { workspace = true }
-thiserror = { workspace = true }
-tokio     = { workspace = true }
-tracing   = { workspace = true }
+axum          = { workspace = true, features = ["ws"] }
+dashmap       = { workspace = true }
+futures       = { workspace = true }
+metrics       = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+trait-variant = { workspace = true }
+tracing       = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "time"] }

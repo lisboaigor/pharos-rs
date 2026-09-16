@@ -121,15 +121,16 @@ impl Reply {
 /// identity on this room before `on_message` is called. It *is* still the
 /// handler's job to check that the fields inside `payload` refer to resources
 /// this `identity` owns — the framework cannot know what the bytes mean.
-pub trait OnMessage: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait OnMessage: Sync + 'static {
     /// Handles one inbound frame's payload, from the connection identified by
     /// `identity`, on `room`.
-    fn on_message(
+    async fn on_message(
         &self,
         identity: &Identity,
         room: &RoomId,
         payload: Bytes,
-    ) -> impl Future<Output = Result<Option<Reply>, RealtimeError>> + Send;
+    ) -> Result<Option<Reply>, RealtimeError>;
 }
 
 impl<M: OnMessage> OnMessage for Arc<M> {

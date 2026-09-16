@@ -39,6 +39,13 @@ tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync"] }
 dashmap = "6.2.1"
 futures = "0.3.32"
 metrics = "0.24.2"
+# `#[trait_variant::make(Send)]`: rewrites a trait's `async fn`/`-> impl
+# Trait` methods in place to add `+ Send` to the returned future, so trait
+# definitions read as plain `async fn` instead of hand-written `-> impl
+# Future<Output = T> + Send`. Same trait name, same public API — this is a
+# proc-macro-only dependency (no runtime component), maintained under
+# rust-lang/impl-trait-utils.
+trait-variant = "0.1.3"
 syn = { version = "3.0.3", features = ["full"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"

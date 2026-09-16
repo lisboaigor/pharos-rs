@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use thiserror::Error;
 
 /// Assignment of a topic partition to a consumer inside a consumer group.
@@ -41,27 +39,24 @@ pub enum ConsumerGroupError {
 }
 
 /// Coordinates consumer group membership and partition assignments.
-pub trait ConsumerGroupCoordinator: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait ConsumerGroupCoordinator: Sync + 'static {
     /// Joins a consumer group and returns the assigned partitions.
-    fn join(
+    async fn join(
         &self,
         group: &str,
         consumer_id: &str,
         topics: &[String],
-    ) -> impl Future<Output = Result<Vec<PartitionAssignment>, ConsumerGroupError>> + Send;
+    ) -> Result<Vec<PartitionAssignment>, ConsumerGroupError>;
 
     /// Leaves a consumer group.
-    fn leave(
-        &self,
-        group: &str,
-        consumer_id: &str,
-    ) -> impl Future<Output = Result<(), ConsumerGroupError>> + Send;
+    async fn leave(&self, group: &str, consumer_id: &str) -> Result<(), ConsumerGroupError>;
 
     /// Returns current assignments for a consumer group.
-    fn assignments(
+    async fn assignments(
         &self,
         group: &str,
-    ) -> impl Future<Output = Result<Vec<PartitionAssignment>, ConsumerGroupError>> + Send;
+    ) -> Result<Vec<PartitionAssignment>, ConsumerGroupError>;
 }
 
 #[cfg(test)]

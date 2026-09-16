@@ -9,14 +9,15 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Broker-facing messaging contracts for Pharos RS: messages, publishers/consumers, retry, outbox, inbox, dead-letter, consumer groups, and schema registry."
 
 [dependencies]
-chrono    = { workspace = true }
-fastrand  = { workspace = true }
-futures   = { workspace = true }
-metrics   = { workspace = true }
-thiserror = { workspace = true }
-tokio     = { workspace = true }
-tracing   = { workspace = true }
-uuid      = { workspace = true }
+chrono        = { workspace = true }
+fastrand      = { workspace = true }
+futures       = { workspace = true }
+metrics       = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+trait-variant = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
 
 [dev-dependencies]
 

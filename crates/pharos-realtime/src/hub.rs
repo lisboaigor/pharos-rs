@@ -205,25 +205,21 @@ impl RealtimeError {
 /// that reconnects can ask for what it missed via
 /// [`RealtimeSubscriber::subscribe_since`], bounded by whatever backlog the
 /// implementation retains.
-pub trait RealtimePublisher: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait RealtimePublisher: Sync + 'static {
     /// Publishes one message to `msg.room`.
-    fn publish(
-        &self,
-        msg: RealtimeMessage,
-    ) -> impl Future<Output = Result<(), RealtimeError>> + Send;
+    async fn publish(&self, msg: RealtimeMessage) -> Result<(), RealtimeError>;
 }
 
 /// Subscribes to a room's fan-out stream.
-pub trait RealtimeSubscriber: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait RealtimeSubscriber: Sync + 'static {
     /// The stream of messages yielded to a subscriber of a room.
     type Stream: Stream<Item = RealtimeMessage> + Send + 'static;
 
     /// Joins `room`, returning a stream of every message published to it from
     /// this point on.
-    fn subscribe(
-        &self,
-        room: &RoomId,
-    ) -> impl Future<Output = Result<Self::Stream, RealtimeError>> + Send;
+    async fn subscribe(&self, room: &RoomId) -> Result<Self::Stream, RealtimeError>;
 
     /// Joins `room` and replays whatever the implementation still retains
     /// after `since`, ahead of the live stream.
@@ -234,6 +230,13 @@ pub trait RealtimeSubscriber: Send + Sync + 'static {
     /// which is correct for a backend with no backlog — the caller must treat
     /// [`Backlog::Gap`] and a plain live stream the same way, by resyncing
     /// through its own read model.
+    ///
+    /// Kept in the manual `-> impl Future<..> + Send { async move { .. } }`
+    /// shape rather than `async fn`: `#[trait_variant::make(Send)]` only
+    /// rewrites a bodyless method's signature — a provided method's body is
+    /// passed through unchanged while its signature's `asyncness` is
+    /// stripped, so an `async fn` body would stop being inside an async
+    /// context after expansion.
     fn subscribe_since(
         &self,
         room: &RoomId,

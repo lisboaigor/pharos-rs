@@ -1,6 +1,4 @@
 use std::error::Error;
-#[cfg(feature = "messaging")]
-use std::future::Future;
 
 use thiserror::Error;
 
@@ -103,7 +101,8 @@ impl UnitOfWorkError {
 /// it in an owned guard (e.g. `Arc<Mutex<..>>` or a boxed handle) to satisfy
 /// `Tx: Send` without a lifetime parameter.
 #[cfg(feature = "messaging")]
-pub trait TransactionalStore: Send + Sync {
+#[trait_variant::make(Send)]
+pub trait TransactionalStore: Sync {
     /// The live transaction handle, owned by the caller once `begin` returns
     /// it.
     type Tx: Send;
@@ -111,7 +110,7 @@ pub trait TransactionalStore: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
     /// Opens a new transaction.
-    fn begin(&self) -> impl Future<Output = Result<Self::Tx, Self::Error>> + Send;
+    async fn begin(&self) -> Result<Self::Tx, Self::Error>;
 
     /// Commits a transaction opened with [`Self::begin`].
     ///
@@ -119,16 +118,16 @@ pub trait TransactionalStore: Send + Sync {
     /// simply dropped to roll back), the handle cannot be reused — the type
     /// system enforces the "one transaction, one outcome" rule a closure-
     /// shaped API would only enforce by convention.
-    fn commit(&self, tx: Self::Tx) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    async fn commit(&self, tx: Self::Tx) -> Result<(), Self::Error>;
 
     /// Inserts a pending outbox message using the same live transaction a
     /// [`TransactionalRepository::save_in_tx`] call just wrote the aggregate
     /// through, so both become visible atomically or neither does.
-    fn insert_outbox_in_tx<'a>(
+    async fn insert_outbox_in_tx<'a>(
         &'a self,
         tx: &'a mut Self::Tx,
         message: &'a OutboxMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+    ) -> Result<(), Self::Error>;
 }
 
 /// A repository whose `save` can run inside a [`TransactionalStore`]'s live
@@ -149,7 +148,8 @@ pub trait TransactionalStore: Send + Sync {
 /// the composing caller ([`save_and_enqueue_in`]) owns that boundary (and
 /// reverts the in-memory version if the surrounding transaction later fails).
 #[cfg(feature = "messaging")]
-pub trait TransactionalRepository<A, Store>: Send + Sync
+#[trait_variant::make(Send)]
+pub trait TransactionalRepository<A, Store>: Sync
 where
     A: AggregateRoot,
     Store: TransactionalStore,
@@ -158,11 +158,11 @@ where
     type Error: Error + Send + Sync + 'static;
 
     /// Persists the aggregate using the caller's live transaction handle.
-    fn save_in_tx<'c>(
+    async fn save_in_tx<'c>(
         &'c self,
         tx: &'c mut Store::Tx,
         aggregate: &'c mut A,
-    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send + 'c;
+    ) -> Result<(), RepositoryError<Self::Error>>;
 }
 
 /// Error returned by [`save_and_enqueue_in`].

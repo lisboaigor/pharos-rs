@@ -143,12 +143,10 @@ impl OutboxError {
 }
 
 /// Stores and updates outbox messages.
-pub trait OutboxRepository: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait OutboxRepository: Sync + 'static {
     /// Inserts a pending outbox message.
-    fn insert(
-        &self,
-        message: OutboxMessage,
-    ) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    async fn insert(&self, message: OutboxMessage) -> Result<(), OutboxError>;
     /// Inserts several pending outbox messages.
     ///
     /// The default implementation calls [`Self::insert`] once per message,
@@ -159,6 +157,14 @@ pub trait OutboxRepository: Send + Sync + 'static {
     /// framework's own outbox path issues one `insert` per event with no
     /// batching anywhere, which is the dominant cost in the outbox
     /// throughput numbers in `docs/guide/benchmarks.md`.
+    // Provided (default) methods keep the manual `-> impl Future<..> +
+    // Send { async move { .. } }` shape rather than `async fn`:
+    // `#[trait_variant::make(Send)]` only rewrites a bodyless `async fn`'s
+    // signature — for an item that already has a body, it passes that body
+    // through unchanged while stripping `asyncness` from the signature, so
+    // an `async fn` body written with bare top-level `.await` stops being
+    // inside an async context. Wrapping the body in `async move` here is
+    // what keeps it valid post-expansion.
     fn insert_many(
         &self,
         messages: Vec<OutboxMessage>,
@@ -178,12 +184,9 @@ pub trait OutboxRepository: Send + Sync + 'static {
     /// lease the claimed rows by moving their `next_attempt_at` into the
     /// future, so two dispatchers never publish the same message while one of
     /// them holds the lease.
-    fn pending(
-        &self,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<OutboxMessage>, OutboxError>> + Send;
+    async fn pending(&self, limit: usize) -> Result<Vec<OutboxMessage>, OutboxError>;
     /// Records one publication attempt.
-    fn record_attempt(&self, id: Uuid) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    async fn record_attempt(&self, id: Uuid) -> Result<(), OutboxError>;
     /// Schedules the next retry of a still-pending message after `delay`.
     ///
     /// Called by the dispatcher when a publish fails but the retry policy still
@@ -199,21 +202,14 @@ pub trait OutboxRepository: Send + Sync + 'static {
         async { Ok(()) }
     }
     /// Marks a message as published.
-    fn mark_published(&self, id: Uuid) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    async fn mark_published(&self, id: Uuid) -> Result<(), OutboxError>;
     /// Marks a message as failed.
-    fn mark_failed(
-        &self,
-        id: Uuid,
-        error: String,
-    ) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    async fn mark_failed(&self, id: Uuid, error: String) -> Result<(), OutboxError>;
     /// Lists up to `limit` messages in the terminal `failed` state, oldest
     /// first where supported. Used by the dead-letter sweep.
-    fn failed(
-        &self,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<OutboxMessage>, OutboxError>> + Send;
+    async fn failed(&self, limit: usize) -> Result<Vec<OutboxMessage>, OutboxError>;
     /// Marks a failed message as dead-lettered so a sweep never parks it twice.
-    fn mark_dead_lettered(&self, id: Uuid) -> impl Future<Output = Result<(), OutboxError>> + Send;
+    async fn mark_dead_lettered(&self, id: Uuid) -> Result<(), OutboxError>;
 }
 
 /// Moves terminally `failed` outbox messages onto a [`DeadLetterQueue`].

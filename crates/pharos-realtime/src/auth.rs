@@ -57,7 +57,8 @@ impl std::fmt::Display for Identity {
 /// own.) Prefer `Sec-WebSocket-Protocol` or an `Authorization` header. If a
 /// browser API forces a query parameter, make that token single-use and
 /// short-lived, and redact it before it reaches a subscriber.
-pub trait ConnectionAuthenticator: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait ConnectionAuthenticator: Sync + 'static {
     /// Authenticates the connection described by `parts`, returning the
     /// resolved [`Identity`] or a [`RealtimeError::Unauthorized`].
     ///
@@ -65,10 +66,7 @@ pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// it must reflect the *current* state of the session — an implementation
     /// that caches a token's validity forever defeats
     /// [`RealtimeConfig::revalidate_every`](crate::ws::RealtimeConfig).
-    fn authenticate(
-        &self,
-        parts: &Parts,
-    ) -> impl Future<Output = Result<Identity, RealtimeError>> + Send;
+    async fn authenticate(&self, parts: &Parts) -> Result<Identity, RealtimeError>;
 }
 
 impl<A: ConnectionAuthenticator> ConnectionAuthenticator for Arc<A> {
@@ -127,18 +125,19 @@ impl std::fmt::Display for Access {
 /// every revalidation tick; publish is checked on **every inbound frame**,
 /// so a permission that is revoked mid-connection stops the next message
 /// rather than the next reconnect.
-pub trait RoomAuthorizer: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait RoomAuthorizer: Sync + 'static {
     /// Authorizes `identity` for `access` on `room`.
     ///
     /// Return [`RealtimeError::Forbidden`] to deny. Any other error is
     /// treated as a denial too — an authorizer that cannot reach its policy
     /// store must fail closed.
-    fn authorize(
+    async fn authorize(
         &self,
         identity: &Identity,
         room: &RoomId,
         access: Access,
-    ) -> impl Future<Output = Result<(), RealtimeError>> + Send;
+    ) -> Result<(), RealtimeError>;
 }
 
 impl<A: RoomAuthorizer> RoomAuthorizer for Arc<A> {

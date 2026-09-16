@@ -111,7 +111,8 @@ pub enum SagaTransition<S, C> {
 }
 
 /// Pure saga state machine.
-pub trait Saga: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait Saga: Sync + 'static {
     /// Saga identifier type.
     type Id: Clone + Send + Sync + 'static;
     /// Persisted state machine payload.
@@ -127,11 +128,11 @@ pub trait Saga: Send + Sync + 'static {
     fn id_for(&self, event: &Self::Event) -> Option<Self::Id>;
 
     /// Computes the transition for `event`, given the current persisted state.
-    fn react(
+    async fn react(
         &self,
         state: Option<&SagaInstance<Self::Id, Self::State>>,
         event: &Self::Event,
-    ) -> impl Future<Output = Result<SagaTransition<Self::State, Self::Command>, Self::Error>> + Send;
+    ) -> Result<SagaTransition<Self::State, Self::Command>, Self::Error>;
 
     /// Computes the transition for an elapsed deadline.
     ///
@@ -141,6 +142,13 @@ pub trait Saga: Send + Sync + 'static {
     /// [`SagaStatus::Failed`] and the timeout never refires. Sagas that
     /// compensate on timeout (expire a payment, release a reservation)
     /// override this and return the appropriate transition.
+    ///
+    /// Kept in the manual `-> impl Future<..> + Send { async { .. } }`
+    /// shape rather than `async fn`: `#[trait_variant::make(Send)]` only
+    /// rewrites a bodyless method's signature — a provided method's body is
+    /// passed through unchanged while its signature's `asyncness` is
+    /// stripped, so an `async fn` body would stop being inside an async
+    /// context after expansion.
     fn on_timeout(
         &self,
         instance: &SagaInstance<Self::Id, Self::State>,
@@ -184,15 +192,13 @@ pub enum SagaSaveError<E: Error + 'static> {
 }
 
 /// Persistence boundary for saga instances.
-pub trait SagaStore<I, S>: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait SagaStore<I, S>: Sync + 'static {
     /// Concrete storage error.
     type Error: Error + Send + Sync + 'static;
 
     /// Loads the current instance for `id`, when it exists.
-    fn load(
-        &self,
-        id: &I,
-    ) -> impl Future<Output = Result<Option<SagaInstance<I, S>>, Self::Error>> + Send;
+    async fn load(&self, id: &I) -> Result<Option<SagaInstance<I, S>>, Self::Error>;
 
     /// Persists an instance, enforcing optimistic concurrency on
     /// [`SagaInstance::version`].
@@ -206,16 +212,14 @@ pub trait SagaStore<I, S>: Send + Sync + 'static {
     /// [`SagaSaveError::ConcurrencyConflict`] otherwise. An implementation
     /// that upserts unconditionally reintroduces the lost-update bug this
     /// type exists to prevent.
-    fn save(
-        &self,
-        instance: SagaInstance<I, S>,
-    ) -> impl Future<Output = Result<(), SagaSaveError<Self::Error>>> + Send;
+    async fn save(&self, instance: SagaInstance<I, S>) -> Result<(), SagaSaveError<Self::Error>>;
 }
 
 /// Saga store that can also claim instances with an elapsed deadline.
 ///
 /// Implement this in addition to [`SagaStore`] to drive timeouts through
 /// [`SagaRunner::run_due_timeouts`].
+#[trait_variant::make(Send)]
 pub trait SagaTimeoutStore<I, S>: SagaStore<I, S> {
     /// Atomically claims up to `limit` [`SagaStatus::Running`] instances
     /// whose deadline is at or before `now`, soonest deadline first.
@@ -232,21 +236,22 @@ pub trait SagaTimeoutStore<I, S>: SagaStore<I, S> {
     /// sweep batch; a lease that is too short lets another sweeper re-claim
     /// instances that are still being processed, reintroducing duplicate
     /// timeout transitions.
-    fn claim_due(
+    async fn claim_due(
         &self,
         now: DateTime<Utc>,
         lease: chrono::Duration,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<SagaInstance<I, S>>, Self::Error>> + Send;
+    ) -> Result<Vec<SagaInstance<I, S>>, Self::Error>;
 }
 
 /// Command dispatch boundary used by the runner.
-pub trait CommandDispatcher<C>: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait CommandDispatcher<C>: Sync + 'static {
     /// Concrete dispatch error.
     type Error: Error + Send + Sync + 'static;
 
     /// Dispatches one command emitted by a saga.
-    fn dispatch(&self, command: C) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    async fn dispatch(&self, command: C) -> Result<(), Self::Error>;
 }
 
 /// Error returned by [`SagaRunner`].

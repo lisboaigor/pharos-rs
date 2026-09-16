@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
@@ -53,23 +51,18 @@ pub enum SchemaRegistryError {
 }
 
 /// Registry for versioned integration event schemas.
-pub trait SchemaRegistry: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait SchemaRegistry: Sync + 'static {
     /// Registers or replaces a schema.
-    fn register(
-        &self,
-        schema: EventSchema,
-    ) -> impl Future<Output = Result<(), SchemaRegistryError>> + Send;
+    async fn register(&self, schema: EventSchema) -> Result<(), SchemaRegistryError>;
     /// Finds a schema by event type and version.
-    fn get(
+    async fn get(
         &self,
         event_type: &str,
         version: u32,
-    ) -> impl Future<Output = Result<Option<EventSchema>, SchemaRegistryError>> + Send;
+    ) -> Result<Option<EventSchema>, SchemaRegistryError>;
     /// Returns the latest schema for an event type, when supported.
-    fn latest(
-        &self,
-        event_type: &str,
-    ) -> impl Future<Output = Result<Option<EventSchema>, SchemaRegistryError>> + Send;
+    async fn latest(&self, event_type: &str) -> Result<Option<EventSchema>, SchemaRegistryError>;
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use uuid::Uuid;
@@ -43,17 +41,12 @@ pub enum DeadLetterError {
 }
 
 /// Stores messages that can no longer be processed successfully.
-pub trait DeadLetterQueue: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait DeadLetterQueue: Sync + 'static {
     /// Sends a message to the dead-letter queue.
-    fn dead_letter(
-        &self,
-        message: DeadLetterMessage,
-    ) -> impl Future<Output = Result<(), DeadLetterError>> + Send;
+    async fn dead_letter(&self, message: DeadLetterMessage) -> Result<(), DeadLetterError>;
     /// Lists dead-letter messages, where supported.
-    fn list(
-        &self,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<DeadLetterMessage>, DeadLetterError>> + Send;
+    async fn list(&self, limit: usize) -> Result<Vec<DeadLetterMessage>, DeadLetterError>;
 }
 
 #[cfg(test)]

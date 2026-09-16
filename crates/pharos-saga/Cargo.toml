@@ -9,10 +9,11 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Saga and process-manager building blocks for Pharos."
 
 [dependencies]
-chrono = { workspace = true }
-pharos-messaging = { path = "../pharos-messaging", version = "0.6.0" }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+chrono            = { workspace = true }
+pharos-messaging  = { path = "../pharos-messaging", version = "0.6.0" }
+thiserror         = { workspace = true }
+trait-variant     = { workspace = true }
+tracing           = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

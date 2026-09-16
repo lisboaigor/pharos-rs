@@ -42,7 +42,8 @@ pub trait EventSourced: AggregateRoot {
 /// `I` and `E` mirror `Entity::Id` and `DomainEvent`, which are already
 /// `Send + Sync`; the bounds here let default method bodies hold them across
 /// `.await` points.
-pub trait EventStore<I, E>: Send + Sync + 'static
+#[trait_variant::make(Send)]
+pub trait EventStore<I, E>: Sync + 'static
 where
     I: Sync,
     E: Send,
@@ -51,14 +52,20 @@ where
     type Error: Error + Send + Sync + 'static;
 
     /// Loads all events for a stream.
-    fn load(&self, id: &I)
-    -> impl Future<Output = Result<Vec<StoredEvent<E>>, Self::Error>> + Send;
+    async fn load(&self, id: &I) -> Result<Vec<StoredEvent<E>>, Self::Error>;
 
     /// Loads the events of a stream with a sequence greater than `after`.
     ///
     /// Used by snapshot-aware rehydration to replay only the tail of a
     /// stream. The default implementation loads everything and filters in
     /// memory; stores should override it with a range query.
+    ///
+    /// Kept in the manual `-> impl Future<..> + Send { async move { .. } }`
+    /// shape rather than `async fn`: `#[trait_variant::make(Send)]` only
+    /// rewrites a bodyless method's signature — a provided method's body is
+    /// passed through unchanged while its signature's `asyncness` is
+    /// stripped, so an `async fn` body with bare top-level `.await` would
+    /// stop being inside an async context after expansion.
     fn load_after(
         &self,
         id: &I,
@@ -74,12 +81,12 @@ where
     }
 
     /// Appends events at the current expected version.
-    fn append(
+    async fn append(
         &self,
         id: &I,
         expected_version: u64,
         events: Vec<E>,
-    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send;
+    ) -> Result<(), RepositoryError<Self::Error>>;
 
     /// Deletes a whole stream.
     ///
@@ -87,7 +94,7 @@ where
     /// them forever; implementations that refuse deletion must return an
     /// error rather than silently succeeding, so callers never believe data
     /// was removed when it was not.
-    fn delete_stream(&self, id: &I) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    async fn delete_stream(&self, id: &I) -> Result<(), Self::Error>;
 }
 
 /// Materialized snapshot for an aggregate state.
@@ -135,20 +142,16 @@ impl<S> Snapshot<S> {
 }
 
 /// Optional snapshot persistence boundary.
-pub trait SnapshotStore<I, S>: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait SnapshotStore<I, S>: Sync + 'static {
     /// Storage error.
     type Error: Error + Send + Sync + 'static;
 
     /// Loads the latest snapshot, when present.
-    fn load(&self, id: &I)
-    -> impl Future<Output = Result<Option<Snapshot<S>>, Self::Error>> + Send;
+    async fn load(&self, id: &I) -> Result<Option<Snapshot<S>>, Self::Error>;
 
     /// Saves or replaces a snapshot.
-    fn save(
-        &self,
-        id: &I,
-        snapshot: Snapshot<S>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    async fn save(&self, id: &I, snapshot: Snapshot<S>) -> Result<(), Self::Error>;
 }
 
 /// Repository that rehydrates an aggregate by replaying its event stream.

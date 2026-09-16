@@ -9,10 +9,11 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 description = "Event sourcing building blocks for Pharos."
 
 [dependencies]
-pharos-core = { path = "../pharos-core", version = "0.6.0" }
-chrono = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+pharos-core   = { path = "../pharos-core", version = "0.6.0" }
+chrono        = { workspace = true }
+thiserror     = { workspace = true }
+trait-variant = { workspace = true }
+tracing       = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

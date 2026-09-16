@@ -158,9 +158,10 @@ pub enum FailureKind {
 }
 
 /// Publishes messages to an external broker or broker-like adapter.
-pub trait MessagePublisher: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait MessagePublisher: Sync + 'static {
     /// Publishes one message.
-    fn publish(&self, message: Message) -> impl Future<Output = Result<(), MessagingError>> + Send;
+    async fn publish(&self, message: Message) -> Result<(), MessagingError>;
     /// Publishes several messages.
     ///
     /// The default implementation calls [`Self::publish`] once per message,
@@ -174,6 +175,13 @@ pub trait MessagePublisher: Send + Sync + 'static {
     /// documentation for that gap.
     ///
     /// [`OutboxDispatcher`]: crate::outbox_dispatcher::OutboxDispatcher
+    ///
+    /// Kept in the manual `-> impl Future<..> + Send { async move { .. } }`
+    /// shape rather than `async fn`: `#[trait_variant::make(Send)]` only
+    /// rewrites a bodyless method's signature — a provided method's body is
+    /// passed through unchanged while its signature's `asyncness` is
+    /// stripped, so an `async fn` body with bare top-level `.await` would
+    /// stop being inside an async context after expansion.
     fn publish_batch(
         &self,
         messages: Vec<Message>,
@@ -188,24 +196,19 @@ pub trait MessagePublisher: Send + Sync + 'static {
 }
 
 /// Consumes messages from an external broker or broker-like adapter.
-pub trait MessageConsumer: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait MessageConsumer: Sync + 'static {
     /// Gets the next available message for a topic.
-    fn next(
-        &self,
-        topic: &str,
-    ) -> impl Future<Output = Result<Option<Delivery>, MessagingError>> + Send;
+    async fn next(&self, topic: &str) -> Result<Option<Delivery>, MessagingError>;
 }
 
 /// Acknowledges or rejects a delivered message.
-pub trait MessageAcknowledger: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait MessageAcknowledger: Sync + 'static {
     /// Acknowledges successful processing.
-    fn ack(&self, delivery: &Delivery) -> impl Future<Output = Result<(), MessagingError>> + Send;
+    async fn ack(&self, delivery: &Delivery) -> Result<(), MessagingError>;
     /// Rejects processing and indicates whether the message should be retried.
-    fn nack(
-        &self,
-        delivery: &Delivery,
-        requeue: bool,
-    ) -> impl Future<Output = Result<(), MessagingError>> + Send;
+    async fn nack(&self, delivery: &Delivery, requeue: bool) -> Result<(), MessagingError>;
 }
 
 // Shared handles delegate, so an `Arc<P>` can be cloned into dispatchers,

@@ -51,26 +51,33 @@ impl<E: Error + Send + Sync + 'static> ClassifiedError for RepositoryError<E> {
 /// `save` takes `&mut` because a successful write advances the aggregate's
 /// optimistic-concurrency version, which the repository writes back onto the
 /// in-memory instance.
-pub trait Repository<A: AggregateRoot>: Send + Sync + 'static {
+///
+/// `#[trait_variant::make(Send)]` rewrites the `async fn`s below to add
+/// `+ Send` to their returned futures — the trait's public shape is
+/// unchanged (same name, same methods), this only spares implementors (and
+/// this file) the hand-written `-> impl Future<Output = T> + Send` form.
+/// `Send` is required because `Repository<A>` is consumed by code generic
+/// over the trait itself (`DefaultAggregateStore`, `save_and_enqueue_in`,
+/// `tower::Service`-backed handlers) — see `pharos_app::AggregateStore`'s
+/// doc comment for the one trait in this workspace that deliberately opts
+/// out of this and why.
+#[trait_variant::make(Send)]
+pub trait Repository<A: AggregateRoot>: Sync + 'static {
     /// The repository-specific storage error type.
     type Error: Error + Send + Sync + 'static;
 
     /// Finds an aggregate by its identifier.
-    fn find_by_id(&self, id: &A::Id)
-    -> impl Future<Output = Result<Option<A>, Self::Error>> + Send;
+    async fn find_by_id(&self, id: &A::Id) -> Result<Option<A>, Self::Error>;
 
     /// Saves the current aggregate state, enforcing optimistic concurrency.
     ///
     /// On success the aggregate's [`version`](AggregateRoot::version) is advanced
     /// to the newly persisted value. On a version mismatch this returns
     /// [`RepositoryError::ConcurrencyConflict`] without mutating storage.
-    fn save(
-        &self,
-        aggregate: &mut A,
-    ) -> impl Future<Output = Result<(), RepositoryError<Self::Error>>> + Send;
+    async fn save(&self, aggregate: &mut A) -> Result<(), RepositoryError<Self::Error>>;
 
     /// Deletes an aggregate by identifier.
-    fn delete(&self, id: &A::Id) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    async fn delete(&self, id: &A::Id) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

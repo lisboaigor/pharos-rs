@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::future::Future;
 
 use tracing::{Instrument, Span, info_span};
 
@@ -172,7 +171,8 @@ pub trait Command: Send + Sync + 'static {
 }
 
 /// Handles a command and returns either an output value or an error.
-pub trait CommandHandler<C: Command>: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait CommandHandler<C: Command>: Sync + 'static {
     /// Successful command result type.
     type Output: Send + Sync + 'static;
     /// Concrete error type returned by the handler.
@@ -182,7 +182,7 @@ pub trait CommandHandler<C: Command>: Send + Sync + 'static {
     ///
     /// Implementations should contain business logic only; tracing is applied
     /// by [`dispatch`]. Prefer dispatching over calling this directly.
-    fn handle(&self, command: C) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+    async fn handle(&self, command: C) -> Result<Self::Output, Self::Error>;
 }
 
 /// Error returned by [`dispatch`]: either the input failed validation before

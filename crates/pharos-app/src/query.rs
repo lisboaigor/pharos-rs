@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::future::Future;
 
 use tracing::{Instrument, Span, info_span};
 
@@ -37,7 +36,8 @@ pub trait Query: Send + Sync + 'static {
 }
 
 /// Handles a query and returns the requested read model.
-pub trait QueryHandler<Q: Query>: Send + Sync + 'static {
+#[trait_variant::make(Send)]
+pub trait QueryHandler<Q: Query>: Sync + 'static {
     /// Concrete error type returned by the handler.
     type Error: Error + Send + Sync + 'static;
 
@@ -45,7 +45,7 @@ pub trait QueryHandler<Q: Query>: Send + Sync + 'static {
     ///
     /// Implementations should contain read logic only; tracing is applied by
     /// [`dispatch`]. Prefer dispatching over calling this directly.
-    fn handle(&self, query: Q) -> impl Future<Output = Result<Q::Result, Self::Error>> + Send;
+    async fn handle(&self, query: Q) -> Result<Q::Result, Self::Error>;
 }
 
 /// Dispatches a query to its handler inside the query's tracing span.
