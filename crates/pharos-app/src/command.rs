@@ -77,6 +77,18 @@ impl std::fmt::Display for ValidationError {
 
 impl Error for ValidationError {}
 
+impl pharos_core::ClassifiedError for ValidationError {
+    fn kind(&self) -> pharos_core::ErrorKind {
+        pharos_core::ErrorKind::Validation
+    }
+
+    fn public_message(&self) -> String {
+        // Every violation names the caller's own input field — never a
+        // detail of how the handler or storage underneath it works.
+        self.to_string()
+    }
+}
+
 /// Marker trait for application commands.
 pub trait Command: Send + Sync + 'static {
     /// Stable label for this command in traces and metrics.
@@ -192,6 +204,26 @@ pub enum DispatchError<E: Error> {
     Handler(E),
 }
 
+impl<E: pharos_core::ClassifiedError> pharos_core::ClassifiedError for DispatchError<E> {
+    fn kind(&self) -> pharos_core::ErrorKind {
+        match self {
+            DispatchError::Validation(_) => pharos_core::ErrorKind::Validation,
+            // Delegates rather than hardcoding a kind: the handler's own
+            // error type is the one that knows whether this particular
+            // failure was a conflict, a not-found, or truly internal — this
+            // seam only forwards that classification, it never invents one.
+            DispatchError::Handler(e) => e.kind(),
+        }
+    }
+
+    fn public_message(&self) -> String {
+        match self {
+            DispatchError::Validation(v) => v.public_message(),
+            DispatchError::Handler(e) => e.public_message(),
+        }
+    }
+}
+
 /// Dispatches a command to its handler inside the command's tracing span.
 ///
 /// This is the framework's instrumentation *and validation* seam:
@@ -219,6 +251,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use pharos_core::ClassifiedError;
+
     use super::*;
 
     struct Increment(u32);
@@ -318,4 +352,38 @@ mod tests {
     // The span name ("command.handle") and its field contents are asserted
     // end-to-end in the `order` example's instrumentation test, where a real
     // capturing subscriber is installed.
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("permission denied for warehouse-7")]
+    struct SensitiveHandlerError;
+
+    impl pharos_core::ClassifiedError for SensitiveHandlerError {
+        fn kind(&self) -> pharos_core::ErrorKind {
+            pharos_core::ErrorKind::Forbidden
+        }
+
+        fn public_message(&self) -> String {
+            "forbidden".to_string()
+        }
+    }
+
+    #[test]
+    fn dispatch_error_validation_classifies_as_validation_with_the_violation_text() {
+        let error: DispatchError<SensitiveHandlerError> =
+            DispatchError::Validation(ValidationError::violation("qty", "must be positive"));
+        assert_eq!(error.kind(), pharos_core::ErrorKind::Validation);
+        assert!(error.public_message().contains("must be positive"));
+    }
+
+    #[test]
+    fn dispatch_error_handler_delegates_classification_to_the_handler_error() {
+        let error: DispatchError<SensitiveHandlerError> =
+            DispatchError::Handler(SensitiveHandlerError);
+        assert_eq!(error.kind(), pharos_core::ErrorKind::Forbidden);
+        // The seam only forwards the handler's own classification; it must
+        // never substitute the handler error's `Display` (which, here,
+        // names an internal resource) for its `public_message`.
+        assert_eq!(error.public_message(), "forbidden");
+        assert!(!error.public_message().contains("warehouse-7"));
+    }
 }

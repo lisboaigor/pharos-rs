@@ -64,6 +64,7 @@
 
 pub mod aggregate;
 pub mod allocation;
+pub mod classify;
 pub mod domain_event;
 pub mod entity;
 pub mod errors;
@@ -81,6 +82,7 @@ pub mod __private {
 
 pub use aggregate::{AggregateEvents, AggregateRoot};
 pub use allocation::{AllocationError, allocate_minor_units};
+pub use classify::{ClassifiedError, ErrorKind};
 pub use domain_event::DomainEvent;
 pub use entity::Entity;
 pub use errors::{DomainError, DomainResult};

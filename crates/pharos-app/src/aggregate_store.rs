@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use pharos_core::{AggregateRoot, RepositoryError};
+use pharos_core::{AggregateRoot, ClassifiedError, ErrorKind, RepositoryError};
 
 /// Error returned by an [`AggregateStore`].
 ///
@@ -30,6 +30,27 @@ impl StoreError {
     /// Wraps any `Error + Send + Sync + 'static` as a storage failure.
     pub fn storage(e: impl Error + Send + Sync + 'static) -> Self {
         Self::Storage(Box::new(e))
+    }
+}
+
+impl ClassifiedError for StoreError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            StoreError::NotFound => ErrorKind::NotFound,
+            StoreError::ConcurrencyConflict { .. } => ErrorKind::Conflict,
+            StoreError::Storage(_) => ErrorKind::Internal,
+        }
+    }
+
+    fn public_message(&self) -> String {
+        match self {
+            StoreError::NotFound | StoreError::ConcurrencyConflict { .. } => self.to_string(),
+            // `Storage` boxes whatever the concrete backend produced — a
+            // `sqlx::Error`, a serialization failure, an outbox-insert
+            // failure. None of that is safe to hand to a caller; it stays
+            // reachable only through `source()` for logging.
+            _ => "internal storage error".to_string(),
+        }
     }
 }
 
@@ -106,4 +127,35 @@ pub trait AggregateStore<A: AggregateRoot>: Send + Sync {
     /// a retry starts clean (see the contract on [`crate::save_and_publish`]
     /// and [`crate::save_and_enqueue_in`], which concrete stores build on).
     async fn save(&self, aggregate: &mut A) -> Result<(), StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("connection to postgres://prod-db.internal:5432 refused")]
+    struct SensitiveAdapterError;
+
+    #[test]
+    fn not_found_and_conflict_classify_with_their_own_message() {
+        assert_eq!(StoreError::NotFound.kind(), ErrorKind::NotFound);
+        assert_eq!(StoreError::NotFound.public_message(), "aggregate not found");
+
+        let conflict = StoreError::ConcurrencyConflict {
+            expected: 2,
+            actual: Some(3),
+        };
+        assert_eq!(conflict.kind(), ErrorKind::Conflict);
+        assert!(conflict.public_message().contains("expected version 2"));
+    }
+
+    #[test]
+    fn storage_failure_never_leaks_the_wrapped_adapter_error() {
+        let error = StoreError::storage(SensitiveAdapterError);
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(!error.public_message().contains("postgres://"));
+        assert!(!error.public_message().contains("5432"));
+        assert_eq!(error.public_message(), "internal storage error");
+    }
 }

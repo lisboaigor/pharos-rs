@@ -27,9 +27,34 @@ use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use pharos_app::{Command, CommandHandler, DispatchError, Query, QueryHandler, ValidationError};
-use pharos_core::DomainError;
+use pharos_core::{ClassifiedError, DomainError, ErrorKind};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+/// Maps [`ErrorKind`] to the conventional HTTP status for it.
+///
+/// This is the *only* place an HTTP status is chosen from a failure's
+/// classification: every [`HandlerError`] constructor that takes a
+/// [`ClassifiedError`] goes through this function, so a domain error, an
+/// application error, and an application's own error type all get the same
+/// status for the same kind, without pharos-axum ever matching on their
+/// concrete variants.
+pub fn status_for(kind: ErrorKind) -> StatusCode {
+    match kind {
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Validation => StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorKind::Conflict => StatusCode::CONFLICT,
+        ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        ErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        // `ErrorKind` is non_exhaustive; an unknown future kind is treated
+        // the same as `Internal` — never assumed safe to answer with
+        // anything more specific than "something failed on our end".
+        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 /// Error returned when an HTTP request cannot be handled successfully.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +86,10 @@ impl HandlerError {
     /// Maps an input-validation failure to `422 Unprocessable Entity`.
     ///
     /// Unlike [`internal`](Self::internal), the detail is safe to return: it
-    /// describes the client's own input.
+    /// describes the client's own input. A thin wrapper over
+    /// [`from_classified`](Self::from_classified).
     pub fn validation(error: &ValidationError) -> Self {
-        Self::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        Self::from_classified(error)
     }
 
     /// Rejects an attempt to invoke an internal-only command over HTTP.
@@ -86,6 +112,38 @@ impl HandlerError {
         )
     }
 
+    /// Maps any [`ClassifiedError`] to its conventional HTTP status and
+    /// public message — [`status_for`] picks the status from
+    /// [`ClassifiedError::kind`], and the response body is exactly
+    /// [`ClassifiedError::public_message`], never this error's `Display` or
+    /// `source()` chain.
+    ///
+    /// This is the framework's *one* HTTP boundary rule: pharos-axum never
+    /// matches on a domain, application, or application-specific error
+    /// enum to decide what to answer — it only ever calls the two methods
+    /// this trait exposes. Implement [`ClassifiedError`] once on your
+    /// application's top-level error type (see
+    /// [`DispatchError`]'s blanket impl, which classifies for free once
+    /// your handler's own error type does) and every route that returns it
+    /// gets a correct, non-leaking response through this one function:
+    ///
+    /// ```ignore
+    /// handler.dispatch(command).await.map_err(|e| HandlerError::from_classified(&e))?;
+    /// ```
+    ///
+    /// A response built this way logs the full error (via
+    /// `tracing::error!`, using this error's `Display`/`source()` chain)
+    /// whenever the mapped status is a 5xx — the same rule
+    /// [`internal`](Self::internal) already followed, now applied
+    /// uniformly regardless of which layer's error type is in hand.
+    pub fn from_classified(error: &impl ClassifiedError) -> Self {
+        let status = status_for(error.kind());
+        if status.is_server_error() {
+            tracing::error!(error = %error, "handler failed");
+        }
+        Self::new(status, error.public_message())
+    }
+
     /// Maps a [`DomainError`] to the conventional HTTP status.
     ///
     /// `NotFound` → `404`, `Conflict`/`BusinessRule` → `409`, `Validation` →
@@ -101,16 +159,13 @@ impl HandlerError {
     ///     DispatchError::Handler(e) => HandlerError::internal(e),
     /// })?;
     /// ```
+    ///
+    /// A thin wrapper over [`from_classified`](Self::from_classified) kept
+    /// for the common single-error-type case; prefer `from_classified`
+    /// directly once your application's own error type also implements
+    /// [`ClassifiedError`].
     pub fn from_domain(error: &DomainError) -> Self {
-        let status = match error {
-            DomainError::NotFound(_) => StatusCode::NOT_FOUND,
-            DomainError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            DomainError::BusinessRule(_) | DomainError::Conflict(_) => StatusCode::CONFLICT,
-            // `DomainError` is non_exhaustive; unknown future variants are
-            // still domain-authored rejections of the request.
-            _ => StatusCode::UNPROCESSABLE_ENTITY,
-        };
-        Self::new(status, error.to_string())
+        Self::from_classified(error)
     }
 
     /// Returns the status code.
@@ -630,5 +685,73 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "the internal-only command handler must never run through this seam either"
         );
+    }
+
+    #[derive(Debug)]
+    struct SensitiveAdapterError;
+
+    impl Display for SensitiveAdapterError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "connection to postgres://prod-db.internal:5432 refused")
+        }
+    }
+
+    impl std::error::Error for SensitiveAdapterError {}
+
+    impl ClassifiedError for SensitiveAdapterError {
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Internal
+        }
+
+        fn public_message(&self) -> String {
+            "internal error".to_string()
+        }
+    }
+
+    #[test]
+    fn status_for_maps_every_kind_to_its_conventional_status() {
+        assert_eq!(status_for(ErrorKind::NotFound), StatusCode::NOT_FOUND);
+        assert_eq!(
+            status_for(ErrorKind::Validation),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(status_for(ErrorKind::Conflict), StatusCode::CONFLICT);
+        assert_eq!(
+            status_for(ErrorKind::Unauthorized),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status_for(ErrorKind::Forbidden), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_for(ErrorKind::RateLimited),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status_for(ErrorKind::Unavailable),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for(ErrorKind::Internal),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn from_classified_never_puts_the_adapter_error_text_in_the_response() {
+        let error = HandlerError::from_classified(&SensitiveAdapterError);
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The whole contract: whatever `Display` says about this error (a
+        // connection string, here) must never reach the client, even though
+        // it's exactly what gets logged via `tracing::error!` a line above.
+        assert!(!error.message().contains("postgres://"));
+        assert!(!error.message().contains("5432"));
+        assert_eq!(error.message(), "internal error");
+    }
+
+    #[test]
+    fn from_classified_returns_domain_authored_text_for_non_internal_kinds() {
+        let domain_error = DomainError::Conflict("order already shipped".into());
+        let error = HandlerError::from_classified(&domain_error);
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert!(error.message().contains("order already shipped"));
     }
 }
