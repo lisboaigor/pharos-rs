@@ -2,21 +2,22 @@
 //!
 //! This example shows how a [`TenantContext`](pharos_app::TenantContext) keeps
 //! tenant identity explicit and how one repository instance per tenant gives
-//! row-level isolation: data written for one tenant is never visible to
-//! another.
+//! isolation: data written for one tenant is never visible to another.
 //!
-//! The domain is deliberately tiny — a `Note` aggregate — so the focus stays on
-//! the tenancy wiring. The same `Note` repository type works against an
-//! in-memory store (see `main.rs`) and against the tenant-scoped PostgreSQL
-//! adapter (see the integration test), both scoped by tenant.
+//! The domain is deliberately tiny — a `Note` aggregate — so the focus stays
+//! on the tenancy wiring (see `main.rs`): one `InMemoryRepository<Note>` per
+//! tenant, keyed by [`TenantId`](pharos_app::TenantId).
+//!
+//! A real deployment usually pushes this isolation down to row-level
+//! security instead of one repository instance per tenant — see the
+//! `pharos_tenant_aggregates` table and its `USING (tenant_id = ...)` policy
+//! in `docs/guide/reference-schema.sql`, which any adapter you write against
+//! Postgres (or another engine with row security) can reuse verbatim.
 
 use chrono::{DateTime, Utc};
 use pharos_core::{AggregateEvents, AggregateRoot, DomainEvent, Entity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// Stable aggregate-type discriminator used by the PostgreSQL adapters.
-pub const NOTE_AGGREGATE_TYPE: &str = "Note";
 
 /// A note owned by a single tenant.
 #[derive(Debug, Clone, Serialize, Deserialize)]

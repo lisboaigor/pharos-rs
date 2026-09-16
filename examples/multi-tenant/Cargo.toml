@@ -10,16 +10,12 @@ repository = "https://github.com/lisboaigor/pharos-rs"
 pharos-core   = { path = "../../crates/pharos-core" }
 pharos-app    = { path = "../../crates/pharos-app" }
 pharos-memory  = { path = "../../crates/pharos-memory" }
-pharos-postgres = { path = "../../crates/pharos-postgres" }
 
 chrono      = { workspace = true }
 serde       = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
 uuid        = { workspace = true }
-
-[dev-dependencies]
-testcontainers = { workspace = true }
 
 [lints]
 workspace = true
