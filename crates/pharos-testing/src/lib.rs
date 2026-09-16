@@ -8,6 +8,14 @@
 //! span and log records in memory so tests can assert on observability output
 //! without depending on a real OTLP endpoint.
 //!
+//! With the `contract` feature, [`contract`] is an adapter conformance kit:
+//! async functions that exercise `Repository`, `OutboxRepository`,
+//! `SagaStore`, and the rest of Pharos's storage/messaging traits' full
+//! contract — not just their happy path — against any implementation you
+//! write. Run it against your own adapter (a SeaORM one, a hand-rolled one)
+//! the same way `pharos-memory`'s own adapters are proven correct in this
+//! crate's test suite.
+//!
 //! ```
 //! use chrono::{DateTime, Utc};
 //! use pharos_core::DomainEvent;
@@ -29,6 +37,9 @@
 //! assert_eq!(capture.events()[0].aggregate_id(), "order-1");
 //! # }
 //! ```
+
+#[cfg(feature = "contract")]
+pub mod contract;
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};

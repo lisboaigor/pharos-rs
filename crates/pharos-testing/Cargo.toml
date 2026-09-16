@@ -41,5 +41,14 @@ chrono         = { workspace = true }
 tokio          = { workspace = true }
 pharos-memory  = { path = "../pharos-memory", version = "0.6.0" }
 
+# Only builds (and only makes sense) with the `contract` feature enabled —
+# it exercises `pharos_testing::contract` against `pharos-memory`'s
+# adapters. Without `required-features`, `cargo build/test --workspace`
+# (no `--all-features`) would try to compile it anyway and fail on the
+# feature-gated `contract` module.
+[[test]]
+name = "contract_kit"
+required-features = ["contract"]
+
 [lints]
 workspace = true
