@@ -1,29 +1,20 @@
 # Observability with Pharos RS
 
-A project scaffolded by `pharos-init` comes up already observable: metrics, logs
-and traces wired, a compose file that brings up the collectors, and dashboards
-provisioned. This page explains what that machinery is, how to reach the same
-place in an existing application, and the traps it exists to remove.
+`pharos-observability` wires metrics, logs, and traces for a Pharos
+application, joined by one value: the OpenTelemetry SDK mints a trace id, the
+log records carry it, and the metrics' exemplars carry it too — so a spike in
+a latency panel leads to the trace behind it, and that trace leads to its log
+lines. This page explains that machinery and the traps it exists to remove.
 
-## In a generated project
+| Signal | Comes from |
+| --- | --- |
+| Metrics | `pharos_axum::metrics`, scraped from the app |
+| Logs | the process's own stdout, structured by `pharos-observability` |
+| Traces | OTLP, exported by `pharos-observability` |
 
-```sh
-docker compose up -d
-open http://localhost:3002        # Grafana, admin/admin
-```
-
-Three signals, one pane:
-
-| Signal | Stored in | Comes from |
-| --- | --- | --- |
-| Metrics | Prometheus | `pharos_axum::metrics`, scraped from the app |
-| Logs | Loki | Grafana Alloy, reading container stdout |
-| Traces | Tempo | OTLP, exported by `pharos-observability` |
-
-They are joined by one value. The OpenTelemetry SDK mints a trace id, the log
-records carry it, and the metrics' exemplars carry it too — so a spike in a
-latency panel leads to the trace behind it, and that trace leads to its log
-lines.
+Wiring a collector stack (Prometheus, Loki, Tempo, or a managed equivalent) to
+receive these is your own infrastructure's concern — `pharos-rs` emits the
+signals, it does not ship or provision collectors.
 
 ## In an existing application
 
@@ -113,35 +104,22 @@ headers at enqueue time with `pharos_observability::propagation::inject`, and
 restore it in the relay with `extract`; otherwise every effect opens a trace of
 its own and the operation cannot be reconstructed.
 
-## Refreshing the configuration
-
-The files under `docker/` belong to the project, so they can be tuned. To pull
-in fixes made to the framework's copies since:
-
-```sh
-pharos-init observability --update      # --dry-run to preview, --force to overwrite edits
-```
-
-Assets you edited are reported and kept. Your compose file, Dockerfile and `.env`
-are never touched.
-
 ## Metrics the framework emits
 
-Beyond the HTTP series, `pharos-app` and the adapters count their own work
-(~60 call sites across the outbox, inbox, saga, DLQ and broker adapters,
-including `pharos.events.published`, `pharos.postgres.outbox.inserted`, and
-the retry and circuit-breaker counters in `pharos_app::resilience`) through
-the `metrics` facade crate. This is a **separate** stack from the
+Beyond the HTTP series, `pharos-app` counts its own work (~60 call sites
+across the outbox, inbox, saga, and DLQ seams, including
+`pharos.events.published` and the retry and circuit-breaker counters in
+`pharos_app::resilience`; your own adapter can add its own) through the
+`metrics` facade crate. This is a **separate** stack from the
 `prometheus-client` registry `pharos-axum` uses for the HTTP series (that
 registry exists because the `prometheus-client` ecosystem has no exemplar
 support) — the two do not share a scrape endpoint or a Grafana panel.
 
 **By default, none of this is collected.** The `metrics` facade degrades to a
-silent no-op recorder until a process installs one; `pharos_observability::init`
-does not install one, `pharos-init`'s generated projects do not either, and the
-Grafana dashboards `pharos-init` provisions have no panel querying a
-`pharos_*` series — they only cover the HTTP metrics. Every outbox, inbox,
-saga, DLQ and broker counter is silently discarded until you opt in.
+silent no-op recorder until a process installs one, and
+`pharos_observability::init` does not install one — every outbox, inbox,
+saga, and DLQ counter is silently discarded until you opt in to a `metrics`
+recorder yourself.
 
 To collect them, install a `metrics` exporter once at process start, for
 example [`metrics-exporter-prometheus`](https://docs.rs/metrics-exporter-prometheus):

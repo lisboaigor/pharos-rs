@@ -18,7 +18,6 @@ members = [
     "examples/multi-tenant",
     "examples/modular-monolith",
     "benches/pharos-benches",
-    "tools/pharos-init",
 ]
 
 [workspace.package]

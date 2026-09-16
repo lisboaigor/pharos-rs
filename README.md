@@ -78,52 +78,28 @@ pharos-rs/
 │   ├── pharos-messaging # broker contracts, retry, outbox/inbox, DLQ, consumer groups
 │   ├── pharos-app       # CQRS, EventBus, integration events, upcasters, Tower adapters
 │   ├── pharos-memory    # in-memory adapters for tests and local development
-│   ├── pharos-postgres  # pooled PostgreSQL adapters
-│   ├── pharos-redis     # Redis messaging adapter
 │   ├── pharos-axum      # Axum extractors/helpers for handlers
 │   ├── pharos-saga      # saga/process-manager primitives
 │   ├── pharos-es        # event sourcing primitives
-│   ├── pharos-kafka     # Kafka + schema registry adapters
-│   ├── pharos-nats      # NATS messaging adapters
 │   ├── pharos-proto     # Protobuf binary serialization for integration events
-│   ├── pharos-testing   # EventCapture and test helpers
+│   ├── pharos-testing   # EventCapture, test helpers, and the adapter conformance kit
 │   └── pharos           # convenience meta-crate (re-exports + prelude)
-├── examples/
-│   ├── order
-│   ├── multi-tenant
-│   └── modular-monolith
-└── tools/
-    └── pharos-init      # interactive project scaffolder
+└── examples/
+    ├── order
+    ├── multi-tenant
+    └── modular-monolith
 ```
+
+`pharos-rs` ships no database, broker, or ORM dependency — only the traits
+above and `pharos-memory`'s in-process implementations of them, for tests and
+local development. Bringing your own storage is a matter of implementing a
+couple of traits and proving them correct with `pharos-testing`'s conformance
+kit; see [`docs/guide/writing-an-adapter.md`](docs/guide/writing-an-adapter.md)
+(SeaORM as the running example) and
+[`docs/guide/reference-schema.sql`](docs/guide/reference-schema.sql) (a
+copyable PostgreSQL schema to start from).
 
 ## Getting started
-
-### Scaffold a new project with `pharos-init`
-
-`pharos-init` is an interactive CLI that asks three high-level questions about your system and scaffolds the right project structure automatically — no Docker, Redis, or PostgreSQL knowledge required up front. The project it writes comes up with `docker compose up`, its database and observability stack included.
-
-```sh
-cargo install --path tools/pharos-init
-pharos-init
-```
-
-You will be asked:
-
-1. **What kind of system?** — single service, modular monolith, event-driven, or high-throughput pipeline
-2. **How does it receive work?** — HTTP API or background worker
-3. **Does it need to persist state?** — in-memory or durable storage (skipped for event-driven/high-throughput)
-
-From those answers `pharos-init` derives persistence, event delivery, broker, serialization format, and HTTP layer automatically, and generates a ready-to-build project.
-
-It also writes the infrastructure to run it: a Dockerfile, a compose file, and a
-configured observability stack — Prometheus, Grafana, Loki, Tempo, Alloy,
-Telegraf, behind a read-only `docker-socket-proxy` (never a raw Docker-socket
-mount) — with metrics, logs and traces already joined by a shared trace id.
-See [the observability guide](docs/guide/observability.md); `pharos-init
-observability --update` refreshes those files as the framework fixes them.
-Pass `--minimal` (`pharos-init --minimal`) to skip that stack entirely — eight
-fewer containers, no Docker-socket access anywhere in the generated compose
-file — while keeping the application's own logging and tracing wired.
 
 ### Manual setup
 

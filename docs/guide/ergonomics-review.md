@@ -65,8 +65,9 @@ All five recommendations are now addressed:
    plus the conditions to deviate.
 2. **Opinionated starter profile** — the `pharos` meta-crate now ships a
    `starter` feature bundle (`macros` + `infra` + `postgres` + `axum` + `tower`)
-   for the PostgreSQL outbox + HTTP path, alongside `full`. The workspace
-   `pharos-init` remains the bootstrap scaffold.
+   for the PostgreSQL outbox + HTTP path, alongside `full`. (Note: the
+   workspace's own scaffolding tool, `pharos-init`, was later removed — see
+   `docs/guide/writing-an-adapter.md` for the current bootstrap path.)
 3. **API cookbook** — `guide/cookbook.md` collects the frequent snippets:
    command handler, transactional save + enqueue, idempotent consumer, tenant
    propagation, and HTTP route.

@@ -96,15 +96,15 @@ enabled workspace-wide in `.cargo/config.toml`.
   red flag.
 - `pharos-app` — application contracts (CQRS, event bus, outbox/inbox, messaging),
   plus the optional Tower adapters (`tower` feature).
-- `pharos-memory` — in-memory adapters only.
-- `pharos-postgres` — pooled PostgreSQL adapters.
-- `pharos-redis` — Redis messaging adapter.
+- `pharos-memory` — in-memory adapters only. The only storage/messaging
+  adapters the workspace ships; everything else (Postgres, Redis, Kafka,
+  NATS, ...) is an application's own concern — see
+  `docs/guide/writing-an-adapter.md`.
 - `pharos-axum` — Axum integration.
 - `pharos-saga` — saga/process-manager primitives.
 - `pharos-es` — event-sourcing primitives.
-- `pharos-kafka` — Kafka + remote schema-registry adapters.
-- `pharos-nats` — NATS messaging adapters.
-- `pharos-testing` — test helpers.
+- `pharos-testing` — test helpers, and the `contract` feature's adapter
+  conformance kit.
 - `pharos` — convenience meta-crate.
 
 Adapter crates depend on `app`/`core`; never the other way.
@@ -113,7 +113,6 @@ Adapter crates depend on `app`/`core`; never the other way.
 
 - The dedicated docs site source lives under `docs/site/` and is built with `mdbook build docs/site`.
 - The 30-minute tutorial lives in `docs/guide/30-minutes.md` and should stay runnable against the current API.
-- `pharos-init` is the only scaffolding path; its generated project is covered by tests in `tools/pharos-init/src/generator.rs`.
 - RFCs live in `docs/rfc/`; use `docs/rfc/0000-template.md` as the starting point.
 
 ## Licensing
