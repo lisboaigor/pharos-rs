@@ -30,16 +30,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-      # The container-backed integration tests are part of the normal suite, so
-      # the test job needs a working Docker daemon. ubuntu-latest ships one;
-      # testcontainers uses it to spin up ephemeral PostgreSQL/Redis per test.
-      - name: Verify Docker is available
-        run: docker info
-
-      - name: Test (unit + container integration)
-        # `--test-threads=1` keeps the number of concurrently running containers
-        # bounded so the runner does not exhaust resources.
-        run: cargo test --workspace --all-features -- --test-threads=1
+      - name: Test
+        run: cargo test --workspace --all-features
 
   msrv:
     name: MSRV (1.98.0)

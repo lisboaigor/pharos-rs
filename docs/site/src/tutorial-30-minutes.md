@@ -8,4 +8,4 @@ Use it when you want the shortest path from a fresh Rust project to:
 - optimistic concurrency
 - an in-process event bus
 - an outbox seam
-- production migration paths to PostgreSQL, Axum, sagas, and event sourcing
+- production migration paths to your own storage adapter, Axum, sagas, and event sourcing

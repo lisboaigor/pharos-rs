@@ -7,13 +7,13 @@ side of a default recommended in the [decision matrix](decision-matrix.md).
 
 **Symptom:** events occasionally go missing after a deploy or crash.
 
-**Why:** if you save the aggregate, commit, then publish to Kafka/Redis/NATS in
-the handler, a crash between commit and publish loses the event with no record
+**Why:** if you save the aggregate, commit, then publish to your broker in the
+handler, a crash between commit and publish loses the event with no record
 that it ever existed.
 
 **Fix:** use the outbox. Persist the aggregate and the outbox rows in the same
-transaction (`pharos::postgres::save_aggregate_and_enqueue`), and let an
-`OutboxDispatcher` move them to the broker. See the
+transaction (`save_and_enqueue_in`, against your `TransactionalStore`), and
+let an `OutboxDispatcher` move them to the broker. See the
 [cookbook](cookbook.md#command-handler-with-transactional-save--enqueue).
 
 ## Forgetting that consumers see duplicates
@@ -48,9 +48,9 @@ pending events as part of the call. If you also drain manually, or save the
 aggregate through the bare `Repository::save` and expect events to fire, the
 counts will be wrong.
 
-**Fix:** go through `save_and_publish` / `save_and_enqueue` (or the postgres
-transactional helper). Use bare `Repository::save` only for aggregates with no
-events.
+**Fix:** go through `save_and_publish` / `save_and_enqueue` (or
+`save_and_enqueue_in`). Use bare `Repository::save` only for aggregates with
+no events.
 
 ## Losing the tenant across an async boundary
 
@@ -60,30 +60,35 @@ events.
 instead of receiving it, isolation breaks.
 
 **Fix:** thread `TenantContext` explicitly from the edge through the application
-layer into the adapter, and `stamp` outgoing integration events. With
-PostgreSQL, use `TenantJsonRepository` so isolation is enforced at the row
-level. See the [cookbook](cookbook.md#tenant-propagation).
+layer into the adapter, and `stamp` outgoing integration events. Build your
+repository so isolation is enforced at the row level (filter every query by
+`tenant_id`) — see `reference-schema.sql`'s row-level-security variant and
+the [cookbook](cookbook.md#tenant-propagation).
 
 ## Reaching for a normalized schema too early
 
 **Symptom:** heavy mapping code and migrations before there is a query that
 needs them.
 
-**Why:** the JSON repository stores the aggregate as a document and needs no
-per-field schema. A normalized relational schema only pays off when you query
-across columns, enforce foreign keys, or report on the same tables.
+**Why:** a JSON/JSONB-document repository stores the aggregate as one blob and
+needs no per-field schema. A normalized relational schema only pays off when
+you query across columns, enforce foreign keys, or report on the same tables.
 
-**Fix:** start with the JSON repository; introduce a hand-written normalized
-`Repository` (as in `examples/order`) when a real relational query appears.
+**Fix:** start with a JSON-document `Repository` (see `reference-schema.sql`);
+introduce a hand-written normalized `Repository` when a real relational query
+appears.
 
-## Enabling more features than you ship
+## Enabling more features than you need
 
-**Symptom:** slow builds, large binaries, confusing surface area.
+**Symptom:** slow builds, confusing surface area.
 
-**Why:** the `full` bundle compiles every adapter (Kafka, NATS, ES, saga, …).
+**Why:** `pharos-app`'s `messaging`/`tower`/`retry`/`tenant-task-local`
+features, and standalone crates like `pharos-saga`/`pharos-es`/
+`pharos-realtime`, each pull in their own dependency tree.
 
-**Fix:** use `full` for exploration only. For a service, use `starter` or list
-the exact flags you depend on. See [Choosing features](decision-matrix.md#feature-bundle).
+**Fix:** depend only on the crates and features your service actually uses —
+there is no bundled "everything" feature to fall back on and forget to trim.
+See [What ships vs. what you bring](decision-matrix.md#what-ships-vs-what-you-bring).
 
 ## Running JSONB schema changes without a rollback plan
 

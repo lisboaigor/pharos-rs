@@ -6,18 +6,18 @@ This page describes the public API of each crate in the Pharos RS workspace.
 
 Core domain primitives used by the entire framework:
 
-| Type                           | Purpose                                                       |
-| ------------------------------ | ------------------------------------------------------------- |
-| `Entity`                       | Stable identity for domain objects                            |
-| `AggregateRoot`                | Aggregate boundary with pending events and OCC `version()`    |
-| `AggregateEvents<E>`           | Small event buffer for aggregates                             |
-| `DomainEvent`                  | Immutable fact with type, timestamp and aggregate correlation |
-| `Repository<A>`                | Persistence boundary for aggregate roots                      |
-| `RepositoryError<E>`           | `save` error with a `ConcurrencyConflict` variant             |
-| `ValueObject`                  | Marker for immutable value objects                            |
+| Type                           | Purpose                                                                                            |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `Entity`                       | Stable identity for domain objects                                                                 |
+| `AggregateRoot`                | Aggregate boundary with pending events and OCC `version()`                                         |
+| `AggregateEvents<E>`           | Small event buffer for aggregates                                                                  |
+| `DomainEvent`                  | Immutable fact with type, timestamp and aggregate correlation                                      |
+| `Repository<A>`                | Persistence boundary for aggregate roots                                                           |
+| `RepositoryError<E>`           | `save` error with a `ConcurrencyConflict` variant                                                  |
+| `ValueObject`                  | Marker for immutable value objects                                                                 |
 | `Money` / `Currency`           | Currency-aware amounts in `i128` minor units (covers wei); checked arithmetic, lossless `allocate` |
-| `DomainError` / `DomainResult` | Shared domain-level result types                              |
-| `value_object!`                | Validated value objects with a single construction point      |
+| `DomainError` / `DomainResult` | Shared domain-level result types                                                                   |
+| `value_object!`                | Validated value objects with a single construction point                                           |
 
 `Money` never touches floats and every operation is checked: mixing currencies
 or overflowing returns a `MoneyError`. With the optional `serde` feature the
@@ -118,84 +118,29 @@ In-memory adapters, ideal for tests, examples, and local development:
 | `InMemorySchemaRegistry`           | In-memory          | `SchemaRegistry`                                             |
 | `InMemoryConsumerGroupCoordinator` | In-memory          | `ConsumerGroupCoordinator`                                   |
 
-## `pharos-postgres`
+`pharos-memory` is the **only** storage/messaging adapter the workspace
+ships. There is no PostgreSQL, Redis, Kafka, or NATS crate here anymore —
+bring your own, against the same traits, following
+[Writing an adapter](writing-an-adapter.md) and
+[`reference-schema.sql`](reference-schema.sql).
 
-Pooled PostgreSQL adapters. Build a connection pool once with
-`connect_pool(url, max_size)` and share it (it is cheap to clone) across every
-adapter:
+## `pharos-testing`
 
-| Adapter                                              | Backing technology | Implements                                                                       |
-| ---------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------- | ---- | ------ |
-| `PostgresOutboxRepository`                           | PostgreSQL         | `OutboxRepository`                                                               |
-| `PostgresInboxStore`                                 | PostgreSQL         | `InboxStore`                                                                     |
-| `PostgresDeadLetterQueue`                            | PostgreSQL         | `DeadLetterQueue`                                                                |
-| `PostgresJsonRepository<A>`                          | PostgreSQL JSONB   | `Repository<A>`                                                                  |
-| `TenantJsonRepository<A>`                            | PostgreSQL JSONB   | multi-tenant `Repository<A>`                                                     |
-| `PostgresUnitOfWork`                                 | PostgreSQL         | closure-based transactional boundary (`transaction(                                            | conn | ...)`), and `pharos_app::TransactionalStore` (`Tx<'a> = sqlx::Transaction<'a, Postgres>`) |
-| `pharos_app::{TransactionalRepository, save_and_enqueue_in}` | any `TransactionalStore` (only PostgreSQL today) | atomic aggregate save + outbox for any repository (JSONB or explicit relational), against any backend — the trait and the composing function never name a concrete connection type |
-| `PgEventStore<I, E>` / `PgSnapshotStore<I, S>`       | PostgreSQL JSONB   | `EventStore` / `SnapshotStore` (`pharos-es`) with PK-arbitrated OCC on append    |
-| `PgSagaStore<I, S>`                                  | PostgreSQL JSONB   | `SagaStore` + `SagaTimeoutStore` (`pharos-saga`); `claim_due` uses `FOR UPDATE SKIP LOCKED` + lease over a partial index, so timeout sweeps scale horizontally |
+Test helpers, plus the `contract` feature's adapter conformance kit:
 
-```rust
-use pharos_postgres::{PostgresOutboxRepository, connect_pool};
+| Area                    | Public API                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Event capture           | `EventCapture<E>`, `capturing_event_bus`, `TestSubscriber`                                                                                              |
+| Adapter conformance kit | `contract::{repository, transactional, outbox, inbox, dead_letter, saga, event_store, messaging, schema_registry}` (feature `contract`, off by default) |
 
-let pool = connect_pool("postgres://postgres:postgres@localhost:5432/app", 16).await?;
-let outbox = PostgresOutboxRepository::new(pool.clone());
-outbox.migrate().await?;
-```
-
-For production, apply the versioned SQL history under
-`crates/pharos-postgres/migrations/` with your migration tool instead of
-running schema creation automatically on startup.
-
-### PostgreSQL schema overview
-
-```mermaid
-erDiagram
-    PHAROS_OUTBOX {
-        uuid id PK
-        uuid message_id
-        text topic
-        text message_key
-        jsonb headers
-        bytea payload
-        text content_type
-        text status
-        integer attempts
-        timestamptz created_at
-        timestamptz updated_at
-        text last_error
-    }
-
-    PHAROS_INBOX {
-        uuid message_id PK
-        text consumer PK
-        text status
-        timestamptz received_at
-        timestamptz updated_at
-        text last_error
-    }
-```
-
-## `pharos-redis`
-
-| Adapter              | Backing technology | Implements                                                   |
-| -------------------- | ------------------ | ------------------------------------------------------------ |
-| `RedisMessageBroker` | Redis lists/sets   | `MessagePublisher`, `MessageConsumer`, `MessageAcknowledger` |
-
-Redis command mapping:
-
-| Operation | Redis command                        |
-| --------- | ------------------------------------ |
-| publish   | `RPUSH <topic> <encoded-delivery>`   |
-| consume   | `LPOP <topic>`                       |
-| ack       | `SADD pharos:acked <message_id>`     |
-| nack      | `SADD pharos:nacked <message_id>`    |
-| requeue   | `RPUSH <topic> <encoded-redelivery>` |
-
-The Redis adapter is intentionally simple and broker-like. For stronger
-operational guarantees, implement a Kafka/RabbitMQ/NATS/SQS adapter behind the
-same `MessagePublisher`, `MessageConsumer`, and `MessageAcknowledger` traits.
+The conformance kit is plain `async fn`s, not `#[tokio::test]`s themselves —
+call them from your own adapter's test, against fixture types
+(`contract::fixtures::{ContractAggregate, ContractEvent}`) rather than your
+domain types, so the same suite runs against any implementation of the
+trait it targets. `pharos-memory`'s own adapters are verified this way in
+`tests/contract_kit.rs`; use the same suite to prove your own
+Postgres/Redis/Kafka/… adapter is correct before shipping it — see
+[Writing an adapter](writing-an-adapter.md).
 
 ## `pharos-axum`
 
@@ -221,20 +166,41 @@ Event-sourcing primitives:
 
 - `EventStore`, `SnapshotStore`, `StoredEvent`, `Snapshot`
 - `EventSourced` and `EventSourcedRepository`
-- Durable adapters live in `pharos-postgres` (`PgEventStore`, `PgSnapshotStore`)
+- No durable adapter ships in the workspace — implement `EventStore`/
+  `SnapshotStore` against your own storage; `reference-schema.sql` includes
+  the event-stream/snapshot tables as a starting point.
 
-## `pharos-kafka`
+## `pharos-realtime`
 
-Kafka and remote schema-registry adapters:
+Real-time WebSocket / pub-sub primitives — fan-out-to-many-subscribers
+delivery (a live game, a chat room, a dashboard with many viewers), a
+different delivery contract from `pharos-messaging`'s point-to-point broker
+consumption:
 
-- `KafkaPublisher`, `KafkaConsumer`, `KafkaAcknowledger`
-- `ConfluentSchemaRegistry`, `ApicurioSchemaRegistry`
+| Area           | Public API                                                                                                                                                                                                                     |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Rooms/messages | `RoomId`, `RealtimeMessage`, `Backlog`                                                                                                                                                                                         |
+| Hub traits     | `RealtimePublisher`, `RealtimeSubscriber`, `RealtimeHub`                                                                                                                                                                       |
+| In-memory hub  | `InMemoryHub` (single-node MVP backend on `tokio::sync::broadcast`)                                                                                                                                                            |
+| Auth seams     | `ConnectionAuthenticator` (who is this?), `RoomAuthorizer` (may they touch this room?), `Identity`, `Access`                                                                                                                   |
+| Axum glue      | `Realtime`, `RealtimeConfig`, `OnMessage`, `Reply` — WebSocket upgrade/pump: authenticate, authorize, join a room, then pump both directions while rechecking authorization and keeping the connection honest with a heartbeat |
 
-## `pharos-nats`
+## `pharos-observability`
 
-Core NATS messaging adapters:
+Metrics, logs, and traces wiring, joined by one value: the OpenTelemetry SDK
+mints a trace id, log records carry it, and metrics' exemplars carry it too.
+See [Observability](observability.md) for the full walkthrough.
 
-- `NatsPublisher`, `NatsConsumer`, `NatsAcknowledger`
+| Area              | Public API                                                                             |
+| ----------------- | -------------------------------------------------------------------------------------- |
+| Setup             | `init(service_name)`, `init_with(Config)`, `Observability` (flush-on-drop guard)       |
+| HTTP              | `http::request_span`, `http::http_metrics`, `http::instrument`, `http::render_metrics` |
+| Trace propagation | `propagation::inject`/`extract` — stamp/restore context across an outbox hop           |
+| Filtering         | `filter::PHAROS_TARGETS`, `filter::build_filter`                                       |
+
+`pharos-rs` emits the signals; wiring a collector stack (Prometheus, Loki,
+Tempo, or a managed equivalent) to receive them is your own infrastructure's
+concern.
 
 ## `pharos-proto`
 
@@ -250,10 +216,11 @@ envelopes. The payload type `P` must derive [`prost::Message`] and [`Default`]
 | `MessageCodec` (re-export) | Re-exported from `pharos-app` so codec-generic code avoids the extra dep |
 | `prost` (re-export)        | Re-exported so downstream crates can derive `prost::Message`             |
 
-Enable with the `proto` feature (included in the `full` bundle):
+Add it as a direct dependency (it is not gated behind a `pharos` facade
+feature):
 
 ```toml
-pharos = { ..., features = ["proto"] }
+pharos-proto = { git = "..." }
 # or add prost directly for payload derive macros
 prost = "0.13"
 ```
@@ -267,7 +234,7 @@ pub struct OrderPlacedProto {
     pub amount_cents: u64,
 }
 
-let serializer = pharos::proto::ProtobufEventSerializer;
+let serializer = pharos_proto::ProtobufEventSerializer;
 let event      = IntegrationEvent::new("OrderPlaced", 1, "orders", OrderPlacedProto { .. });
 let wire       = serializer.serialize(&event)?;
 // wire.content_type == "application/x-protobuf"

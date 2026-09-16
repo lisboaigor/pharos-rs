@@ -89,9 +89,10 @@ sequenceDiagram
 ```
 
 In production, the aggregate save and outbox insert should usually participate
-in the same database transaction. Pharos exposes the seam; concrete transactional
-composition belongs to the application or a database-specific adapter (see
-`save_aggregate_and_enqueue` in `pharos-postgres`).
+in the same database transaction. Pharos exposes the seam (`TransactionalStore`
++ `TransactionalRepository` + `save_and_enqueue_in`, all backend-agnostic);
+the concrete transactional adapter is yours to implement — see
+[Writing an adapter](writing-an-adapter.md).
 
 ## Inbox and idempotent consumers
 
@@ -165,11 +166,15 @@ Recommended usage:
 ## Relational persistence pattern
 
 Pharos intentionally does not try to become an ORM. For relational models, the
-recommended pattern is to implement `Repository<A>` explicitly for each aggregate
-using SQL that matches the real schema.
+recommended pattern is to implement `Repository<A>` explicitly for each
+aggregate using SQL (or an ORM such as SeaORM) that matches the real schema.
+[Writing an adapter](writing-an-adapter.md) walks through this end to end
+against SeaORM 2.0, and `examples/order`'s
+`tests/transactional_outbox_flow.rs` demonstrates the atomic save+outbox
+path against `pharos-memory`'s `InMemoryUnitOfWork` — the same seam a real
+backend implements.
 
-The order example includes `PostgresOrderRepository`, which persists the aggregate
-in normalized tables:
+A normalized shape typically looks like:
 
 ```mermaid
 erDiagram
@@ -192,18 +197,20 @@ erDiagram
     ORDERS ||--o{ ORDER_ITEMS : contains
 ```
 
-This repository:
+Such a repository:
 
 - stores `Order` state in `orders`
 - stores aggregate-internal `OrderItem`s in `order_items`
-- uses PostgreSQL constraints and a foreign key
-- wraps `save` and `delete` in real PostgreSQL transactions
+- uses relational constraints and foreign keys
+- wraps `save` and `delete` in a real database transaction
 - rehydrates the aggregate through a controlled domain constructor
-- is validated by a Docker integration test against PostgreSQL
+- is validated by `pharos-testing`'s conformance kit (`contract::repository`,
+  `contract::transactional`) against the real backend
 
 This is the preferred production direction for relational persistence: explicit
 repositories and migrations per aggregate, with framework traits providing the
-boundary.
+boundary — see [`reference-schema.sql`](reference-schema.sql) for a copyable
+starting schema.
 
 ## Recommended production path
 
@@ -214,7 +221,7 @@ flowchart TD
     Outbox[Use save_and_enqueue]
     Transaction[Make aggregate save and outbox insert transactional]
     Dispatcher[Run OutboxDispatcher worker]
-    Broker[Use Redis adapter or implement Kafka/RabbitMQ/NATS/SQS]
+    Broker[Implement MessagePublisher/Consumer/Acknowledger for your broker]
     Consumer[Use InboxStore for idempotency]
     Observe[Wire tracing and metrics backends]
 
@@ -231,18 +238,18 @@ See [`production.md`](production.md) for the full deployment checklist.
 
 ## Current status and limitations
 
-| Area                        | Current status                                                                                                | Remaining limitation                                                     |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Specialized broker adapters | Generic messaging traits plus Redis adapter exist                                                             | No first-party Kafka, RabbitMQ, NATS or SQS client adapters yet          |
-| Aggregate persistence       | PostgreSQL JSONB repository, tenant-scoped repository, and explicit normalized order repository example exist | No custom relational aggregate repositories generated automatically      |
-| Transactions                | `pharos_app::{TransactionalStore, TransactionalRepository, save_and_enqueue_in}` give any repository (JSONB or explicit relational) the atomic save+outbox guarantee, against any backend implementing `TransactionalStore` | Only `pharos-postgres` (`PostgresUnitOfWork`) implements `TransactionalStore` today; transaction-per-command policy is composed by the application (a Tower layer), not built in |
-| OpenTelemetry               | Configuration descriptor exists                                                                               | No built-in OTLP pipeline installer/exporter dependency wired by default |
-| Metrics                     | Metrics config descriptor and counters exist                                                                  | No built-in Prometheus server/exporter dependency wired by default       |
-| Transport                   | HTTP/gRPC contracts exist                                                                                     | No Axum/Tonic server adapters yet                                        |
-| Schema registry             | Contract and in-memory registry exist                                                                         | No Confluent/Apicurio/remote registry adapter yet                        |
-| Dead-lettering              | PostgreSQL-backed DLQ, `DeadLettering` handler decorator, and the `sweep_failed_to_dead_letter` outbox sweep exist | No broker-native DLQ integration yet                                     |
-| Consumer groups             | Contract and in-memory coordinator exist                                                                      | No broker-native group coordination adapters yet                         |
+| Area                    | Current status                                                                                                                                                                               | Remaining limitation                                                                                                                       |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Storage/broker adapters | `pharos-memory` ships in-process implementations of every trait, for tests and local dev                                                                                                     | No first-party PostgreSQL/Redis/Kafka/NATS crate — implement your own against the traits (see [Writing an adapter](writing-an-adapter.md)) |
+| Aggregate persistence   | `Repository<A>` trait plus `pharos-memory`'s `InMemoryRepository`; `examples/order` shows a hand-written relational shape                                                                    | No adapter generator; you write the repository (a few hours against `reference-schema.sql` + the conformance kit)                          |
+| Transactions            | `pharos_app::{TransactionalStore, TransactionalRepository, save_and_enqueue_in}` give any repository the atomic save+outbox guarantee, against any backend implementing `TransactionalStore` | `pharos-memory`'s `InMemoryUnitOfWork` is the only implementation shipped; production needs your own                                       |
+| OpenTelemetry / metrics | `pharos-observability` wires the OTLP exporter, `tracing` subscriber, and `metrics` facade — see [Observability](observability.md)                                                           | You still choose and run the collector (Prometheus/Loki/Tempo or a managed equivalent)                                                     |
+| Transport               | `pharos-axum` provides HTTP adapters over command/query handlers                                                                                                                             | No gRPC (Tonic) adapter yet                                                                                                                |
+| Real-time / pub-sub     | `pharos-realtime` provides WebSocket fan-out (rooms, auth seams, `InMemoryHub`)                                                                                                              | Only the in-memory hub ships; a multi-node hub is your own adapter                                                                         |
+| Schema registry         | Contract and in-memory registry exist                                                                                                                                                        | No Confluent/Apicurio/remote registry adapter yet                                                                                          |
+| Dead-lettering          | `DeadLetterQueue` trait, `DeadLettering` handler decorator, `sweep_failed_to_dead_letter` outbox sweep, `pharos-memory`'s in-process DLQ                                                     | No broker-native DLQ integration yet                                                                                                       |
+| Consumer groups         | Contract and in-memory coordinator exist                                                                                                                                                     | No broker-native group coordination adapter yet                                                                                            |
 
-The framework exposes the seams and default local/PostgreSQL/Redis implementations.
-Specialized production adapters for specific ecosystems should be added as separate
-infrastructure modules or crates.
+The framework exposes the seams and `pharos-memory`'s default local
+implementations. Production adapters for a specific storage/broker are your
+own crate, proven correct against `pharos-testing`'s conformance kit.

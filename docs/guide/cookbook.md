@@ -144,28 +144,32 @@ independently, instead of the whole delivery being one pass/fail outcome.
 
 When another process consumes your events, persist the aggregate and the outbox
 rows **in the same database transaction** so a crash cannot leave them out of
-sync. Map each domain event to a broker `Message`.
+sync. `save_and_enqueue_in` composes this against any `TransactionalStore` +
+`TransactionalRepository` implementation — `pharos-memory`'s
+`InMemoryUnitOfWork` for tests, your own adapter (see
+[Writing an adapter](writing-an-adapter.md)) in production. Map each domain
+event to a broker `Message`.
 
 ```rust
-use pharos::postgres::save_aggregate_and_enqueue;
+use pharos_app::save_and_enqueue_in;
 
-// `pool` is a deadpool/sqlx Pool shared by the handler.
+// `store`/`repo` implement `TransactionalStore` and
+// `TransactionalRepository<Order, Store>` respectively — see
+// `writing-an-adapter.md` for a SeaORM-backed pair, or
+// `pharos_memory::InMemoryUnitOfWork` for tests.
 async fn handle(&self, cmd: PlaceOrder) -> Result<(), AppError> {
     let mut order = Order::place(cmd.into())?;
 
-    save_aggregate_and_enqueue(
-        &self.pool,
-        "Order",                                       // aggregate type tag
-        &mut order,
-        |event| {
+    save_and_enqueue_in(&self.store, &self.repo, &mut order, |event| {
+        Ok::<_, std::convert::Infallible>(
             Message::new(
-                "orders",                              // topic
-                serde_json::to_vec(event).unwrap(),    // payload
-                "application/json",                    // content type
+                "orders",                            // topic
+                serde_json::to_vec(event).unwrap(),  // payload
+                "application/json",                  // content type
             )
-            .with_key(event.aggregate_id())            // partition/order key
-        },
-    )
+            .with_key(event.aggregate_id()),         // partition/order key
+        )
+    })
     .await
     .map_err(AppError::infra)?;
     Ok(())
@@ -251,14 +255,15 @@ let event = tenant.stamp(IntegrationEvent::new(
 // event.tenant_id is now Some(tenant id) for downstream consumers.
 ```
 
-With `pharos::postgres`, `TenantJsonRepository` enforces this at the row level:
-queries are filtered by `tenant_id`, so one tenant can never read another's
-rows even under the same aggregate id. See `examples/multi-tenant`.
+Build your repository so `tenant_id` is part of the lookup key (or enforced
+via row-level security, see `reference-schema.sql`): queries are filtered by
+`tenant_id`, so one tenant can never read another's rows even under the same
+aggregate id. See `examples/multi-tenant`.
 
 ## HTTP route over a handler (axum)
 
 ```rust
-use pharos::axum::{CommandHandlerState, HandlerError, run_command};
+use pharos_axum::{CommandHandlerState, HandlerError, run_command};
 
 async fn place_order(
     handler: CommandHandlerState<PlaceOrder, PlaceOrderHandler<Repo>>,
@@ -404,7 +409,7 @@ let pipeline = ServiceBuilder::new()
 Every entry port (HTTP route, worker loop, broker consumer) that drives the
 same `pipeline` gets identical authorization, limits, and timeouts. For a
 transaction-per-command policy, write a small `tower::Layer` whose service
-opens `PostgresUnitOfWork::transaction` around the inner call.
+opens your `TransactionalStore`'s transaction around the inner call.
 
 ## Protobuf integration event
 
@@ -413,7 +418,7 @@ pipeline where JSON overhead is a concern. The payload type must derive
 `prost::Message`; prost auto-derives `Default` and `Debug`.
 
 ```rust
-use pharos::proto::{ProtobufEventSerializer, APPLICATION_PROTOBUF};
+use pharos_proto::{ProtobufEventSerializer, APPLICATION_PROTOBUF};
 use pharos::prelude::IntegrationEvent;
 
 // 1. Define the payload type in your bounded context.
@@ -488,7 +493,7 @@ let wire = to_wire(&JsonEventSerializer, &json_event);
 // wire.content_type == "application/json"
 
 // Protobuf path — payload must impl prost::Message + Default
-use pharos::proto::ProtobufEventSerializer;
+use pharos_proto::ProtobufEventSerializer;
 
 #[derive(Clone, prost::Message)]  // prost derives Default and Debug automatically
 struct OrderPlacedProto {

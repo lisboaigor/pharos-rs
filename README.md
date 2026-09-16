@@ -18,7 +18,7 @@ The public API is intentionally small: a domain core, an application-contract cr
 - Command/query handlers with validation + tracing applied by the `dispatch` seam
 - Internal-only commands (`#[command(internal)]`): the HTTP entry points refuse to route them, keeping saga-issued payouts/refunds off the wire while in-process dispatch still works
 - Repository abstraction with optimistic concurrency control
-- Atomic aggregate save + outbox in one transaction (`pharos_app::{TransactionalStore, TransactionalRepository, save_and_enqueue_in}`) — backend-agnostic (the trait and the composing function never name a concrete connection type), though `pharos-postgres`'s `PostgresUnitOfWork` is the only `TransactionalStore` implementation today; other adapters only offer the non-atomic `save_and_enqueue`
+- Atomic aggregate save + outbox in one transaction (`pharos_app::{TransactionalStore, TransactionalRepository, save_and_enqueue_in}`) — backend-agnostic (the trait and the composing function never name a concrete connection type); `pharos-memory`'s `InMemoryUnitOfWork` is the shipped `TransactionalStore` implementation for tests, production needs your own (see [Writing an adapter](docs/guide/writing-an-adapter.md))
 - In-process domain event bus with configurable error policy, retry, and dead-letter decorators
 - Integration event envelope with typed correlation/causation, tenant, trace and schema metadata
 - Schema evolution through JSON upcasters (`VersionedJsonCodec`)
@@ -108,7 +108,9 @@ Most applications should start with the `pharos` facade and import from its prel
 > Pharos RS is not published to crates.io (every crate sets `publish = false`)
 > and is currently at 0.6.0, pre-1.0. Depend on it by git revision and pin a
 > commit — there is no semver resolution or docs.rs to fall back on. Coming
-> from 0.4? See the [migration guide](docs/guide/migrating-0.4-to-0.5.md).
+> from 0.4? See the [0.4→0.5 migration guide](docs/guide/migrating-0.4-to-0.5.md).
+> Pinned to a commit before the storage/broker crates and `pharos-init` were
+> removed? See the [0.6→0.7 migration guide](docs/guide/migrating-0.6-to-0.7.md).
 
 ```toml
 pharos = { git = "https://github.com/lisboaigor/pharos-rs", rev = "<commit>", features = ["macros"] }
@@ -156,9 +158,8 @@ If you want lower-level control, depend on `pharos-core`, `pharos-app`, or `phar
 # build
 cargo build --workspace
 
-# test (requires Docker for container-backed integration tests)
+# test
 cargo test --workspace --all-features
-cargo test-docker   # = cargo test --workspace --all-features -- --test-threads=1
 
 # docs
 cargo docs   # alias for: cargo doc --workspace --no-deps
@@ -177,13 +178,10 @@ cargo docs   # alias for: cargo doc --workspace --no-deps
 
 Pharos RS stands on top of the Rust ecosystem. Thanks to the maintainers and contributors of these third-party libraries used directly across this workspace:
 
-- [async-nats](https://crates.io/crates/async-nats)
 - [axum](https://crates.io/crates/axum)
 - [chrono](https://crates.io/crates/chrono)
-- [console](https://crates.io/crates/console)
 - [criterion](https://crates.io/crates/criterion)
 - [dashmap](https://crates.io/crates/dashmap)
-- [dialoguer](https://crates.io/crates/dialoguer)
 - [futures](https://crates.io/crates/futures)
 - [garde](https://crates.io/crates/garde)
 - [http](https://crates.io/crates/http)
@@ -192,17 +190,13 @@ Pharos RS stands on top of the Rust ecosystem. Thanks to the maintainers and con
 - [proc-macro2](https://crates.io/crates/proc-macro2)
 - [prost](https://crates.io/crates/prost)
 - [quote](https://crates.io/crates/quote)
-- [rdkafka](https://crates.io/crates/rdkafka)
-- [redis](https://crates.io/crates/redis)
-- [reqwest](https://crates.io/crates/reqwest)
 - [serde](https://crates.io/crates/serde)
 - [serde_json](https://crates.io/crates/serde_json)
-- [sqlx](https://crates.io/crates/sqlx)
 - [syn](https://crates.io/crates/syn)
-- [testcontainers](https://crates.io/crates/testcontainers)
 - [thiserror](https://crates.io/crates/thiserror)
 - [tokio](https://crates.io/crates/tokio)
 - [tower](https://crates.io/crates/tower)
+- [trait-variant](https://crates.io/crates/trait-variant)
 - [tracing](https://crates.io/crates/tracing)
 - [tracing-subscriber](https://crates.io/crates/tracing-subscriber)
 - [uuid](https://crates.io/crates/uuid)

@@ -6,7 +6,7 @@ The workspace is intentionally split:
 
 - `pharos-core` for pure domain primitives
 - `pharos-app` for application contracts and orchestration helpers
-- adapters such as `pharos-postgres`, `pharos-redis`, `pharos-kafka`, and `pharos-nats`
+- `pharos-memory`, the only storage/broker adapter the workspace ships (for tests and local dev) — bring your own for production, against the same traits
 - optional higher-level crates such as `pharos-axum`, `pharos-saga`, and `pharos-es`
 
 Start with the meta-crate when you want one dependency, or depend on the focused crates directly when you need tighter control.

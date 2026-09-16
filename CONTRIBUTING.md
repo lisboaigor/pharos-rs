@@ -12,22 +12,22 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The container-backed integration tests are a first-class part of the suite and
-are **never** `#[ignore]`d — they exercise the real PostgreSQL/Redis behavior
-(optimistic concurrency, the atomic aggregate+outbox transaction, tenant
-isolation, inbox idempotency) that in-memory adapters cannot. They use
-`testcontainers` to spin up an ephemeral PostgreSQL or Redis instance per test
-and tear it down automatically when the test finishes, so **running the test
-suite requires a running Docker daemon**.
+No test in the workspace requires Docker or any other external service:
+`pharos-rs` ships no database/broker dependency, so every test runs against
+`pharos-memory`'s in-process adapters. Tests are **never** `#[ignore]`d.
 
 ```bash
 cargo test --workspace --all-features
-# or, to bound concurrent containers on a small machine:
-cargo test-docker   # = cargo test --workspace --all-features -- --test-threads=1
 ```
 
-CI runs the full suite, including the container tests, on every push and pull
-request via `.github/workflows/ci.yml`.
+If you're writing your own storage/broker adapter (outside this workspace,
+following [`docs/guide/writing-an-adapter.md`](docs/guide/writing-an-adapter.md)),
+prove it correct against `pharos-testing`'s `contract` conformance kit —
+that's the place a container-backed integration test belongs, in your own
+adapter crate's own CI.
+
+CI runs the full suite on every push and pull request via
+`.github/workflows/ci.yml`.
 
 ## Before opening a pull request
 
