@@ -63,7 +63,9 @@ instead of receiving it, isolation breaks.
 layer into the adapter, and `stamp` outgoing integration events. Build your
 repository so isolation is enforced at the row level (filter every query by
 `tenant_id`) — see `reference-schema.sql`'s row-level-security variant and
-the [cookbook](cookbook.md#tenant-propagation).
+the [cookbook](cookbook.md#tenant-propagation). The task-local does not cross
+`tokio::spawn`, a background job, or a consumed message on its own: see
+[tenancy](tenancy.md) for `spawn_scoped`, `for_each_tenant` and `with_message_scope`.
 
 ## Reaching for a normalized schema too early
 

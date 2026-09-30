@@ -32,6 +32,12 @@ This folder is the canonical documentation entrypoint for contributors and adopt
 - `guide/reference-schema.sql`: reference PostgreSQL schema (copyable, not
   code the framework runs) each conformance suite in `pharos-testing::contract`
   is proven against.
+- `guide/tenancy.md`: keeping the tenant across spawned tasks, per-tenant jobs and
+  messages (`spawn_scoped`, `for_each_tenant`, `with_message_scope`), and crossing
+  the tenant boundary on purpose and on the record (`Elevator`).
+- `guide/migrating-to-tenancy-helpers.md`: adopting the tenancy helpers step by step
+  (additive; nothing breaks for those who do not), including elevation and the
+  reference-schema change for the event tables.
 - `guide/benchmarks.md`: benchmark baseline and interpretation.
 - `guide/ergonomics-review.md`: ergonomics assessment with recommendations.
 - `guide/migrating-0.4-to-0.5.md`: what broke going to 0.5.0 and how to update.
