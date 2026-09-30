@@ -83,6 +83,8 @@ pub mod cascade;
 pub mod command;
 #[cfg(feature = "messaging")]
 pub mod default_store;
+#[cfg(feature = "tenant-task-local")]
+pub mod elevation;
 #[cfg(feature = "messaging")]
 pub mod enrichment;
 pub mod error;
@@ -95,6 +97,8 @@ pub mod resilience;
 pub mod serialization;
 pub mod service;
 pub mod tenant;
+#[cfg(feature = "tenant-task-local")]
+pub mod tenant_iter;
 #[cfg(feature = "tenant-task-local")]
 pub mod tenant_local;
 #[cfg(feature = "tower")]
@@ -129,10 +133,16 @@ pub use command::{
 };
 #[cfg(feature = "messaging")]
 pub use default_store::DefaultAggregateStore;
+#[cfg(feature = "tenant-task-local")]
+pub use elevation::{
+    AllowPurposes, DenyAll, Elevation, ElevationAudit, ElevationDenied, ElevationKind,
+    ElevationOutcome, ElevationPolicy, ElevationRequest, Elevator, MemoryAudit, NoAudit, Purpose,
+    ScopeAuditSink, current_elevation,
+};
 #[cfg(feature = "messaging")]
 pub use enrichment::MessageEnricher;
 #[cfg(all(feature = "messaging", feature = "tenant-task-local"))]
-pub use enrichment::TenantHeader;
+pub use enrichment::{TENANT_HEADER, TenantHeader, tenant_of, with_message_scope};
 pub use error::ApplicationError;
 pub use event_bus::{EventBus, EventBusError, PublishErrorPolicy};
 pub use event_handler::{CascadingEventHandler, EventHandler};
@@ -161,7 +171,9 @@ pub use service::save_and_enqueue;
 pub use service::{republish_pending, save_and_publish};
 pub use tenant::{InvalidTenantId, TenantContext, TenantId};
 #[cfg(feature = "tenant-task-local")]
-pub use tenant_local::CURRENT_TENANT;
+pub use tenant_iter::{FixedTenants, ForEachReport, TenantSource, for_each_tenant};
+#[cfg(feature = "tenant-task-local")]
+pub use tenant_local::{CURRENT_TENANT, spawn_scoped};
 #[cfg(feature = "tower")]
 pub use tower_service::{CommandHandlerService, QueryHandlerService};
 pub use unit_of_work::UnitOfWorkError;
