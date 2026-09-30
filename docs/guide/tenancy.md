@@ -95,6 +95,58 @@ Strategies shipped: `DenyAll`, `AllowPurposes` (policies); `NoAudit`,
 `MemoryAudit` (sinks, the latter for tests). Write your own by implementing
 `ElevationPolicy` / `ScopeAuditSink`.
 
+## Security model: what is guaranteed, and what is not
+
+Verified by `crates/pharos-app/tests/tenancy_offensive.rs`, which attacks these
+helpers through the public API.
+
+**Guaranteed**
+
+- Per-tenant work (`for_each_tenant`, `with_message_scope`) never inherits an
+  elevation, nor an impersonation of another tenant, from its caller. They clear it.
+- An elevation is not inherited by `spawn_scoped`, `tokio::spawn`, `spawn_blocking`
+  or a thread, nor seen by a sibling future on the same task.
+- Nesting cannot widen what the policy grants; an impersonation inside an elevation
+  narrows it.
+- `Elevation` cannot be built by hand (a `compile_fail` doctest pins it).
+- An actor is a label: control characters and anything over 256 characters are
+  refused, so it cannot forge a line of the audit trail or flood the sink.
+- A request is decided and recorded **when made**, with the line that made it, even
+  if refused and even if the future is never polled. A sink that fails or panics
+  grants nothing.
+- A malformed tenant header is refused; every valid spelling of a UUID is the same
+  tenant.
+
+**Not guaranteed. Know these before relying on the helpers.**
+
+- **A purpose is a label, not a capability.** Anyone who can write the name can ask
+  for it. What stops the wrong caller is the policy, and what makes it accountable
+  is the audit trail with the caller's line.
+- **Any code can build its own `Elevator`** with a policy that grants everything and
+  get a valid `Elevation`. A storage adapter that lifts a filter must accept only
+  elevations its own elevator issued: check `Elevator::issued` and ignore the rest.
+- **A granted future is a capability.** Whoever holds it can await it later,
+  elsewhere. It was still recorded where it was made.
+- **The tenant header is not authenticated.** Whoever can publish to the broker can
+  stamp any tenant. Protect publishing with the broker's own access control.
+- **A source is trusted.** `for_each_tenant` visits what the `TenantSource` lists,
+  duplicates included. A panic in one tenant's work aborts the pass (it unwinds);
+  only an `Err` is isolated per tenant.
+- **The nil UUID is a valid tenant.** A multi-tenant application must not let a
+  tenant with that id exist.
+
+Row-level security, which the reference schema sets up, has limits of its own:
+
+- It binds a role that is not the table owner and has no `BYPASSRLS`. The owner
+  sees everything (the schema does not `FORCE` it).
+- **`TRUNCATE` ignores it.** The application role must be granted `SELECT, INSERT,
+  UPDATE, DELETE` and never `ALL`, or one statement clears every tenant.
+- The tenant is a session setting the role can write. Code that can run arbitrary
+  SQL as the application role can switch tenant, so RLS defends against bugs (a
+  query without its `WHERE`), not against SQL injection. A pool that re-applies
+  the scope on every checkout and clears it on release (as the reference adapters
+  do) limits the damage to the connection held.
+
 ## What is deliberately not here
 
 - No storage adapter: how a connection learns the tenant (a session setting, a

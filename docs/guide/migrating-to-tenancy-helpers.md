@@ -127,13 +127,24 @@ Prefer `impersonating` wherever the caller really is working on one tenant.
 ### 4.4 Storage adapter
 
 Wherever your adapter used to read the old flag to lift its tenant filter, read
-`current_elevation()` and lift **only for `ElevationKind::CrossTenant`**. An
-impersonation runs inside the tenant's ordinary scope and must lift nothing.
+`current_elevation()` and lift **only when both hold**:
+
+- the kind is `ElevationKind::CrossTenant` (an impersonation runs inside the
+  tenant's ordinary scope and must lift nothing), **and**
+- `your_elevator.issued(&elevation)` is true.
+
+The second check is not optional. An `Elevation` cannot be built by hand, but any
+code can build its own `Elevator` with a policy that grants everything and obtain a
+valid one. An adapter that lifts for any elevation it finds has only moved the flag.
+Keep one elevator for the application and accept nothing else. A test support crate
+that brings its own elevator has to be introduced to the adapter explicitly, behind
+a feature that production builds never enable.
 
 ### 4.5 Call sites
 
 Each call site now returns `Result<_, ElevationDenied>` (outer) around whatever it
-returned before. Two patterns cover almost everything:
+returned before. The request is decided and recorded when `elevated` is *called*, with
+the line that made it, not when the returned future is first polled. Two patterns cover almost everything:
 
 ```rust
 // a function returning Result<T, MyError> where MyError: From<ElevationDenied>

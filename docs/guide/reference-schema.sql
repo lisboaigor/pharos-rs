@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS pharos_tenant_aggregates (
 CREATE INDEX IF NOT EXISTS idx_pharos_tenant_aggregates_type_updated_at
     ON pharos_tenant_aggregates (tenant_id, aggregate_type, updated_at);
 
+-- Grants matter as much as the policy. RLS binds a role that does not own the table
+-- and has no BYPASSRLS, and it does not cover TRUNCATE: give the application role
+-- exactly what it needs and never ALL, or a single TRUNCATE empties every tenant.
+--
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON pharos_tenant_aggregates,
+--         pharos_event_streams, pharos_snapshots TO app_role;
+--
 ALTER TABLE pharos_tenant_aggregates ENABLE ROW LEVEL SECURITY;
 
 -- The session setting the policy reads to scope every query. Set it once per
