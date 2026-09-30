@@ -299,11 +299,20 @@ CREATE INDEX IF NOT EXISTS idx_pharos_sagas_due
 -- Pairs with: EventStore — pharos_testing::contract::event_store::run
 --             SnapshotStore — pharos_testing::contract::event_store::snapshot_store
 --
--- `tenant_id` defaults to the nil UUID so a single-tenant application never
--- has to think about it; a multi-tenant one sets it per row like the
--- aggregate repository above (RLS is equally applicable here — add the same
--- policy shape if you need it; omitted here to keep this section focused on
--- the append-only/optimistic-concurrency shape event sourcing itself needs).
+-- These tables are the **multi-tenant** shape: `tenant_id` has no default, so
+-- a write that forgets to name its tenant fails instead of landing in a shared
+-- "nobody's" bucket, and the same row-level-security policy as the aggregate
+-- repository above keeps one tenant's streams out of another's reads.
+--
+-- A single-tenant application that never wants to think about tenants can use
+-- the nil UUID as its one tenant. Do that explicitly, in your own copy of
+-- this file, by adding to each `tenant_id` column below:
+--
+--   DEFAULT '00000000-0000-0000-0000-000000000000'
+--
+-- and by leaving the two `ENABLE ROW LEVEL SECURITY` statements out. Keeping
+-- that default here, unmarked, made it the silent fallback for every
+-- multi-tenant copy too, which is the failure this shape exists to prevent.
 --
 -- `event_type` is nullable on purpose: a row written before this column
 -- existed has no retroactive way to know its event type, and `EventStore`
@@ -311,7 +320,7 @@ CREATE INDEX IF NOT EXISTS idx_pharos_sagas_due
 -- failing to load old history.
 
 CREATE TABLE IF NOT EXISTS pharos_event_streams (
-    tenant_id      UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    tenant_id      UUID NOT NULL,
     stream_type    TEXT NOT NULL,
     stream_id      TEXT NOT NULL,
     sequence       BIGINT NOT NULL,
@@ -323,7 +332,7 @@ CREATE TABLE IF NOT EXISTS pharos_event_streams (
 );
 
 CREATE TABLE IF NOT EXISTS pharos_snapshots (
-    tenant_id      UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    tenant_id      UUID NOT NULL,
     stream_type    TEXT NOT NULL,
     stream_id      TEXT NOT NULL,
     payload        JSONB NOT NULL,
@@ -332,6 +341,16 @@ CREATE TABLE IF NOT EXISTS pharos_snapshots (
     schema_version INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, stream_type, stream_id)
 );
+
+ALTER TABLE pharos_event_streams ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON pharos_event_streams
+    USING      (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+
+ALTER TABLE pharos_snapshots ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON pharos_snapshots
+    USING      (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- `EventStore::append`'s optimistic concurrency: `expected_version` must
 -- equal the stream's current highest `sequence` (0 for a never-appended
