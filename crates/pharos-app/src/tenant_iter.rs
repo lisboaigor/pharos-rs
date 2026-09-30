@@ -1,5 +1,6 @@
 use std::future::Future;
 
+use crate::elevation::without_elevation;
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_local::CURRENT_TENANT;
 
@@ -76,7 +77,10 @@ where
     };
     for tenant in tenants {
         let scope = Some(TenantContext::new(tenant));
-        match CURRENT_TENANT.scope(scope, work(tenant)).await {
+        match CURRENT_TENANT
+            .scope(scope, without_elevation(work(tenant)))
+            .await
+        {
             Ok(()) => report.succeeded += 1,
             Err(e) => report.failed.push((tenant, e)),
         }

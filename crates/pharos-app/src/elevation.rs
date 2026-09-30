@@ -30,6 +30,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -79,12 +81,33 @@ pub enum ElevationKind {
 /// A granted crossing of the tenant boundary.
 ///
 /// Only an [`Elevator`] makes one. Read it back with [`current_elevation`].
+///
+/// It cannot be built by hand, nor obtained by defaulting or by naming its
+/// fields:
+///
+/// ```compile_fail
+/// use pharos_app::{Elevation, ElevationKind, Purpose};
+/// let forged = Elevation {
+///     purpose: Purpose::new("backoffice"),
+///     actor: None,
+///     kind: ElevationKind::CrossTenant,
+///     granted_at: chrono::Utc::now(),
+///     issuer: 1,
+///     caller: std::panic::Location::caller(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// let forged = pharos_app::Elevation::default();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elevation {
     purpose: Purpose,
     actor: Option<String>,
     kind: ElevationKind,
     granted_at: DateTime<Utc>,
+    issuer: u64,
+    caller: &'static Location<'static>,
 }
 
 impl Elevation {
@@ -107,6 +130,11 @@ impl Elevation {
     pub fn granted_at(&self) -> DateTime<Utc> {
         self.granted_at
     }
+
+    /// Where in the code it was asked for.
+    pub fn caller(&self) -> &'static Location<'static> {
+        self.caller
+    }
 }
 
 /// The elevation of the current task, if it has one.
@@ -117,6 +145,16 @@ pub fn current_elevation() -> Option<Elevation> {
         .try_with(|elevation| elevation.clone())
         .ok()
         .flatten()
+}
+
+/// Runs `work` with no elevation, whatever the caller holds.
+///
+/// For the helpers that open a **tenant** scope (`for_each_tenant`,
+/// `with_message_scope`): the work they run is meant to see one tenant, so it must
+/// not inherit a cross-tenant elevation, or an impersonation of another tenant,
+/// from whoever called them.
+pub(crate) fn without_elevation<F: Future>(work: F) -> impl Future<Output = F::Output> {
+    CURRENT_ELEVATION.scope(None, work)
 }
 
 /// What an [`ElevationPolicy`] is asked to decide.
@@ -223,6 +261,9 @@ pub struct ElevationAudit {
     pub outcome: ElevationOutcome,
     /// When it was decided.
     pub at: DateTime<Utc>,
+    /// Where in the code it was asked for. A purpose is only a name, so this is
+    /// what ties an entry to the code that made the request.
+    pub caller: &'static Location<'static>,
 }
 
 /// Where elevation requests are recorded.
@@ -282,9 +323,17 @@ pub struct ElevationDenied {
 /// Built once at startup and shared (it is cheap to clone).
 #[derive(Clone)]
 pub struct Elevator {
+    id: u64,
     policy: Arc<dyn ElevationPolicy>,
     audit: Arc<dyn ScopeAuditSink>,
 }
+
+/// Each elevator gets its own number, so an elevation can be traced to the one
+/// that granted it. Clones share it: they are the same elevator.
+static NEXT_ELEVATOR: AtomicU64 = AtomicU64::new(1);
+
+/// The longest actor an elevation will carry.
+const MAX_ACTOR_LEN: usize = 256;
 
 impl fmt::Debug for Elevator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -299,42 +348,74 @@ impl Elevator {
         audit: impl ScopeAuditSink + 'static,
     ) -> Self {
         Self {
+            id: NEXT_ELEVATOR.fetch_add(1, Ordering::Relaxed),
             policy: Arc::new(policy),
             audit: Arc::new(audit),
         }
     }
 
+    /// Whether **this** elevator granted `elevation`.
+    ///
+    /// An `Elevation` cannot be built by hand, but any code can build an
+    /// `Elevator` with a policy that grants everything and obtain a valid one.
+    /// A storage adapter that lifts a filter must therefore not accept any
+    /// elevation it finds: it keeps its own elevator and accepts only what that
+    /// elevator issued.
+    pub fn issued(&self, elevation: &Elevation) -> bool {
+        elevation.issuer == self.id
+    }
+
     /// Runs `work` across every tenant, for `purpose`.
     ///
-    /// Returns [`ElevationDenied`], without running `work`, when the policy
-    /// refuses. Either way the request is recorded.
-    pub async fn elevated<F: Future>(
+    /// The request is decided and recorded when this is **called**, not when the
+    /// returned future is first polled. Returns [`ElevationDenied`], without
+    /// running `work`, when the policy refuses.
+    #[track_caller]
+    pub fn elevated<F: Future>(
         &self,
         purpose: Purpose,
         actor: Option<&str>,
         work: F,
-    ) -> Result<F::Output, ElevationDenied> {
-        let elevation = self.admit(purpose, actor, ElevationKind::CrossTenant)?;
-        Ok(CURRENT_ELEVATION.scope(Some(elevation), work).await)
+    ) -> impl Future<Output = Result<F::Output, ElevationDenied>> + use<F> {
+        let admitted = self.admit(
+            purpose,
+            actor,
+            ElevationKind::CrossTenant,
+            Location::caller(),
+        );
+        async move {
+            let elevation = admitted?;
+            Ok(CURRENT_ELEVATION.scope(Some(elevation), work).await)
+        }
     }
 
     /// Runs `work` as `tenant`, for `purpose`, with `actor` on the record.
     ///
     /// The work sees exactly what the tenant itself would: its ordinary scope is
     /// opened, nothing is lifted. An impersonation always names its actor; a
-    /// blank one is refused.
-    pub async fn impersonating<F: Future>(
+    /// blank one is refused. Decided and recorded when called, like
+    /// [`elevated`](Self::elevated).
+    #[track_caller]
+    pub fn impersonating<F: Future>(
         &self,
         tenant: TenantId,
         purpose: Purpose,
         actor: &str,
         work: F,
-    ) -> Result<F::Output, ElevationDenied> {
-        let elevation = self.admit(purpose, Some(actor), ElevationKind::Impersonation(tenant))?;
-        let scope = Some(TenantContext::new(tenant));
-        Ok(CURRENT_TENANT
-            .scope(scope, CURRENT_ELEVATION.scope(Some(elevation), work))
-            .await)
+    ) -> impl Future<Output = Result<F::Output, ElevationDenied>> + use<F> {
+        let admitted = self.admit(
+            purpose,
+            Some(actor),
+            ElevationKind::Impersonation(tenant),
+            Location::caller(),
+        );
+        async move {
+            let elevation = admitted?;
+            let scope = Some(TenantContext::new(tenant));
+            Ok(CURRENT_TENANT
+                .scope(scope, CURRENT_ELEVATION.scope(Some(elevation), work))
+                .await)
+        }
     }
 
     fn admit(
@@ -342,11 +423,16 @@ impl Elevator {
         purpose: Purpose,
         actor: Option<&str>,
         kind: ElevationKind,
+        caller: &'static Location<'static>,
     ) -> Result<Elevation, ElevationDenied> {
         let actor = actor.map(str::trim).filter(|a| !a.is_empty());
         let at = Utc::now();
 
         let decision = match (kind, actor) {
+            // An actor ends up in logs and audit rows: a label, not free text.
+            // Control characters would let it forge a line of the trail, and an
+            // unbounded one would flood the sink.
+            (_, Some(a)) if !is_plain_label(a) => Err("the actor is not a plain label"),
             (ElevationKind::Impersonation(_), None) => Err("an impersonation needs an actor"),
             _ => self.policy.authorize(&ElevationRequest {
                 purpose,
@@ -357,13 +443,15 @@ impl Elevator {
 
         self.audit.record(ElevationAudit {
             purpose,
-            actor: actor.map(str::to_owned),
+            // A refused, malformed actor is not echoed into the trail.
+            actor: actor.filter(|a| is_plain_label(a)).map(str::to_owned),
             kind,
             outcome: match decision {
                 Ok(()) => ElevationOutcome::Granted,
                 Err(reason) => ElevationOutcome::Denied(reason),
             },
             at,
+            caller,
         });
 
         match decision {
@@ -372,10 +460,17 @@ impl Elevator {
                 actor: actor.map(str::to_owned),
                 kind,
                 granted_at: at,
+                issuer: self.id,
+                caller,
             }),
             Err(reason) => Err(ElevationDenied { purpose, reason }),
         }
     }
+}
+
+/// Short and free of control characters.
+fn is_plain_label(actor: &str) -> bool {
+    actor.chars().count() <= MAX_ACTOR_LEN && !actor.chars().any(char::is_control)
 }
 
 #[cfg(test)]

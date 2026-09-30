@@ -86,6 +86,7 @@ pub async fn with_message_scope<F: std::future::Future>(
     work: F,
 ) -> Result<F::Output, crate::tenant::InvalidTenantId> {
     let scope = tenant_of(message)?;
+    let work = crate::elevation::without_elevation(work);
     Ok(crate::tenant_local::CURRENT_TENANT.scope(scope, work).await)
 }
 
